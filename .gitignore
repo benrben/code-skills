@@ -1,6 +1,6 @@
 .DS_Store
-*-workspace/
 node_modules/
 __pycache__/
 *.pyc
 .venv/
+.ruff_cache/
