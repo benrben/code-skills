@@ -2,8 +2,8 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "code-skills",
   "displayName": "Code Discipline",
-  "version": "1.0.0",
-  "description": "Engineering discipline with a strict repository quality repair loop.",
+  "version": "2.0.0",
+  "description": "Engineering discipline with reusable formatting, type, contract, test, dead-code, mutation, flake, and architecture gates.",
   "author": {
     "name": "Ben Reich",
     "url": "https://github.com/benrben"

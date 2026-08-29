@@ -8,8 +8,8 @@ Copy this file into a repository and run:
 The runner auto-detects common toolchains and also accepts commands that emit
 normalized JSON, which makes every gate extensible to arbitrary languages. It
 installs missing coverage and complexity tools into isolated caches by default,
-writes a self-contained HTML report, and exits non-zero unless all three gates
-can be measured and pass.
+writes a self-contained HTML report, and exits non-zero unless every applicable
+gate can be measured and passes.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 
@@ -219,6 +219,12 @@ class CommandResult:
 
 
 @dataclasses.dataclass
+class CheckCommand:
+    command: list[str]
+    fail_on_output: bool = False
+
+
+@dataclasses.dataclass
 class FunctionMetric:
     path: str
     name: str
@@ -274,6 +280,7 @@ class GateResult:
     details: list[str] = dataclasses.field(default_factory=list)
     command_results: list[CommandResult] = dataclasses.field(default_factory=list)
     prompts: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+    applicable: bool = True
 
 
 @dataclasses.dataclass
@@ -330,6 +337,31 @@ def default_config() -> dict[str, Any]:
             "extensions": sorted(SOURCE_EXTENSIONS),
         },
         "test": {"command": None, "timeout_seconds": 600},
+        "format_lint": {
+            "enabled": "auto",
+            "required": False,
+            "commands": [],
+            "timeout_seconds": 300,
+        },
+        "types": {
+            "enabled": "auto",
+            "required": False,
+            "commands": [],
+            "timeout_seconds": 600,
+        },
+        "contracts": {
+            "enabled": "auto",
+            "required": False,
+            "commands": [],
+            "patterns": [
+                "**/openapi.json",
+                "**/openapi.yaml",
+                "**/openapi.yml",
+                "**/*.schema.json",
+                "**/schemas/*.json",
+            ],
+            "timeout_seconds": 300,
+        },
         "metrics": {
             "command": None,
             "report": None,
@@ -346,6 +378,17 @@ def default_config() -> dict[str, Any]:
             "max_mutants": 0,
             "operators": OPERATOR_MUTATIONS,
             "exclude": [],
+        },
+        "dead_code": {
+            "enabled": "auto",
+            "required": False,
+            "commands": [],
+            "timeout_seconds": 300,
+        },
+        "flaky_tests": {
+            "enabled": True,
+            "runs": 3,
+            "timeout_seconds": 600,
         },
         "dependencies": {
             "command": None,
@@ -398,6 +441,29 @@ def command_list(
         )
     substitutions = substitutions or {}
     return [substitute_text(part, substitutions) for part in command]
+
+
+def command_lists(
+    value: Any, substitutions: dict[str, str] | None = None
+) -> list[list[str]]:
+    if value is None or value == [] or value == "":
+        return []
+    if isinstance(value, str):
+        command = command_list(value, substitutions)
+        return [command] if command else []
+    if isinstance(value, list) and all(
+        isinstance(item, (str, int, float)) for item in value
+    ):
+        command = command_list(value, substitutions)
+        return [command] if command else []
+    if isinstance(value, list):
+        commands = []
+        for raw_command in value:
+            command = command_list(raw_command, substitutions)
+            if command:
+                commands.append(command)
+        return commands
+    raise ValueError("Commands must be a command or an array of commands")
 
 
 def substitute_text(value: str, substitutions: dict[str, str]) -> str:
@@ -527,8 +593,16 @@ def matches_any(relative: str, patterns: Sequence[str]) -> bool:
     return any(
         fnmatch.fnmatch(relative, pattern)
         or path.match(pattern)
+        or (
+            pattern.startswith("**/")
+            and fnmatch.fnmatch(relative, pattern.removeprefix("**/"))
+        )
         or fnmatch.fnmatch(lowered, pattern.lower())
         or Path(lowered).match(pattern.lower())
+        or (
+            pattern.lower().startswith("**/")
+            and fnmatch.fnmatch(lowered, pattern.lower().removeprefix("**/"))
+        )
         for pattern in patterns
     )
 
@@ -645,7 +719,7 @@ def bootstrap_tools(
         )
     )
     python_env = context.python_env
-    missing_packages = []
+    missing_packages: list[str] = []
     if needs_lizard and not _python_module_available(
         python, "lizard", root, python_env
     ):
@@ -654,6 +728,35 @@ def bootstrap_tools(
         python, "coverage", root, python_env
     ):
         missing_packages.append("coverage")
+    has_python = any(path.suffix.lower() in {".py", ".pyi"} for path in source_files)
+    optional_python_tools = []
+    if has_python and (
+        any((root / name).exists() for name in ("ruff.toml", ".ruff.toml"))
+        or project_config_contains(root, "[tool.ruff")
+    ):
+        optional_python_tools.append(("ruff", "ruff"))
+    if has_python and (
+        (root / "mypy.ini").exists()
+        or project_config_contains(root, "[tool.mypy")
+        or project_config_contains(root, "[mypy")
+    ):
+        optional_python_tools.append(("mypy", "mypy"))
+    if has_python and project_config_contains(root, "[tool.vulture"):
+        optional_python_tools.append(("vulture", "vulture"))
+    contract_files = discover_contract_files(root, config.get("contracts", {}))
+    if any(path.name.lower().endswith(".schema.json") for path in contract_files):
+        optional_python_tools.append(("jsonschema", "jsonschema"))
+    if any(
+        path.name.lower() in {"openapi.json", "openapi.yaml", "openapi.yml"}
+        for path in contract_files
+    ):
+        optional_python_tools.append(
+            ("openapi_spec_validator", "openapi-spec-validator")
+        )
+    for module, package in optional_python_tools:
+        if not _python_module_available(python, module, root, python_env):
+            missing_packages.append(package)
+    missing_packages = list(dict.fromkeys(missing_packages))
     if auto_install and missing_packages:
         install = run_command(
             [
@@ -767,6 +870,489 @@ def infer_test_command(root: Path) -> list[str] | None:
     if list(root.glob("*.sln")) and executable(root, "dotnet"):
         return [executable(root, "dotnet") or "dotnet", "test"]
     return None
+
+
+def package_scripts(root: Path) -> dict[str, str]:
+    package = read_package_json(root)
+    scripts = package.get("scripts", {})
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(name): str(command) for name, command in scripts.items()}
+
+
+def package_script_command(root: Path, name: str) -> list[str] | None:
+    if name not in package_scripts(root):
+        return None
+    if (root / "pnpm-lock.yaml").exists() and executable(root, "pnpm"):
+        return [executable(root, "pnpm") or "pnpm", "run", name]
+    if (root / "yarn.lock").exists() and executable(root, "yarn"):
+        return [executable(root, "yarn") or "yarn", "run", name]
+    if executable(root, "npm"):
+        return [executable(root, "npm") or "npm", "run", name]
+    return None
+
+
+def first_package_script(root: Path, names: Sequence[str]) -> CheckCommand | None:
+    for name in names:
+        command = package_script_command(root, name)
+        if command:
+            return CheckCommand(command)
+    return None
+
+
+def configured_check_commands(
+    section: dict[str, Any], root: Path
+) -> list[CheckCommand]:
+    substitutions = {"root": str(root)}
+    value = section.get("commands")
+    if not value and section.get("command"):
+        value = section["command"]
+    return [CheckCommand(command) for command in command_lists(value, substitutions)]
+
+
+def unique_check_commands(commands: Sequence[CheckCommand]) -> list[CheckCommand]:
+    seen: set[tuple[str, ...]] = set()
+    result = []
+    for command in commands:
+        key = tuple(command.command)
+        if key not in seen:
+            seen.add(key)
+            result.append(command)
+    return result
+
+
+def project_config_contains(root: Path, text: str) -> bool:
+    for name in ("pyproject.toml", "setup.cfg", "tox.ini"):
+        path = root / name
+        try:
+            if text in path.read_text(encoding="utf-8"):
+                return True
+        except (OSError, UnicodeDecodeError):
+            continue
+    return False
+
+
+def infer_format_lint_commands(
+    root: Path, source_files: Sequence[Path], tools: ToolContext
+) -> list[CheckCommand]:
+    commands: list[CheckCommand] = []
+    lint = first_package_script(root, ("lint:check", "check:lint", "lint"))
+    formatting = first_package_script(
+        root, ("format:check", "check:format", "format-check", "fmt:check")
+    )
+    if lint:
+        commands.append(lint)
+    if formatting:
+        commands.append(formatting)
+
+    eslint_configs = (
+        ".eslintrc",
+        ".eslintrc.json",
+        ".eslintrc.js",
+        ".eslintrc.cjs",
+        "eslint.config.js",
+        "eslint.config.mjs",
+        "eslint.config.cjs",
+    )
+    eslint = executable(root, "eslint")
+    if not lint and eslint and any((root / name).exists() for name in eslint_configs):
+        commands.append(CheckCommand([eslint, "."]))
+    prettier = executable(root, "prettier")
+    prettier_configs = (
+        ".prettierrc",
+        ".prettierrc.json",
+        ".prettierrc.js",
+        "prettier.config.js",
+        "prettier.config.cjs",
+    )
+    if (
+        not formatting
+        and prettier
+        and any((root / name).exists() for name in prettier_configs)
+    ):
+        commands.append(CheckCommand([prettier, "--check", "."]))
+
+    has_python = any(path.suffix.lower() in {".py", ".pyi"} for path in source_files)
+    has_ruff_config = any(
+        (root / name).exists() for name in ("ruff.toml", ".ruff.toml")
+    ) or project_config_contains(root, "[tool.ruff")
+    if (
+        has_python
+        and has_ruff_config
+        and _python_module_available(tools.python, "ruff", root, tools.python_env)
+    ):
+        commands.extend(
+            [
+                CheckCommand([tools.python, "-m", "ruff", "check", "."]),
+                CheckCommand([tools.python, "-m", "ruff", "format", "--check", "."]),
+            ]
+        )
+    go_files = [path for path in source_files if path.suffix.lower() == ".go"]
+    gofmt = executable(root, "gofmt")
+    if go_files and gofmt:
+        commands.append(
+            CheckCommand(
+                [gofmt, "-l", *[normalize_path(path, root) for path in go_files]],
+                fail_on_output=True,
+            )
+        )
+    cargo = executable(root, "cargo")
+    if (root / "Cargo.toml").exists() and cargo:
+        commands.append(CheckCommand([cargo, "fmt", "--all", "--", "--check"]))
+    return unique_check_commands(commands)
+
+
+def infer_type_commands(
+    root: Path, source_files: Sequence[Path], tools: ToolContext
+) -> list[CheckCommand]:
+    commands: list[CheckCommand] = []
+    script = first_package_script(
+        root, ("typecheck", "type-check", "check:types", "types:check")
+    )
+    if script:
+        commands.append(script)
+    elif list(root.glob("tsconfig*.json")) and executable(root, "tsc"):
+        commands.append(CheckCommand([executable(root, "tsc") or "tsc", "--noEmit"]))
+    has_python = any(path.suffix.lower() in {".py", ".pyi"} for path in source_files)
+    has_mypy_config = (
+        (root / "mypy.ini").exists()
+        or project_config_contains(root, "[tool.mypy")
+        or project_config_contains(root, "[mypy")
+    )
+    if (
+        has_python
+        and has_mypy_config
+        and _python_module_available(tools.python, "mypy", root, tools.python_env)
+    ):
+        commands.append(CheckCommand([tools.python, "-m", "mypy", "."]))
+    if (root / "go.mod").exists() and executable(root, "go"):
+        commands.append(CheckCommand([executable(root, "go") or "go", "vet", "./..."]))
+    if (root / "Cargo.toml").exists() and executable(root, "cargo"):
+        commands.append(
+            CheckCommand(
+                [executable(root, "cargo") or "cargo", "check", "--all-targets"]
+            )
+        )
+    if list(root.glob("*.sln")) and executable(root, "dotnet"):
+        commands.append(
+            CheckCommand(
+                [executable(root, "dotnet") or "dotnet", "build", "--no-restore"]
+            )
+        )
+    return unique_check_commands(commands)
+
+
+def discover_contract_files(root: Path, section: dict[str, Any]) -> list[Path]:
+    patterns = [str(pattern) for pattern in section.get("patterns", [])]
+    return sorted(
+        path
+        for path in walk_files(root)
+        if matches_any(normalize_path(path, root), patterns)
+    )
+
+
+def infer_contract_commands(root: Path) -> list[CheckCommand]:
+    commands = []
+    for name in package_scripts(root):
+        lowered = name.lower()
+        if "contract" in lowered or lowered in {
+            "schema:check",
+            "check:schema",
+            "openapi:check",
+            "check:openapi",
+        }:
+            command = package_script_command(root, name)
+            if command:
+                commands.append(CheckCommand(command))
+    return unique_check_commands(commands)
+
+
+def infer_dead_code_commands(
+    root: Path, source_files: Sequence[Path], tools: ToolContext
+) -> list[CheckCommand]:
+    commands = []
+    for name in package_scripts(root):
+        lowered = name.lower()
+        if any(
+            token in lowered for token in ("dead-code", "deadcode", "unused")
+        ) or lowered in {
+            "knip",
+            "ts-prune",
+        }:
+            command = package_script_command(root, name)
+            if command:
+                commands.append(CheckCommand(command))
+    dependencies = package_dependencies(root)
+    npx = executable(root, "npx")
+    if npx and "knip" in dependencies and not commands:
+        commands.append(CheckCommand([npx, "--no-install", "knip"]))
+    elif npx and "ts-prune" in dependencies and not commands:
+        commands.append(CheckCommand([npx, "--no-install", "ts-prune"]))
+    has_python = any(path.suffix.lower() in {".py", ".pyi"} for path in source_files)
+    if (
+        has_python
+        and project_config_contains(root, "[tool.vulture")
+        and _python_module_available(tools.python, "vulture", root, tools.python_env)
+    ):
+        commands.append(CheckCommand([tools.python, "-m", "vulture", "."]))
+    return unique_check_commands(commands)
+
+
+def unavailable_check(
+    key: str, title: str, section: dict[str, Any], guidance: str
+) -> GateResult:
+    if bool(section.get("required", False)):
+        return GateResult(
+            key,
+            title,
+            False,
+            f"No configured or supported {title.lower()} command was available.",
+            [guidance],
+            prompts=[
+                (
+                    f"Configure {title.lower()}",
+                    f"Configure a deterministic {title.lower()} command that exits non-zero on violations. {guidance} Do not disable the requested gate.",
+                )
+            ],
+        )
+    return GateResult(
+        key,
+        title,
+        True,
+        f"Not applicable: no configured or supported {title.lower()} command was detected.",
+        [guidance],
+        applicable=False,
+    )
+
+
+def run_command_check_gate(
+    root: Path,
+    key: str,
+    title: str,
+    section: dict[str, Any],
+    inferred: Sequence[CheckCommand],
+    guidance: str,
+    extra_env: dict[str, str] | None = None,
+) -> GateResult:
+    if section.get("enabled", "auto") is False:
+        return GateResult(
+            key,
+            title,
+            False,
+            f"{title} is disabled; a requested gate cannot be skipped.",
+            prompts=[
+                (
+                    f"Enable {title.lower()}",
+                    f"Enable and configure the {title.lower()} gate, then repair every reported violation.",
+                )
+            ],
+        )
+    configured = configured_check_commands(section, root)
+    commands = configured or list(inferred)
+    if not commands:
+        return unavailable_check(key, title, section, guidance)
+    timeout = int(section.get("timeout_seconds", 300))
+    results = []
+    failures = []
+    for check in commands:
+        result = run_command(check.command, root, timeout, extra_env)
+        results.append(result)
+        if result.returncode != 0 or (check.fail_on_output and result.stdout.strip()):
+            failures.append(result)
+    if failures:
+        details = [format_command(result) for result in failures]
+        first = failures[0]
+        return GateResult(
+            key,
+            title,
+            False,
+            f"{len(failures)} of {len(results)} {title.lower()} commands failed.",
+            details,
+            results,
+            [
+                (
+                    f"Repair {title.lower()}",
+                    generic_adapter_prompt(title.lower(), first),
+                )
+            ],
+        )
+    return GateResult(
+        key,
+        title,
+        True,
+        f"All {len(results)} {title.lower()} commands passed with zero violations.",
+        command_results=results,
+    )
+
+
+JSON_SCHEMA_CHECK = """\
+import json
+import sys
+from jsonschema.validators import validator_for
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    schema = json.load(handle)
+validator_for(schema).check_schema(schema)
+print(f"valid JSON Schema: {sys.argv[1]}")
+"""
+
+
+def contract_file_commands(
+    files: Sequence[Path], tools: ToolContext
+) -> list[CheckCommand]:
+    commands = []
+    for path in files:
+        lowered = path.name.lower()
+        if lowered in {"openapi.json", "openapi.yaml", "openapi.yml"}:
+            commands.append(
+                CheckCommand([tools.python, "-m", "openapi_spec_validator", str(path)])
+            )
+        else:
+            commands.append(
+                CheckCommand([tools.python, "-c", JSON_SCHEMA_CHECK, str(path)])
+            )
+    return commands
+
+
+def run_contract_gate(
+    root: Path, config: dict[str, Any], tools: ToolContext
+) -> GateResult:
+    section = config["contracts"]
+    files = discover_contract_files(root, section)
+    commands = configured_check_commands(section, root)
+    commands.extend(infer_contract_commands(root))
+    if files:
+        commands.extend(contract_file_commands(files, tools))
+    effective_section = dict(section)
+    effective_section["command"] = None
+    effective_section["commands"] = []
+    result = run_command_check_gate(
+        root,
+        "contracts",
+        "Contract/schema validation",
+        effective_section,
+        unique_check_commands(commands),
+        "Add OpenAPI or *.schema.json documents, or configure contracts.commands for repository-specific compatibility checks.",
+        tools.python_env,
+    )
+    if result.applicable and result.passed and files:
+        result.summary = (
+            f"All {len(files)} detected contract/schema files and "
+            f"{len(result.command_results) - len(files)} configured checks passed."
+        )
+    return result
+
+
+def run_test_baseline(
+    root: Path, config: dict[str, Any]
+) -> tuple[list[str] | None, CommandResult | None]:
+    command = command_list(config["test"].get("command")) or infer_test_command(root)
+    if not command:
+        return None, None
+    return command, run_command(
+        command, root, int(config["test"].get("timeout_seconds", 600))
+    )
+
+
+def combine_test_and_metrics_gate(
+    metrics_gate: GateResult,
+    test_command: list[str] | None,
+    baseline: CommandResult | None,
+) -> GateResult:
+    title = "Tests, coverage & CRAAP"
+    if not test_command or baseline is None:
+        return GateResult(
+            "quality",
+            title,
+            False,
+            "No complete test command could be configured or inferred.",
+            prompts=[
+                (
+                    "Configure the complete test suite",
+                    "Configure test.command as an argument array that runs every required test and exits non-zero on failure. Then rerun coverage and CRAAP analysis.",
+                )
+            ],
+        )
+    if baseline.returncode != 0:
+        return GateResult(
+            "quality",
+            title,
+            False,
+            "The complete test suite failed before coverage and CRAAP could be certified.",
+            [baseline.stdout],
+            [baseline],
+            [("Repair tests", generic_adapter_prompt("test", baseline))],
+        )
+    metrics_gate.key = "quality"
+    metrics_gate.title = title
+    metrics_gate.command_results.insert(0, baseline)
+    if metrics_gate.passed:
+        metrics_gate.summary = f"Tests pass. {metrics_gate.summary}"
+    return metrics_gate
+
+
+def run_flaky_test_gate(
+    root: Path,
+    config: dict[str, Any],
+    test_command: list[str] | None,
+    baseline: CommandResult | None,
+) -> GateResult:
+    section = config["flaky_tests"]
+    if section.get("enabled", True) is False:
+        return GateResult(
+            "flaky",
+            "Flaky-test detection",
+            False,
+            "Flaky-test detection is disabled; a requested gate cannot be skipped.",
+        )
+    if not test_command or baseline is None:
+        return GateResult(
+            "flaky",
+            "Flaky-test detection",
+            True,
+            "Not applicable: no complete test command was available.",
+            applicable=False,
+        )
+    if baseline.returncode != 0:
+        return GateResult(
+            "flaky",
+            "Flaky-test detection",
+            True,
+            "Not evaluated because the baseline test suite failed consistently before repeat runs.",
+            [baseline.stdout],
+            [baseline],
+            applicable=False,
+        )
+    runs = max(2, int(section.get("runs", 3)))
+    timeout = int(
+        section.get("timeout_seconds", config["test"].get("timeout_seconds", 600))
+    )
+    results = [baseline]
+    for _ in range(runs - 1):
+        results.append(run_command(test_command, root, timeout))
+    exit_codes = {result.returncode for result in results}
+    if exit_codes == {0}:
+        return GateResult(
+            "flaky",
+            "Flaky-test detection",
+            True,
+            f"The complete test suite passed consistently across {runs} runs; zero flakes were observed.",
+            command_results=results,
+        )
+    return GateResult(
+        "flaky",
+        "Flaky-test detection",
+        False,
+        f"The test suite was inconsistent across {runs} runs; exit codes were {sorted(exit_codes)}.",
+        [format_command(result) for result in results if result.returncode != 0],
+        results,
+        [
+            (
+                "Eliminate flaky tests",
+                "Reproduce the inconsistent complete-suite result. Remove dependencies on timing, order, shared mutable state, randomness, network state, and leaked resources. Do not add retries or quarantine the test merely to hide the flake. Rerun the full suite repeatedly until every configured run passes.",
+            )
+        ],
+    )
 
 
 def _python_module_available(
@@ -1902,6 +2488,7 @@ def run_mutation_gate(
     config: dict[str, Any],
     source_files: Sequence[Path],
     cli_max_mutants: int | None,
+    test_baseline: CommandResult | None = None,
 ) -> tuple[GateResult, list[Mutation]]:
     mutation_config = config["mutation"]
     if not mutation_config.get("enabled", True):
@@ -1940,7 +2527,11 @@ def run_mutation_gate(
             "timeout_seconds", config["test"].get("timeout_seconds", 600)
         )
     )
-    baseline = run_command(test_command, root, timeout)
+    baseline = (
+        test_baseline
+        if test_baseline and test_baseline.command == test_command
+        else run_command(test_command, root, timeout)
+    )
     if baseline.returncode != 0:
         return GateResult(
             "mutation",
@@ -2469,8 +3060,17 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     survivors = [mutation for mutation in report.mutations if mutation.survived]
     failed_installs = [result for result in report.tool_setup if result.returncode != 0]
     gate_summary = "\n".join(
-        f"- {gate.title}: {'PASS' if gate.passed else 'FAIL'} — {gate.summary}"
+        f"- {gate.title}: {gate_outcome(gate)} — {gate.summary}"
         for gate in report.gates
+    )
+    failure_evidence = (
+        "\n\n".join(
+            f"{gate.title}:\n"
+            + "\n".join(f"- {detail}" for detail in gate.details[:20])
+            for gate in report.gates
+            if gate.applicable and not gate.passed and gate.details
+        )
+        or "No additional command output was recorded. Read each gate summary above."
     )
     function_summary = (
         "\n".join(
@@ -2509,9 +3109,14 @@ Run from the repository root:
 {rerun_command}
 
 Non-negotiable finish conditions:
-1. Every production function has 100% executable-line coverage and CRAAP <= 6.
-2. The complete test suite kills every generated operator mutant; zero survive.
-3. The dependency checker reports zero ownership or direction-rule violations.
+1. Every applicable formatter and linter command passes with zero violations.
+2. Every applicable static type checker passes with zero errors.
+3. Every detected or configured contract/schema check passes.
+4. The complete test suite passes; every production function has 100% executable-line coverage and CRAAP <= 6.
+5. Every applicable dead-code detector reports zero findings.
+6. The complete test suite passes consistently across every configured flaky-test run.
+7. The complete test suite kills every generated operator mutant; zero survive.
+8. The dependency checker reports zero ownership or direction-rule violations.
 
 Current gate status:
 {gate_summary}
@@ -2525,6 +3130,9 @@ Surviving mutants ({len(survivors)} total; first 50 shown):
 Dependency violations ({len(report.dependency_violations)} total; first 50 shown):
 {dependency_summary}
 
+Other failing-gate evidence:
+{failure_evidence}
+
 Automatic installation failures:
 {install_summary}
 
@@ -2532,46 +3140,100 @@ Repair rules:
 - Read neighboring production code and tests before editing.
 - For uncovered behavior or a surviving mutant, add a behavior-focused test through the production API and prove it fails against the unfixed or mutated code.
 - Simplify control flow without changing behavior until each function meets the CRAAP limit. Preserve public contracts and error paths.
+- Fix formatter, lint, type, contract, and dead-code findings in production code; do not hide them with ignore comments, generated baselines, exclusions, or weakened configuration.
+- Eliminate test nondeterminism at its source. Do not use retries or quarantine to conceal flaky behavior.
 - Fix architecture violations by moving responsibility, splitting a mixed module, or inverting the dependency behind an owned interface. Do not broaden rules merely to make the checker green.
-- Do not disable a gate, lower thresholds, cap mutants, add coverage exclusions, skip tests, weaken assertions, or replace commands with no-ops.
-- After each coherent batch, run the focused tests, then rerun the full gate. Continue until the full gate exits 0 and report the final evidence for all three checks."""
+- Do not disable a gate, lower thresholds, cap mutants, add coverage exclusions, skip tests, weaken assertions, add suppressions, or replace commands with no-ops.
+- After each coherent batch, run the focused tests, then rerun the full gate. Continue until the full gate exits 0 and report final evidence for every applicable check."""
+
+
+def gate_outcome(gate: GateResult) -> str:
+    if not gate.applicable:
+        return "NOT APPLICABLE"
+    return "PASS" if gate.passed else "FAIL"
+
+
+def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) -> str:
+    step, question, kicker, explanation = presentation
+    state = "na" if not gate.applicable else ("pass" if gate.passed else "fail")
+    badge = (
+        "NOT NEEDED"
+        if not gate.applicable
+        else ("LOOKS GOOD" if gate.passed else "FIX THIS")
+    )
+    return f"""<article class="gate {state}">
+      <div class="gate-top"><span class="step">{html.escape(step)}</span><span class="badge">{badge}</span></div>
+      <div class="kicker">{html.escape(kicker)}</div>
+      <h3>{html.escape(question)}</h3>
+      <p class="explain">{html.escape(explanation)}</p>
+      <p class="result">{html.escape(gate.summary)}</p>
+      {details_html(gate.details)}
+      {commands_html(gate.command_results)}
+    </article>"""
 
 
 def html_report(report: AnalysisReport) -> str:
     status = "READY TO SHIP" if report.passed else "NOT READY YET"
     coverage_limit = report.functions[0].coverage_limit if report.functions else 100
     craap_limit = report.functions[0].craap_limit if report.functions else 6
-    passed_gates = sum(gate.passed for gate in report.gates)
+    applicable_gates = sum(gate.applicable for gate in report.gates)
+    passed_gates = sum(gate.passed and gate.applicable for gate in report.gates)
+    not_applicable_gates = len(report.gates) - applicable_gates
     gate_language = {
-        "craap": (
+        "format_lint": (
             "1",
+            "Is the code formatted and idiomatic?",
+            "Formatter + lint",
+            "Every detected project formatter and linter must pass without changing files.",
+        ),
+        "types": (
+            "2",
+            "Do the types agree?",
+            "Static types",
+            "Configured type checkers must report zero errors before tests run.",
+        ),
+        "contracts": (
+            "3",
+            "Are service contracts valid?",
+            "Contracts + schemas",
+            "Detected OpenAPI and JSON Schema files, plus configured compatibility checks, must pass.",
+        ),
+        "quality": (
+            "4",
             "Are all code paths tested?",
-            "Coverage + complexity",
-            f"Every function needs {coverage_limit:g}% test coverage and a CRAAP score of {craap_limit:g} or lower.",
+            "Tests + coverage + complexity",
+            f"The complete suite must pass, with {coverage_limit:g}% function coverage and CRAAP {craap_limit:g} or lower.",
+        ),
+        "dead_code": (
+            "5",
+            "Is unused code gone?",
+            "Dead code",
+            "Configured high-confidence unused-code detectors must report zero findings.",
+        ),
+        "flaky": (
+            "6",
+            "Are the tests repeatable?",
+            "Flaky-test detection",
+            "Repeated complete-suite runs must produce consistent passing results.",
         ),
         "mutation": (
-            "2",
+            "7",
             "Would tests catch wrong code?",
             "Mutation testing",
             "The gate makes tiny wrong changes. Your tests must catch every one.",
         ),
         "dependencies": (
-            "3",
+            "8",
             "Does the architecture stay clean?",
             "Module boundaries",
             "Imports must follow the dependency rules declared by the project.",
         ),
     }
     gate_cards = "".join(
-        f"""<article class="gate {"pass" if gate.passed else "fail"}">
-          <div class="gate-top"><span class="step">{gate_language.get(gate.key, ("•", "", "", ""))[0]}</span><span class="badge">{"LOOKS GOOD" if gate.passed else "FIX THIS"}</span></div>
-          <div class="kicker">{html.escape(gate_language.get(gate.key, ("", "", gate.title, ""))[2])}</div>
-          <h3>{html.escape(gate_language.get(gate.key, ("", gate.title, "", ""))[1])}</h3>
-          <p class="explain">{html.escape(gate_language.get(gate.key, ("", "", "", gate.summary))[3])}</p>
-          <p class="result">{html.escape(gate.summary)}</p>
-          {details_html(gate.details)}
-          {commands_html(gate.command_results)}
-        </article>"""
+        gate_card_html(
+            gate,
+            gate_language.get(gate.key, ("•", gate.title, gate.title, gate.summary)),
+        )
         for gate in report.gates
     )
     ordered_functions = sorted(
@@ -2645,9 +3307,7 @@ def html_report(report: AnalysisReport) -> str:
                 f'<article class="prompt more"><h3>{len(gate.prompts) - len(shown_prompts)} more {html.escape(gate.title)} fixes</h3><p>Start with the prompts shown, then rerun the gate. The next highest-priority fixes will move into this queue.</p></article>'
             )
     if report.passed:
-        prompt_html = (
-            '<div class="all-clear">Nothing to fix. All three checks are green.</div>'
-        )
+        prompt_html = '<div class="all-clear">Nothing to fix. Every applicable check is green.</div>'
     else:
         master_prompt = html.escape(master_fix_prompt(report))
         individual_prompt_html = "".join(prompts)
@@ -2657,7 +3317,7 @@ def html_report(report: AnalysisReport) -> str:
         prompt_html = f"""<article class="prompt master-prompt">
           <div class="prompt-head"><div><div class="kicker">All failing gates · one agent task</div><h3>Fix every issue</h3></div>
           <button data-copy="prompt-fix-everything">Copy complete prompt</button></div>
-          <p>Paste this once. It tells the agent to repair all three checks and keep rerunning the gate until it passes.</p>
+          <p>Paste this once. It tells the agent to repair every applicable check and keep rerunning the gate until it passes.</p>
           <pre id="prompt-fix-everything">{master_prompt}</pre>
         </article>{individual_prompt_html}"""
     notes_html = "".join(f"<li>{html.escape(note)}</li>" for note in report.notes)
@@ -2678,16 +3338,16 @@ def html_report(report: AnalysisReport) -> str:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Can I ship? — {status}</title>
 <style>
-:root{{--bg:#f6f4ff;--ink:#17152b;--muted:#67637b;--card:#fff;--line:#ded9f0;--purple:#6d4aff;--purple-soft:#eee9ff;--good:#087a55;--good-soft:#e5f8f0;--bad:#c72c41;--bad-soft:#fff0f2;--code:#19172b}}
+:root{{--bg:#f6f4ff;--ink:#17152b;--muted:#67637b;--card:#fff;--line:#ded9f0;--purple:#6d4aff;--purple-soft:#eee9ff;--good:#087a55;--good-soft:#e5f8f0;--bad:#c72c41;--bad-soft:#fff0f2;--na:#6b7280;--na-soft:#f1f2f4;--code:#19172b}}
 *{{box-sizing:border-box}} body{{margin:0;background:radial-gradient(circle at 8% 0,#ebe5ff 0,transparent 32%),var(--bg);color:var(--ink);font:16px/1.58 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}}
 main{{max-width:1220px;margin:auto;padding:42px 28px 72px}} h1,h2,h3{{line-height:1.12;letter-spacing:-.025em}} h1{{font-size:clamp(42px,7vw,76px);margin:.12em 0}} h2{{font-size:28px;margin:52px 0 8px}} h3{{font-size:24px;margin:8px 0 12px}}
 .eyebrow,.kicker{{color:var(--purple);font-size:13px;font-weight:900;letter-spacing:.1em;text-transform:uppercase}} .muted,.section-note{{color:var(--muted)}}
 .hero{{display:grid;grid-template-columns:1fr auto;gap:28px;align-items:end;padding:30px;border:1px solid var(--line);border-radius:26px;background:rgba(255,255,255,.78);box-shadow:0 18px 60px rgba(67,47,140,.09)}}
 .verdict{{min-width:220px;text-align:center;font-weight:950;font-size:24px;padding:18px 22px;border-radius:18px}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}}
-.progress{{margin-top:16px;color:var(--muted);font-weight:700}} .progress strong{{color:var(--ink)}} .quick-guide{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}} .quick-guide div{{padding:14px 16px;background:rgba(255,255,255,.7);border:1px solid var(--line);border-radius:14px}} .quick-guide strong{{display:block}}
+.progress{{margin-top:16px;color:var(--muted);font-weight:700}} .progress strong{{color:var(--ink)}} .quick-guide{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .quick-guide div{{padding:14px 16px;background:rgba(255,255,255,.7);border:1px solid var(--line);border-radius:14px}} .quick-guide strong{{display:block}}
 .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}} .gate,.prompt,.setup{{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:0 10px 35px rgba(67,47,140,.06)}}
-.gate.pass{{border-top:6px solid var(--good)}} .gate.fail{{border-top:6px solid var(--bad)}} .gate-top,.prompt-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .step{{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--purple-soft);color:var(--purple);font-weight:950}} .badge{{font-size:12px;font-weight:950;padding:6px 9px;border-radius:99px}} .pass .badge{{background:var(--good-soft);color:var(--good)}} .fail .badge{{background:var(--bad-soft);color:var(--bad)}}
-.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
+.gate.pass{{border-top:6px solid var(--good)}} .gate.fail{{border-top:6px solid var(--bad)}} .gate.na{{border-top:6px solid var(--na)}} .gate-top,.prompt-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .step{{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--purple-soft);color:var(--purple);font-weight:950}} .badge{{font-size:12px;font-weight:950;padding:6px 9px;border-radius:99px}} .pass .badge{{background:var(--good-soft);color:var(--good)}} .fail .badge{{background:var(--bad-soft);color:var(--bad)}} .na .badge{{background:var(--na-soft);color:var(--na)}}
+.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .na .result{{background:var(--na-soft);color:var(--na)}} .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:var(--card)}} table{{width:100%;border-collapse:collapse}} th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{background:#f0edfa;font-size:13px;text-transform:uppercase;letter-spacing:.05em}} tr.bad{{background:#fff8f9}} tr.bad td:last-child{{color:var(--bad);font-weight:900}} tr.ok td:last-child{{color:var(--good);font-weight:800}}
 code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f4f1ff;padding:15px;border-radius:12px;max-height:420px;overflow:auto}} details{{margin-top:12px}} summary{{cursor:pointer;font-weight:800;color:var(--purple)}} button{{background:var(--purple);color:#fff;border:0;border-radius:10px;padding:9px 13px;font-weight:900;cursor:pointer}} button.copied{{background:var(--good)}}
 .prompt{{border-left:5px solid var(--purple)}} .prompt h3{{font-size:18px;letter-spacing:0}} .master-prompt{{grid-column:1/-1;border:2px solid var(--purple);background:linear-gradient(135deg,#fff 0,#f5f1ff 100%)}} .master-prompt h3{{font-size:28px;margin-top:5px}} .master-prompt p{{color:var(--muted)}} .prompt-group-heading{{grid-column:1/-1;margin-top:12px}} .prompt-group-heading h3{{margin-bottom:4px}} .prompt-group-heading p{{margin:0;color:var(--muted)}} .all-clear{{grid-column:1/-1;padding:24px;background:var(--good-soft);color:var(--good);font-weight:850;border-radius:16px}} .setup{{padding:18px 22px}} ul{{padding-left:20px}}
@@ -2695,10 +3355,10 @@ code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white
 </style></head><body><main>
 <section class="hero"><div><div class="eyebrow">CODE CONFIDENCE CHECK · v{VERSION}</div><h1>Can I ship this?</h1>
 <div class="muted">{html.escape(report.root)}<br>{html.escape(report.generated_at)} · {html.escape(language_text)}</div>
-<div class="progress"><strong>{passed_gates} of {len(report.gates)}</strong> safety checks passed</div></div>
+<div class="progress"><strong>{passed_gates} of {applicable_gates}</strong> applicable checks passed · {not_applicable_gates} not applicable</div></div>
 <div class="verdict {"pass" if report.passed else "fail"}">{status}</div></section>
-<section class="quick-guide"><div><strong>Green means go</strong>No action needed.</div><div><strong>Red means pause</strong>Fix it before shipping.</div><div><strong>Need help?</strong>Copy an AI repair prompt below.</div></section>
-<h2>Your three checks</h2><p class="section-note">Start here. Technical proof is lower down when you need it.</p><section class="grid">{gate_cards}</section>
+<section class="quick-guide"><div><strong>Green means go</strong>No action needed.</div><div><strong>Red means pause</strong>Fix it before shipping.</div><div><strong>Gray means not applicable</strong>No supported project check was detected.</div><div><strong>Need help?</strong>Copy an AI repair prompt below.</div></section>
+<h2>Your quality checks</h2><p class="section-note">Start here. Technical proof is lower down when you need it.</p><section class="grid">{gate_cards}</section>
 <section class="stats"><div class="stat"><strong>{functions_passing}/{len(report.functions)}</strong><span>functions meet coverage + CRAAP</span></div><div class="stat"><strong>{mutants_killed}/{len(report.mutations)}</strong><span>wrong-code mutations caught</span></div><div class="stat"><strong>{len(report.dependency_violations)}</strong><span>architecture violations</span></div></section>
 <h2>Fix with your coding agent</h2><p class="section-note">Choose the complete all-in-one prompt or a focused prompt for one issue.</p><section class="grid">{prompt_html}</section>
 <h2>Automatic tool setup</h2><section class="setup"><strong>{html.escape(setup_summary)}</strong>{setup_evidence}</section>
@@ -2802,11 +3462,53 @@ def run(
         )
     with tempfile.TemporaryDirectory(prefix="repo-quality-gate-") as temporary:
         workspace = Path(temporary)
-        metrics_gate, functions = run_metrics_gate(
-            root, config, source_files, workspace, tools
+        format_lint_gate = run_command_check_gate(
+            root,
+            "format_lint",
+            "Formatter & lint",
+            config["format_lint"],
+            infer_format_lint_commands(root, source_files, tools),
+            "Configure format_lint.commands with non-mutating check-mode formatter and linter commands.",
+            tools.python_env,
         )
+        types_gate = run_command_check_gate(
+            root,
+            "types",
+            "Static type checking",
+            config["types"],
+            infer_type_commands(root, source_files, tools),
+            "Configure types.commands with the repository's complete static type checker.",
+            tools.python_env,
+        )
+        contracts_gate = run_contract_gate(root, config, tools)
+        test_command, test_baseline = run_test_baseline(root, config)
+        if test_baseline and test_baseline.returncode == 0:
+            raw_metrics_gate, functions = run_metrics_gate(
+                root, config, source_files, workspace, tools
+            )
+        else:
+            raw_metrics_gate = GateResult(
+                "craap",
+                "CRAAP: coverage + complexity",
+                False,
+                "Coverage and CRAAP were not run because baseline tests did not pass.",
+            )
+            functions = []
+        quality_gate = combine_test_and_metrics_gate(
+            raw_metrics_gate, test_command, test_baseline
+        )
+        dead_code_gate = run_command_check_gate(
+            root,
+            "dead_code",
+            "Dead code",
+            config["dead_code"],
+            infer_dead_code_commands(root, source_files, tools),
+            "Configure dead_code.commands with a high-confidence unused-code detector such as Vulture, Knip, or ts-prune.",
+            tools.python_env,
+        )
+        flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
         mutation_gate, mutations = run_mutation_gate(
-            root, config, source_files, cli_max_mutants
+            root, config, source_files, cli_max_mutants, test_baseline
         )
         dependency_gate, violations = run_dependency_gate(
             root, config, source_files, workspace
@@ -2815,7 +3517,16 @@ def run(
         root=str(root),
         generated_at=time.strftime("%Y-%m-%d %H:%M:%S %z"),
         languages=languages,
-        gates=[metrics_gate, mutation_gate, dependency_gate],
+        gates=[
+            format_lint_gate,
+            types_gate,
+            contracts_gate,
+            quality_gate,
+            dead_code_gate,
+            flaky_gate,
+            mutation_gate,
+            dependency_gate,
+        ],
         functions=functions,
         mutations=mutations,
         dependency_violations=violations,
@@ -2873,7 +3584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(f"Wrote {config_path}")
         print(
-            "Review source, test, metrics, mutation, and dependency settings before the first enforcing run."
+            "Review source, format/lint, types, contracts, tests, metrics, dead-code, flaky-test, mutation, and dependency settings before the first enforcing run."
         )
         return 0
     report_path = Path(args.html)
@@ -2916,7 +3627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"HTML report: {report_path}", file=sys.stderr)
         return 2
     for gate in analysis.gates:
-        print(f"[{'PASS' if gate.passed else 'FAIL'}] {gate.title}: {gate.summary}")
+        print(f"[{gate_outcome(gate)}] {gate.title}: {gate.summary}")
     print(f"HTML report: {report_path}")
     return 0 if analysis.passed else 1
 

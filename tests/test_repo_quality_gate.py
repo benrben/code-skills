@@ -9,17 +9,40 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py"
-EMBEDDED_GATE = LOOP_SCRIPT.with_name("repo_quality_gate.py")
 sys.path.insert(0, str(ROOT))
 
 import repo_quality_gate as gate  # noqa: E402
 
 
 class QualityGateUnitTests(unittest.TestCase):
-    def test_skill_bundles_the_portable_gate_without_drift(self) -> None:
-        self.assertEqual(
-            EMBEDDED_GATE.read_bytes(), (ROOT / "repo_quality_gate.py").read_bytes()
-        )
+    def test_bootstrap_auto_installs_json_schema_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "api.schema.json").write_text(
+                json.dumps({"type": "object"}), encoding="utf-8"
+            )
+            config = gate.default_config()
+            config["tools"]["cache_dir"] = str(root / "tool-cache")
+            config["metrics"]["report"] = "metrics.json"
+            install_result = gate.CommandResult(
+                command=["python", "-m", "pip", "install", "jsonschema"],
+                returncode=0,
+                stdout="installed",
+                duration_seconds=0.1,
+            )
+
+            with (
+                mock.patch.object(gate, "_python_module_available", return_value=False),
+                mock.patch.object(gate, "run_command", return_value=install_result),
+            ):
+                tools = gate.bootstrap_tools(root, config, [])
+
+            self.assertEqual(len(tools.setup_results), 1)
+            self.assertIn("jsonschema", tools.setup_results[0].command)
+            self.assertEqual(
+                gate.discover_contract_files(root, config["contracts"]),
+                [root / "api.schema.json"],
+            )
 
     def test_failing_report_has_master_and_focused_repair_prompts(self) -> None:
         function = gate.FunctionMetric(
@@ -96,11 +119,125 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertIn("Copy complete prompt", rendered)
         self.assertIn("Prefer smaller tasks?", rendered)
         self.assertEqual(rendered.count("data-copy="), 4)
-        self.assertIn("Every production function has 100%", combined)
+        self.assertIn("every production function has 100%", combined)
         self.assertIn("zero survive", combined)
         self.assertIn("zero ownership or direction-rule violations", combined)
         self.assertIn("Continue until the full gate exits 0", combined)
         self.assertIn("python3 /plugin/quality_loop.py --root .", combined)
+
+    def test_package_scripts_feed_reusable_command_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps(
+                    {
+                        "scripts": {
+                            "lint": "eslint .",
+                            "format:check": "prettier --check .",
+                            "typecheck": "tsc --noEmit",
+                            "test:contracts": "node contract-test.js",
+                            "dead-code": "knip",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tools = gate.ToolContext(
+                cache_dir=root,
+                python=sys.executable,
+                python_path=root,
+            )
+
+            with mock.patch.object(
+                gate,
+                "executable",
+                side_effect=lambda _root, name: "/usr/bin/npm"
+                if name == "npm"
+                else None,
+            ):
+                format_commands = gate.infer_format_lint_commands(root, [], tools)
+                type_commands = gate.infer_type_commands(root, [], tools)
+                contract_commands = gate.infer_contract_commands(root)
+                dead_commands = gate.infer_dead_code_commands(root, [], tools)
+
+            self.assertEqual(
+                [command.command[-1] for command in format_commands],
+                ["lint", "format:check"],
+            )
+            self.assertEqual(type_commands[0].command[-1], "typecheck")
+            self.assertEqual(contract_commands[0].command[-1], "test:contracts")
+            self.assertEqual(dead_commands[0].command[-1], "dead-code")
+
+    def test_optional_command_gate_is_explicitly_not_applicable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = gate.run_command_check_gate(
+                Path(temporary),
+                "types",
+                "Static type checking",
+                {"enabled": "auto", "required": False, "commands": []},
+                [],
+                "Configure a type checker.",
+            )
+
+        self.assertTrue(result.passed)
+        self.assertFalse(result.applicable)
+        self.assertIn("Not applicable", result.summary)
+        self.assertEqual(gate.gate_outcome(result), "NOT APPLICABLE")
+
+    def test_output_sensitive_formatter_command_fails_on_listed_files(self) -> None:
+        command_result = gate.CommandResult(
+            command=["gofmt", "-l", "app.go"],
+            returncode=0,
+            stdout="app.go\n",
+            duration_seconds=0.1,
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(gate, "run_command", return_value=command_result),
+        ):
+            result = gate.run_command_check_gate(
+                Path(temporary),
+                "format_lint",
+                "Formatter & lint",
+                {"enabled": "auto", "required": False, "commands": []},
+                [gate.CheckCommand(command_result.command, fail_on_output=True)],
+                "Configure formatting.",
+            )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(result.applicable)
+
+    def test_flaky_gate_fails_on_inconsistent_exit_codes(self) -> None:
+        baseline = gate.CommandResult(
+            command=["test-command"],
+            returncode=0,
+            stdout="pass",
+            duration_seconds=0.1,
+        )
+        passing = gate.CommandResult(
+            command=["test-command"],
+            returncode=0,
+            stdout="pass",
+            duration_seconds=0.1,
+        )
+        failing = gate.CommandResult(
+            command=["test-command"],
+            returncode=1,
+            stdout="intermittent failure",
+            duration_seconds=0.1,
+        )
+        config = gate.default_config()
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(gate, "run_command", side_effect=[passing, failing]),
+        ):
+            result = gate.run_flaky_test_gate(
+                Path(temporary), config, ["test-command"], baseline
+            )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.command_results), 3)
+        self.assertIn("inconsistent", result.summary)
 
     def test_bootstrap_auto_installs_lizard_for_typescript(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -372,7 +509,27 @@ class QualityGateEndToEndTests(unittest.TestCase):
                         {
                             "source": {"include": ["src/**"], "exclude": []},
                             "test": {"command": [sys.executable, "check.py"]},
+                            "format_lint": {
+                                "commands": [
+                                    [sys.executable, "-c", "print('format clean')"]
+                                ]
+                            },
+                            "types": {
+                                "commands": [
+                                    [sys.executable, "-c", "print('types clean')"]
+                                ]
+                            },
+                            "contracts": {
+                                "commands": [
+                                    [sys.executable, "-c", "print('contracts valid')"]
+                                ]
+                            },
                             "metrics": {"report": "metrics.json"},
+                            "dead_code": {
+                                "commands": [
+                                    [sys.executable, "-c", "print('no dead code')"]
+                                ]
+                            },
                             "mutation": {
                                 "test_command": [sys.executable, "check.py"],
                                 "operators": {"==": "!="},
@@ -402,7 +559,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
 
             self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
             self.assertEqual(passing_state["status"], "pass")
-            self.assertEqual(len(passing_state["gates"]), 3)
+            self.assertEqual(len(passing_state["gates"]), 8)
+            self.assertEqual(passing_state["counts"]["checks_applicable"], 8)
+            self.assertEqual(passing_state["counts"]["checks_passing"], 8)
             self.assertIsNone(passing_state["fix_prompt"])
 
             rules_path.unlink()
@@ -418,7 +577,10 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertIsNotNone(failing_state["fix_prompt"])
             self.assertIn(str(LOOP_SCRIPT), failing_state["rerun_command"])
             self.assertEqual(failing_state["counts"]["dependency_violations"], 0)
-            self.assertEqual(failing_state["gates"][2]["status"], "fail")
+            dependency_gate = next(
+                item for item in failing_state["gates"] if item["key"] == "dependencies"
+            )
+            self.assertEqual(dependency_gate["status"], "fail")
 
             config_path.write_text("{invalid", encoding="utf-8")
             broken = subprocess.run(
@@ -474,7 +636,19 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 {
                     "source": {"include": ["src/**"], "exclude": []},
                     "test": {"command": passing_command},
+                    "format_lint": {
+                        "commands": [[sys.executable, "-c", "print('format clean')"]]
+                    },
+                    "types": {
+                        "commands": [[sys.executable, "-c", "print('types clean')"]]
+                    },
+                    "contracts": {
+                        "commands": [[sys.executable, "-c", "print('contracts valid')"]]
+                    },
                     "metrics": {"report": "metrics.json"},
+                    "dead_code": {
+                        "commands": [[sys.executable, "-c", "print('no dead code')"]]
+                    },
                     "mutation": {
                         "test_command": passing_command,
                         "operators": {"==": "!="},
@@ -490,7 +664,8 @@ class QualityGateEndToEndTests(unittest.TestCase):
             rendered = report_path.read_text(encoding="utf-8")
             self.assertIn("Can I ship this?", rendered)
             self.assertIn("READY TO SHIP", rendered)
-            self.assertEqual(rendered.count('<article class="gate '), 3)
+            self.assertEqual(rendered.count('<article class="gate '), 8)
+            self.assertEqual(rendered.count("NOT NEEDED"), 0)
             self.assertEqual(rendered.count("data-copy="), 0)
             self.assertNotIn("Gherkin", rendered)
             self.assertNotIn("Executable UI", rendered)

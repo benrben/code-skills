@@ -22,8 +22,8 @@ from types import ModuleType
 from typing import Any, Sequence
 
 
-VERSION = "1.0.0"
-DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
+VERSION = "2.0.0"
+DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
 
 
 def load_gate(path: Path) -> ModuleType:
@@ -138,12 +138,31 @@ def analysis_state(
         "gates": [
             {
                 "key": result.key,
-                "status": "pass" if result.passed else "fail",
+                "status": (
+                    "not_applicable"
+                    if not result.applicable
+                    else ("pass" if result.passed else "fail")
+                ),
                 "summary": result.summary,
+                "details": result.details[:100],
+                "commands": [
+                    {
+                        "command": item.command,
+                        "returncode": item.returncode,
+                        "timed_out": item.timed_out,
+                        "duration_seconds": round(item.duration_seconds, 3),
+                    }
+                    for item in result.command_results
+                ],
             }
             for result in analysis.gates
         ],
         "counts": {
+            "checks_total": len(analysis.gates),
+            "checks_applicable": sum(item.applicable for item in analysis.gates),
+            "checks_passing": sum(
+                item.applicable and item.passed for item in analysis.gates
+            ),
             "functions_total": len(analysis.functions),
             "functions_failing": len(failing_functions),
             "mutants_total": len(analysis.mutations),
@@ -151,6 +170,16 @@ def analysis_state(
             "dependency_violations": len(violations),
         },
         "failures": {
+            "checks": [
+                {
+                    "key": item.key,
+                    "title": item.title,
+                    "summary": item.summary,
+                    "details": item.details[:100],
+                }
+                for item in analysis.gates
+                if item.applicable and not item.passed
+            ],
             "functions": [function_failure(item) for item in failing_functions[:200]],
             "surviving_mutants": [mutation_failure(item) for item in survivors[:200]],
             "dependencies": [dependency_failure(item) for item in violations[:200]],
@@ -296,9 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_json_atomic(state_path, state)
 
     for result in analysis.gates:
-        print(
-            f"[{'PASS' if result.passed else 'FAIL'}] {result.title}: {result.summary}"
-        )
+        print(f"[{gate.gate_outcome(result)}] {result.title}: {result.summary}")
     print(f"QUALITY_LOOP={state['status'].upper()}")
     print(f"STATE={state_path}")
     print(f"HTML={html_path}")

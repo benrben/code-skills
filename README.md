@@ -42,13 +42,23 @@ launching a full-repository gate.
 ## Portable repository quality gate
 
 [`repo_quality_gate.py`](repo_quality_gate.py) is a single-file bootstrapper and
-runner for any repository. It enforces three required gates and writes a clear,
-self-contained HTML report with one copy-paste prompt to fix every failure plus
-focused prompts for developers who prefer to repair issues individually:
+runner for any repository. It writes a clear, self-contained HTML report with
+one copy-paste prompt to fix every failure plus focused prompts for developers
+who prefer to repair issues individually. The organized loop runs these checks:
 
+- formatter and lint commands
+- static type checking
+- contract and schema validation
 - 100% per-function coverage and CRAAP ≤ 6
+- dead-code detection
+- repeated-suite flaky-test detection
 - zero surviving operator mutants
 - zero module dependency violations
+
+Repository-configured commands take precedence. Common package scripts and
+tool configurations are detected automatically; checks unsupported by a
+repository are reported explicitly as not applicable instead of silently
+passing. Set a check's `required` field to `true` when missing tooling must fail.
 
 Copy it into a repository, let it detect the available toolchain, and run it:
 
@@ -59,12 +69,13 @@ python3 repo_quality_gate.py --root . --html quality-gate-report.html
 open quality-gate-report.html  # macOS; use your browser elsewhere
 ```
 
-Missing analysis tools install automatically. Python coverage and the
-multi-language Lizard complexity analyzer go into an isolated gate cache;
-Vitest's matching V8 coverage provider installs into `node_modules` without
-changing `package.json` or the lockfile; Rust coverage installs into a
-gate-owned Cargo prefix. Mutation and dependency analysis are built into the
-script. Use `--no-install` for an offline/read-only tool setup run.
+Missing detected analysis tools install automatically. Ruff, mypy, Vulture,
+JSON Schema and OpenAPI validators, Python coverage, and the multi-language
+Lizard complexity analyzer go into an isolated gate cache; Vitest's matching
+V8 coverage provider installs into `node_modules` without changing
+`package.json` or the lockfile; Rust coverage installs into a gate-owned Cargo
+prefix. Mutation and dependency analysis are built into the script. Use
+`--no-install` for an offline/read-only tool setup run.
 
 The core is language-neutral. It reads standard coverage formats (Coverage.py
 JSON, Istanbul JSON, LCOV, Cobertura/JaCoCo XML, and Go cover profiles), uses
@@ -110,8 +121,8 @@ machine-readable JSON state under a repository-specific user cache. Exit `0`
 means all gates pass, exit `1` means the JSON contains actionable failures and a
 single combined repair prompt, and exit `2` means configuration or tooling must
 be repaired first. The agent fixes a coherent batch and invokes the same command
-again until it exits `0`. The skill bundles its own gate engine, so it also works
-when installed independently from the rest of this repository.
+again until it exits `0`. The loop and standalone CLI share one canonical gate
+engine at the plugin root, so fixes and new checks cannot drift between copies.
 
 ## Method
 

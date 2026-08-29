@@ -1,7 +1,7 @@
 {
   "name": "code-skills",
-  "version": "1.0.0",
-  "description": "Engineering discipline with a strict repository quality repair loop.",
+  "version": "2.0.0",
+  "description": "Engineering discipline with reusable formatting, type, contract, test, dead-code, mutation, flake, and architecture gates.",
   "author": {
     "name": "Ben Reich",
     "url": "https://github.com/benrben"
@@ -13,7 +13,7 @@
   "interface": {
     "displayName": "Code Discipline",
     "shortDescription": "Engineering discipline and strict quality loops.",
-    "longDescription": "Applies behavior-preserving engineering discipline and can loop on coverage, mutation strength, and module boundaries until every required gate passes.",
+    "longDescription": "Applies behavior-preserving engineering discipline and loops through formatting, lint, types, contracts, tests, coverage, complexity, dead code, flakes, mutation strength, and module boundaries until every applicable gate passes.",
     "developerName": "Ben Reich",
     "category": "Developer Tools",
     "capabilities": [],

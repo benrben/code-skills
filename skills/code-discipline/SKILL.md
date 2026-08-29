@@ -1,6 +1,6 @@
 ---
 name: code-discipline
-description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, YAGNI-restrained design, and an executable repository-quality loop when strict coverage, mutation, or dependency gates are requested.
+description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, YAGNI-restrained design, and an executable repository-quality loop when strict formatting, lint, types, contracts, coverage, mutation, dead-code, flaky-test, or dependency gates are requested.
 ---
 
 # The Zen of Modern Development
@@ -14,9 +14,10 @@ and record why — practicality beats purity.
 ## Repository quality loop
 
 Use the loop only when the user asks for strict repository hardening, the
-quality gate, mutation testing, CRAAP enforcement, architecture enforcement,
-or continued repair until all checks pass. Ordinary coding work does not
-authorize this full-repository run.
+quality gate, formatting/lint enforcement, static types, contract validation,
+mutation testing, CRAAP enforcement, dead-code detection, flaky-test detection,
+architecture enforcement, or continued repair until all checks pass. Ordinary
+coding work does not authorize this full-repository run.
 
 The deterministic entrypoint is `scripts/quality_loop.py` beside this file. In
 Claude Code plugins it is available at
@@ -30,7 +31,7 @@ python3 <skill-directory>/scripts/quality_loop.py --root .
 
 The core writes its HTML and JSON state to a user cache, leaving the target
 worktree unchanged except for repairs the agent intentionally makes. Exit `0`
-means all three gates passed. Exit `1` means measured failures remain: read
+means every applicable gate passed. Exit `1` means measured failures remain: read
 `fix_prompt` and `failures` in the printed state JSON path, repair one coherent
 batch, run focused tests, and rerun. Exit `2` means configuration, an adapter,
 or the runner failed; repair that blocker before changing production behavior.
@@ -41,13 +42,15 @@ If `.quality-dependencies.json` is missing, derive its modules and permitted
 directions from the intended architecture after reading the repository; never
 bless accidental imports as the specification.
 
-The finish conditions are 100% executable-line coverage and CRAAP ≤ 6 for
-every production function, zero surviving operator mutants, and zero module
-ownership or direction violations. Never lower thresholds, disable a gate,
-cap the final mutation run, skip tests, weaken assertions, add exclusions,
-broaden an allow-list merely to pass, or replace a command with a no-op.
-Continue until the core exits `0`, then report all three summaries and the
-state/report paths. Do not commit or push unless the user asked.
+The finish conditions are zero formatter/linter/type/contract/dead-code
+violations where those checks apply; a passing and repeatable full test suite;
+100% executable-line coverage and CRAAP ≤ 6 for every production function;
+zero surviving operator mutants; and zero module ownership or direction
+violations. Never lower thresholds, disable a gate, cap the final mutation run,
+skip tests, weaken assertions, add suppressions or exclusions, broaden an
+allow-list merely to pass, or replace a command with a no-op. Continue until
+the core exits `0`, then report every applicable summary and the state/report
+paths. Do not commit or push unless the user asked.
 
 ## Readability counts.
 
