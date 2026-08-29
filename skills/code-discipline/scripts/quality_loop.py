@@ -9,21 +9,37 @@ prevented a complete measurement.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import shlex
 import sys
 import tempfile
 import time
 from types import ModuleType
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence, TextIO
 
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
+
+
+class ConcurrentRunError(RuntimeError):
+    """Raised when another quality loop already owns a repository."""
+
+
+def raise_keyboard_interrupt(_signum: int, _frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
+def install_interrupt_handlers() -> None:
+    signal.signal(signal.SIGINT, raise_keyboard_interrupt)
+    signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
 
 def load_gate(path: Path) -> ModuleType:
@@ -48,6 +64,90 @@ def default_artifact_dir(root: Path) -> Path:
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     digest = hashlib.sha256(str(root).encode()).hexdigest()[:12]
     return cache / "repo-quality-loop" / f"{root.name}-{digest}"
+
+
+def repository_lock_path(root: Path) -> Path:
+    """Return one stable lock path regardless of report destination."""
+    return default_artifact_dir(root.resolve()) / ".run.lock"
+
+
+def try_lock(handle: TextIO) -> bool:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write("\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EDEADLK}:
+                return False
+            raise
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def unlock(handle: TextIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def lock_owner(handle: TextIO) -> str:
+    handle.seek(0)
+    raw = handle.read().strip("\0\n ")
+    if not raw:
+        return "owner details unavailable"
+    try:
+        owner = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    pid = owner.get("pid", "unknown")
+    started_at = owner.get("started_at", "unknown time")
+    return f"PID {pid}, started {started_at}"
+
+
+@contextmanager
+def repository_run_lock(root: Path) -> Iterator[None]:
+    """Allow only one quality loop to use a repository's shared tools at a time."""
+    path = repository_lock_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        if not try_lock(handle):
+            raise ConcurrentRunError(
+                f"quality loop already running for {root} ({lock_owner(handle)})"
+            )
+        try:
+            handle.seek(0)
+            handle.truncate()
+            json.dump(
+                {
+                    "pid": os.getpid(),
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+                },
+                handle,
+            )
+            handle.flush()
+            yield
+        finally:
+            unlock(handle)
 
 
 def display_path(path: Path, root: Path) -> str:
@@ -321,13 +421,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    root = Path(args.root).resolve()
-    if not root.is_dir():
-        print(f"error: repository root does not exist: {root}", file=sys.stderr)
-        return 2
-
+def run_locked(args: argparse.Namespace, root: Path) -> int:
     explicit_config = args.config is not None
     config_path = resolve_from_root(args.config, root, root / ".quality-gate.json")
     explicit_artifacts = args.artifact_dir is not None
@@ -400,6 +494,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.print_prompt and state["fix_prompt"]:
         print("\n" + state["fix_prompt"])
     return exit_code
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        print(f"error: repository root does not exist: {root}", file=sys.stderr)
+        return 2
+    install_interrupt_handlers()
+    try:
+        with repository_run_lock(root):
+            return run_locked(args, root)
+    except ConcurrentRunError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted: quality loop stopped cleanly", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

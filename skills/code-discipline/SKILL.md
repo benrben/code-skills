@@ -39,11 +39,13 @@ DIR` for the default HTML and JSON filenames in a dedicated directory.
 
 For a full mutation run, `--mutation-workers auto` executes mutants in up to
 four isolated repository snapshots; a positive integer selects an exact upper
-bound. The active worktree is never mutated by parallel workers. Use one worker
-when tests cannot isolate fixed ports, shared databases, external accounts, or
-other process-global resources. Tests may use `QUALITY_GATE_MUTATION_WORKER` to
-derive worker-specific resources. Parallelism changes throughput only; it must
-not reduce the mutant set or weaken the zero-survivor requirement.
+bound. Every worker, including a single worker, uses a disposable snapshot, so
+the active worktree is never mutated. Use one worker when tests cannot isolate
+fixed ports, shared databases, external accounts, or other process-global
+resources. Tests may use `QUALITY_GATE_MUTATION_WORKER` to derive worker-specific
+resources. Parallelism changes throughput only; it must not reduce the mutant
+set or weaken the zero-survivor requirement. Only one quality loop may run per
+repository at a time because coverage tools commonly share temporary paths.
 
 The core writes its HTML and JSON state to a user cache, leaving the target
 worktree unchanged except for repairs the agent intentionally makes. Exit `0`

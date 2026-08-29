@@ -126,7 +126,10 @@ temporary/cache paths, so it never mutates the active worktree or another
 worker's files. Repositories whose tests share fixed ports, databases,
 accounts, or other resources should either isolate those resources using
 `QUALITY_GATE_MUTATION_WORKER` or select one worker. The default remains one
-worker for compatibility.
+worker for compatibility. A repository-specific lock rejects overlapping
+quality-loop runs before they can race over shared coverage output. Interrupts
+and command timeouts stop the complete spawned process tree and release that
+lock cleanly.
 
 Agents loop on the smaller core attached to `code-discipline`:
 

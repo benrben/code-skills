@@ -1,5 +1,8 @@
 import json
+import importlib.util
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,18 @@ LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py
 sys.path.insert(0, str(ROOT))
 
 import repo_quality_gate as gate  # noqa: E402
+
+
+def load_quality_loop():
+    spec = importlib.util.spec_from_file_location("quality_loop_test_module", LOOP_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load quality loop: {LOOP_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+quality_loop = load_quality_loop()
 
 
 class QualityGateUnitTests(unittest.TestCase):
@@ -495,6 +510,51 @@ const helper = require('./helper.js')
             self.assertEqual(source.read_text(encoding="utf-8"), original)
             self.assertEqual(source.stat().st_mtime_ns, original_mtime)
 
+    def test_single_mutation_worker_uses_an_isolated_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            original = "def is_one(value):\n    return value == 1\n"
+            source.write_text(original, encoding="utf-8")
+            config = gate.default_config()
+            config["test"]["command"] = ["test-command"]
+            config["mutation"]["operators"] = {"==": "!="}
+            mutation_roots: list[Path] = []
+
+            def fake_run_command(
+                command: list[str],
+                execution_root: Path,
+                _timeout: int,
+                _extra_env: dict[str, str] | None = None,
+            ) -> gate.CommandResult:
+                if execution_root == root:
+                    self.assertEqual(source.read_text(encoding="utf-8"), original)
+                    return gate.CommandResult(command, 0, "baseline", 0.01)
+                mutation_roots.append(execution_root)
+                self.assertEqual(source.read_text(encoding="utf-8"), original)
+                self.assertNotEqual(
+                    (execution_root / "app.py").read_text(encoding="utf-8"),
+                    original,
+                )
+                return gate.CommandResult(command, 1, "killed", 0.01)
+
+            with mock.patch.object(
+                gate, "run_command", side_effect=fake_run_command
+            ):
+                result, mutations = gate.run_mutation_gate(
+                    root,
+                    config,
+                    [source],
+                    cli_max_mutants=None,
+                    cli_mutation_workers=1,
+                )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(len(mutations), 1)
+            self.assertEqual(len(mutation_roots), 1)
+            self.assertNotEqual(mutation_roots[0], root)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
     def test_mutation_gate_runs_parallel_workers_in_isolated_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -594,6 +654,90 @@ const helper = require('./helper.js')
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     gate.resolve_mutation_workers(invalid, 10)
+
+    def test_quality_loop_rejects_a_concurrent_run_for_the_same_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache)}):
+                with quality_loop.repository_run_lock(root):
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            str(LOOP_SCRIPT),
+                            "--root",
+                            str(root),
+                            "--fast",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                        env=os.environ.copy(),
+                    )
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("already running", completed.stderr)
+
+    def test_quality_loop_interrupt_stops_the_complete_command_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            child_pid_path = root / "child.pid"
+            (root / "check.py").write_text(
+                "from pathlib import Path\n"
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                f"Path({str(child_pid_path)!r}).write_text(str(child.pid))\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            (root / ".quality-gate.json").write_text(
+                json.dumps(
+                    {
+                        "test": {
+                            "command": [sys.executable, "check.py"],
+                            "timeout_seconds": 60,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            wrapper = (
+                "import os, signal, sys; "
+                "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                "os.execv(sys.executable, [sys.executable, sys.argv[1], "
+                "'--root', sys.argv[2], '--fast', '--no-install'])"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", wrapper, str(LOOP_SCRIPT), str(root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            child_pid: int | None = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not child_pid_path.exists():
+                    time.sleep(0.05)
+                self.assertTrue(child_pid_path.exists(), "test command did not start")
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+                os.kill(process.pid, signal.SIGINT)
+                process.communicate(timeout=8)
+
+                self.assertEqual(process.returncode, 130)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=5)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_dependency_gate_rejects_forbidden_edge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -26,18 +26,20 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tokenize
 from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 
@@ -510,7 +512,12 @@ def run_command(
     if extra_env:
         env.update(extra_env)
     try:
-        completed = subprocess.run(
+        process_options: dict[str, Any] = {}
+        if os.name == "nt":
+            process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            process_options["start_new_session"] = True
+        process = subprocess.Popen(
             list(command),
             cwd=root,
             env=env,
@@ -518,25 +525,27 @@ def run_command(
             stderr=subprocess.STDOUT,
             text=True,
             errors="replace",
-            timeout=max(1, timeout_seconds),
-            check=False,
+            **process_options,
         )
+        try:
+            stdout, _ = process.communicate(timeout=max(1, timeout_seconds))
+        except subprocess.TimeoutExpired:
+            stdout = stop_process_tree(process)
+            return CommandResult(
+                command=list(command),
+                returncode=124,
+                stdout=stdout[-12000:],
+                duration_seconds=time.monotonic() - started,
+                timed_out=True,
+            )
+        except BaseException:
+            stop_process_tree(process)
+            raise
         return CommandResult(
             command=list(command),
-            returncode=completed.returncode,
-            stdout=completed.stdout[-12000:],
+            returncode=process.returncode,
+            stdout=stdout[-12000:],
             duration_seconds=time.monotonic() - started,
-        )
-    except subprocess.TimeoutExpired as error:
-        output = error.stdout or ""
-        if isinstance(output, bytes):
-            output = output.decode(errors="replace")
-        return CommandResult(
-            command=list(command),
-            returncode=124,
-            stdout=output[-12000:],
-            duration_seconds=time.monotonic() - started,
-            timed_out=True,
         )
     except OSError as error:
         return CommandResult(
@@ -545,6 +554,31 @@ def run_command(
             stdout=str(error),
             duration_seconds=time.monotonic() - started,
         )
+
+
+def stop_process_tree(process: subprocess.Popen[str]) -> str:
+    """Stop a command and every descendant while preserving captured output."""
+    if process.poll() is None:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+    try:
+        stdout, _ = process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            process.kill()
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        stdout, _ = process.communicate()
+    return stdout or ""
 
 
 def executable(root: Path, name: str) -> str | None:
@@ -2718,9 +2752,14 @@ def run_mutations_serially(
 ) -> list[Mutation]:
     results: list[Mutation] = []
     with tempfile.TemporaryDirectory(
-        prefix="quality-gate-mutation-runtime-"
+        prefix="quality-gate-mutation-worker-"
     ) as temporary:
-        runtime_root = Path(temporary)
+        worker_parent = Path(temporary)
+        worker_root = worker_parent / "repository"
+        runtime_root = worker_parent / "runtime"
+        copy_repository_snapshot(root, worker_root)
+        runtime_root.mkdir()
+        worker_command = command_for_snapshot(test_command, root, worker_root)
         for index, candidate in enumerate(candidates, start=1):
             if sys.stderr.isatty():
                 print(
@@ -2731,8 +2770,8 @@ def run_mutations_serially(
             results.append(
                 execute_mutation_candidate(
                     candidate,
-                    root,
-                    test_command,
+                    worker_root,
+                    worker_command,
                     timeout,
                     runtime_root,
                     1,
@@ -2750,6 +2789,7 @@ def run_mutations_in_parallel(
 ) -> list[Mutation]:
     indexed = list(enumerate(candidates, start=1))
     assignments = [indexed[index::worker_count] for index in range(worker_count)]
+    stop_requested = threading.Event()
 
     def run_worker(
         worker_number: int,
@@ -2764,6 +2804,8 @@ def run_mutations_in_parallel(
         worker_command = command_for_snapshot(test_command, root, worker_root)
         completed: list[tuple[int, Mutation]] = []
         for index, candidate in assigned:
+            if stop_requested.is_set():
+                break
             if sys.stderr.isatty():
                 print(
                     f"[mutation {index}/{len(candidates)} worker {worker_number}] {candidate.path}:{candidate.line}:{candidate.column} {candidate.original}->{candidate.replacement}",
@@ -2795,8 +2837,14 @@ def run_mutations_in_parallel(
                 executor.submit(run_worker, index + 1, assigned, pool_root)
                 for index, assigned in enumerate(assignments)
             ]
-            for future in futures:
-                by_index.update(future.result())
+            try:
+                for future in futures:
+                    by_index.update(future.result())
+            except BaseException:
+                stop_requested.set()
+                for future in futures:
+                    future.cancel()
+                raise
     return [by_index[index] for index in range(1, len(candidates) + 1)]
 
 
