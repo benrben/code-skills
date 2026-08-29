@@ -1,7 +1,7 @@
 # code-skills
 
 Personal collection of [Agent Skills](https://github.com/anthropics/skills)
-for Claude Code. Every skill here is **eval-certified**: it exists because it
+for Claude Code and Codex. Every skill here is **eval-certified**: it exists because it
 won a pre-registered, blind-judged A/B on a real codebase — and anything that
 lost such an eval was deleted, not kept.
 
@@ -9,7 +9,7 @@ lost such an eval was deleted, not kept.
 
 | Skill | Task it serves | Certified record |
 |---|---|---|
-| [code-discipline](skills/code-discipline/SKILL.md) | Any coding work — writing, fixing, refactoring, reviewing. Nine verses of why, each with the terse rules that enforce it | 6–1 across 7 blind-judged execution cells, two worker models; every rule earned its place by flipping a lost cell |
+| [code-discipline](skills/code-discipline/SKILL.md) | Any coding work—writing, fixing, refactoring, reviewing—plus an on-request executable repository quality loop | 6–1 across 7 blind-judged execution cells, two worker models; every doctrine rule earned its place by flipping a lost cell |
 
 Renamed 2026-08-22 for task clarity — evaluated as *modern-zen*, the name the
 archive still uses.
@@ -19,14 +19,25 @@ description.
 
 ## Install
 
-Clone, then symlink skills into your personal skills directory:
+Clone, then symlink the same skill into Claude Code, Codex, or both:
 
 ```bash
 git clone https://github.com/benrben/code-skills.git
 ln -s "$(pwd)/code-skills/skills/code-discipline" ~/.claude/skills/code-discipline
+ln -s "$(pwd)/code-skills/skills/code-discipline" ~/.codex/skills/code-discipline
 ```
 
-Skills auto-trigger from their frontmatter `description`.
+The repository is also a validated plugin bundle: `.claude-plugin/plugin.json`
+and `.codex-plugin/plugin.json` expose the same `code-discipline` skill without
+creating a second skill. For a local Claude Code plugin session:
+
+```bash
+claude --plugin-dir "$(pwd)/code-skills"
+```
+
+Skills auto-trigger from their frontmatter `description`. The strict repository
+loop runs only when requested; ordinary coding still uses the discipline without
+launching a full-repository gate.
 
 ## Portable repository quality gate
 
@@ -87,6 +98,20 @@ dependency specification or a semantic analyzer for an unknown language, that
 gate fails with a prompt that an agent can use to create the missing evidence.
 `--max-mutants N` is available for quick diagnostics, but a capped mutation run
 can never produce a passing gate.
+
+Agents loop on the smaller core attached to `code-discipline`:
+
+```bash
+python3 skills/code-discipline/scripts/quality_loop.py --root /path/to/repository
+```
+
+Each invocation performs one complete measurement and writes an HTML report and
+machine-readable JSON state under a repository-specific user cache. Exit `0`
+means all gates pass, exit `1` means the JSON contains actionable failures and a
+single combined repair prompt, and exit `2` means configuration or tooling must
+be repaired first. The agent fixes a coherent batch and invokes the same command
+again until it exits `0`. The skill bundles its own gate engine, so it also works
+when installed independently from the rest of this repository.
 
 ## Method
 

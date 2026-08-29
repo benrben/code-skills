@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,12 +8,19 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py"
+EMBEDDED_GATE = LOOP_SCRIPT.with_name("repo_quality_gate.py")
 sys.path.insert(0, str(ROOT))
 
 import repo_quality_gate as gate  # noqa: E402
 
 
 class QualityGateUnitTests(unittest.TestCase):
+    def test_skill_bundles_the_portable_gate_without_drift(self) -> None:
+        self.assertEqual(
+            EMBEDDED_GATE.read_bytes(), (ROOT / "repo_quality_gate.py").read_bytes()
+        )
+
     def test_failing_report_has_master_and_focused_repair_prompts(self) -> None:
         function = gate.FunctionMetric(
             path="src/app.py",
@@ -78,6 +86,7 @@ class QualityGateUnitTests(unittest.TestCase):
             dependency_violations=[violation],
             tool_setup=[],
             notes=[],
+            rerun_command="python3 /plugin/quality_loop.py --root .",
         )
 
         combined = gate.master_fix_prompt(report)
@@ -91,6 +100,7 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertIn("zero survive", combined)
         self.assertIn("zero ownership or direction-rule violations", combined)
         self.assertIn("Continue until the full gate exits 0", combined)
+        self.assertIn("python3 /plugin/quality_loop.py --root .", combined)
 
     def test_bootstrap_auto_installs_lizard_for_typescript(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -312,6 +322,116 @@ const helper = require('./helper.js')
 
 
 class QualityGateEndToEndTests(unittest.TestCase):
+    def test_agent_loop_emits_pass_fail_and_error_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            source = root / "src" / "app.py"
+            source.write_text(
+                "def is_one(value):\n    return value == 1\n", encoding="utf-8"
+            )
+            (root / "check.py").write_text(
+                "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\n",
+                encoding="utf-8",
+            )
+            (root / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "src/app.py",
+                                "name": "is_one",
+                                "start_line": 1,
+                                "end_line": 2,
+                                "complexity": 1,
+                                "covered_lines": 2,
+                                "total_lines": 2,
+                                "coverage_percent": 100,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rules_path = root / ".quality-dependencies.json"
+            rules_path.write_text(
+                json.dumps(
+                    {
+                        "modules": [{"name": "core", "paths": ["src/**"]}],
+                        "allow": {"core": []},
+                        "deny": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path = root / ".quality-gate.json"
+            config_path.write_text(
+                json.dumps(
+                    gate.deep_merge(
+                        gate.default_config(),
+                        {
+                            "source": {"include": ["src/**"], "exclude": []},
+                            "test": {"command": [sys.executable, "check.py"]},
+                            "metrics": {"report": "metrics.json"},
+                            "mutation": {
+                                "test_command": [sys.executable, "check.py"],
+                                "operators": {"==": "!="},
+                            },
+                        },
+                    )
+                ),
+                encoding="utf-8",
+            )
+            artifacts = root / "artifacts"
+            command = [
+                sys.executable,
+                str(LOOP_SCRIPT),
+                "--root",
+                str(root),
+                "--artifact-dir",
+                str(artifacts),
+                "--no-install",
+            ]
+
+            passing = subprocess.run(
+                command, capture_output=True, text=True, timeout=30, check=False
+            )
+            passing_state = json.loads(
+                (artifacts / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
+            self.assertEqual(passing_state["status"], "pass")
+            self.assertEqual(len(passing_state["gates"]), 3)
+            self.assertIsNone(passing_state["fix_prompt"])
+
+            rules_path.unlink()
+            failing = subprocess.run(
+                command, capture_output=True, text=True, timeout=30, check=False
+            )
+            failing_state = json.loads(
+                (artifacts / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(failing.returncode, 1, failing.stdout + failing.stderr)
+            self.assertEqual(failing_state["status"], "fail")
+            self.assertIsNotNone(failing_state["fix_prompt"])
+            self.assertIn(str(LOOP_SCRIPT), failing_state["rerun_command"])
+            self.assertEqual(failing_state["counts"]["dependency_violations"], 0)
+            self.assertEqual(failing_state["gates"][2]["status"], "fail")
+
+            config_path.write_text("{invalid", encoding="utf-8")
+            broken = subprocess.run(
+                command, capture_output=True, text=True, timeout=30, check=False
+            )
+            broken_state = json.loads(
+                (artifacts / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(broken.returncode, 2, broken.stdout + broken.stderr)
+            self.assertEqual(broken_state["status"], "error")
+            self.assertTrue(broken_state["error"])
+
     def test_complete_generic_adapter_run_passes_and_writes_html(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

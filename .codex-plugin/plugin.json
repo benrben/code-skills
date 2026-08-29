@@ -1,0 +1,25 @@
+{
+  "name": "code-skills",
+  "version": "1.0.0",
+  "description": "Engineering discipline with a strict repository quality repair loop.",
+  "author": {
+    "name": "Ben Reich",
+    "url": "https://github.com/benrben"
+  },
+  "homepage": "https://github.com/benrben/code-skills",
+  "repository": "https://github.com/benrben/code-skills",
+  "keywords": ["engineering", "quality", "coverage", "mutation-testing", "architecture"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Code Discipline",
+    "shortDescription": "Engineering discipline and strict quality loops.",
+    "longDescription": "Applies behavior-preserving engineering discipline and can loop on coverage, mutation strength, and module boundaries until every required gate passes.",
+    "developerName": "Ben Reich",
+    "category": "Developer Tools",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Use code discipline while implementing and verifying this change.",
+      "Run the repository quality loop and fix every issue until it passes."
+    ]
+  }
+}

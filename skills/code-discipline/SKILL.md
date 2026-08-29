@@ -1,6 +1,6 @@
 ---
 name: code-discipline
-description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, and YAGNI-restrained design.
+description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, YAGNI-restrained design, and an executable repository-quality loop when strict coverage, mutation, or dependency gates are requested.
 ---
 
 # The Zen of Modern Development
@@ -10,6 +10,44 @@ optimize for the reader.** Each verse below is the why; the rules under it
 are the do. When rules conflict, the tiebreaker: which version does the
 reader understand faster? If the honest answer is the less pure one, take it
 and record why — practicality beats purity.
+
+## Repository quality loop
+
+Use the loop only when the user asks for strict repository hardening, the
+quality gate, mutation testing, CRAAP enforcement, architecture enforcement,
+or continued repair until all checks pass. Ordinary coding work does not
+authorize this full-repository run.
+
+The deterministic entrypoint is `scripts/quality_loop.py` beside this file. In
+Claude Code plugins it is available at
+`${CLAUDE_PLUGIN_ROOT}/skills/code-discipline/scripts/quality_loop.py`; in
+Codex, use the absolute path beside the loaded `SKILL.md`. Run it from the
+target repository root:
+
+```bash
+python3 <skill-directory>/scripts/quality_loop.py --root .
+```
+
+The core writes its HTML and JSON state to a user cache, leaving the target
+worktree unchanged except for repairs the agent intentionally makes. Exit `0`
+means all three gates passed. Exit `1` means measured failures remain: read
+`fix_prompt` and `failures` in the printed state JSON path, repair one coherent
+batch, run focused tests, and rerun. Exit `2` means configuration, an adapter,
+or the runner failed; repair that blocker before changing production behavior.
+
+Before the first run, inspect and preserve existing worktree changes. Do not
+run mutation analysis concurrently with another process writing source files.
+If `.quality-dependencies.json` is missing, derive its modules and permitted
+directions from the intended architecture after reading the repository; never
+bless accidental imports as the specification.
+
+The finish conditions are 100% executable-line coverage and CRAAP ≤ 6 for
+every production function, zero surviving operator mutants, and zero module
+ownership or direction violations. Never lower thresholds, disable a gate,
+cap the final mutation run, skip tests, weaken assertions, add exclusions,
+broaden an allow-list merely to pass, or replace a command with a no-op.
+Continue until the core exits `0`, then report all three summaries and the
+state/report paths. Do not commit or push unless the user asked.
 
 ## Readability counts.
 
