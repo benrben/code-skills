@@ -141,6 +141,10 @@ single combined repair prompt, and exit `2` means configuration or tooling must
 be repaired first. The agent fixes a coherent batch and invokes the same command
 again until it exits `0`. The loop and standalone CLI share one canonical gate
 engine at the plugin root, so fixes and new checks cannot drift between copies.
+Coverage and CRAAP analysis are attempted even when the baseline test command
+fails; those measurements are labeled diagnostic and cannot certify the
+repository until the tests pass. Mutation testing still requires a green
+unmodified baseline because surviving/killed results are otherwise invalid.
 
 For faster repair iterations, use diagnostic mode:
 

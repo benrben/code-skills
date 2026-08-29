@@ -54,6 +54,12 @@ executed checks are green and full certification is ready. Exit `2` means
 configuration, an adapter, or the runner failed; repair that blocker before
 changing production behavior.
 
+Coverage and CRAAP analysis always run when their adapters are available. If
+the baseline test suite is red, preserve those measurements as diagnostic
+evidence and repair the tests; do not claim the metrics are certified. Flaky
+and mutation results require a green unmodified baseline and remain blocked
+until it passes.
+
 Before the first run, inspect and preserve existing worktree changes. Do not
 run mutation analysis concurrently with another process writing source files.
 If `.quality-dependencies.json` is missing, derive its modules and permitted

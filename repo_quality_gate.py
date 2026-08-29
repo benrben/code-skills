@@ -37,7 +37,7 @@ from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 
@@ -1303,23 +1303,33 @@ def combine_test_and_metrics_gate(
             "quality",
             title,
             False,
-            "No complete test command could be configured or inferred.",
+            "No complete test command could be configured or inferred. "
+            f"Coverage and CRAAP still ran diagnostically: {metrics_gate.summary}",
+            metrics_gate.details,
+            metrics_gate.command_results,
             prompts=[
                 (
                     "Configure the complete test suite",
                     "Configure test.command as an argument array that runs every required test and exits non-zero on failure. Then rerun coverage and CRAAP analysis.",
-                )
+                ),
+                *metrics_gate.prompts,
             ],
         )
     if baseline.returncode != 0:
+        details = [baseline.stdout] if baseline.stdout else []
+        details.extend(metrics_gate.details)
         return GateResult(
             "quality",
             title,
             False,
-            "The complete test suite failed before coverage and CRAAP could be certified.",
-            [baseline.stdout],
-            [baseline],
-            [("Repair tests", generic_adapter_prompt("test", baseline))],
+            "The complete test suite failed. Coverage and CRAAP ran diagnostically: "
+            f"{metrics_gate.summary} These measurements cannot be certified until the baseline tests pass.",
+            details,
+            [baseline, *metrics_gate.command_results],
+            [
+                ("Repair tests", generic_adapter_prompt("test", baseline)),
+                *metrics_gate.prompts,
+            ],
         )
     metrics_gate.key = "quality"
     metrics_gate.title = title
@@ -3782,18 +3792,9 @@ def run(
         )
         contracts_gate = run_contract_gate(root, config, tools)
         test_command, test_baseline = run_test_baseline(root, config)
-        if test_baseline and test_baseline.returncode == 0:
-            raw_metrics_gate, functions = run_metrics_gate(
-                root, config, source_files, workspace, tools
-            )
-        else:
-            raw_metrics_gate = GateResult(
-                "craap",
-                "CRAAP: coverage + complexity",
-                False,
-                "Coverage and CRAAP were not run because baseline tests did not pass.",
-            )
-            functions = []
+        raw_metrics_gate, functions = run_metrics_gate(
+            root, config, source_files, workspace, tools
+        )
         quality_gate = combine_test_and_metrics_gate(
             raw_metrics_gate, test_command, test_baseline
         )

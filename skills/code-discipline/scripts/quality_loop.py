@@ -22,7 +22,7 @@ from types import ModuleType
 from typing import Any, Sequence
 
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
 
 

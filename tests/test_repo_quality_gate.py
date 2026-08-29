@@ -212,6 +212,54 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertIn("FULL RUN ONLY", gate.html_report(report))
         self.assertIn("READY FOR FULL RUN", gate.html_report(report))
 
+    def test_metrics_run_diagnostically_when_baseline_tests_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text("def value():\n    return 1\n", encoding="utf-8")
+            (root / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "app.py",
+                                "name": "value",
+                                "start_line": 1,
+                                "end_line": 2,
+                                "complexity": 1,
+                                "covered_lines": 2,
+                                "total_lines": 2,
+                                "coverage_percent": 100,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["test"]["command"] = [
+                sys.executable,
+                "-c",
+                "raise SystemExit(1)",
+            ]
+            config["metrics"]["report"] = "metrics.json"
+
+            report = gate.run(
+                root,
+                config,
+                root / "report.html",
+                cli_max_mutants=None,
+                notes=[],
+                fast=True,
+            )
+            quality = next(item for item in report.gates if item.key == "quality")
+
+            self.assertFalse(quality.passed)
+            self.assertIn("ran diagnostically", quality.summary)
+            self.assertEqual(len(report.functions), 1)
+            self.assertEqual(report.functions[0].coverage_percent, 100)
+            self.assertEqual(quality.command_results[0].returncode, 1)
+
     def test_output_sensitive_formatter_command_fails_on_listed_files(self) -> None:
         command_result = gate.CommandResult(
             command=["gofmt", "-l", "app.go"],
