@@ -29,12 +29,22 @@ target repository root:
 python3 <skill-directory>/scripts/quality_loop.py --root .
 ```
 
+During repair iterations, add `--fast`. Fast mode executes every static gate
+and one complete tests/coverage/CRAAP pass, but defers flaky-test repetitions
+and mutation testing. It is diagnostic only and never exits `0`. Read
+`ready_for_full` in the JSON state: when true, immediately run the provided
+`full_rerun_command` without `--fast`. Only that full command can certify the
+repository. Use `--html PATH` for an explicit report file or `--artifact-dir
+DIR` for the default HTML and JSON filenames in a dedicated directory.
+
 The core writes its HTML and JSON state to a user cache, leaving the target
 worktree unchanged except for repairs the agent intentionally makes. Exit `0`
 means every applicable gate passed. Exit `1` means measured failures remain: read
 `fix_prompt` and `failures` in the printed state JSON path, repair one coherent
-batch, run focused tests, and rerun. Exit `2` means configuration, an adapter,
-or the runner failed; repair that blocker before changing production behavior.
+batch, run focused tests, and rerun; in fast mode it can instead mean the
+executed checks are green and full certification is ready. Exit `2` means
+configuration, an adapter, or the runner failed; repair that blocker before
+changing production behavior.
 
 Before the first run, inspect and preserve existing worktree changes. Do not
 run mutation analysis concurrently with another process writing source files.

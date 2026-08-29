@@ -23,8 +23,9 @@ Clone, then symlink the same skill into Claude Code, Codex, or both:
 
 ```bash
 git clone https://github.com/benrben/code-skills.git
+mkdir -p ~/.claude/skills ~/.agents/skills
 ln -s "$(pwd)/code-skills/skills/code-discipline" ~/.claude/skills/code-discipline
-ln -s "$(pwd)/code-skills/skills/code-discipline" ~/.codex/skills/code-discipline
+ln -s "$(pwd)/code-skills/skills/code-discipline" ~/.agents/skills/code-discipline
 ```
 
 The repository is also a validated plugin bundle: `.claude-plugin/plugin.json`
@@ -123,6 +124,24 @@ single combined repair prompt, and exit `2` means configuration or tooling must
 be repaired first. The agent fixes a coherent batch and invokes the same command
 again until it exits `0`. The loop and standalone CLI share one canonical gate
 engine at the plugin root, so fixes and new checks cannot drift between copies.
+
+For faster repair iterations, use diagnostic mode:
+
+```bash
+python3 skills/code-discipline/scripts/quality_loop.py \
+  --root /path/to/repository \
+  --html quality-gate-report.html \
+  --fast
+```
+
+Fast mode runs every static gate plus one complete tests/coverage/CRAAP pass,
+but defers repeated flaky-test runs and mutation testing. It always exits
+nonzero and can never certify a repository. Its JSON state reports
+`ready_for_full: true` and provides `full_rerun_command` when the executed
+checks are clean; run that command without `--fast` for the required final
+certification. `--html` writes the JSON state beside the requested HTML file;
+use `--artifact-dir` instead when both artifacts should live in a dedicated
+directory.
 
 ## Method
 

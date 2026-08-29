@@ -36,7 +36,7 @@ from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 
@@ -281,6 +281,7 @@ class GateResult:
     command_results: list[CommandResult] = dataclasses.field(default_factory=list)
     prompts: list[tuple[str, str]] = dataclasses.field(default_factory=list)
     applicable: bool = True
+    deferred: bool = False
 
 
 @dataclasses.dataclass
@@ -313,10 +314,24 @@ class AnalysisReport:
     tool_setup: list[CommandResult]
     notes: list[str]
     rerun_command: str | None = None
+    mode: str = "full"
 
     @property
     def passed(self) -> bool:
-        return bool(self.gates) and all(gate.passed for gate in self.gates)
+        return (
+            self.mode == "full"
+            and bool(self.gates)
+            and all(gate.passed for gate in self.gates)
+        )
+
+    @property
+    def ready_for_full(self) -> bool:
+        executed = [gate for gate in self.gates if not gate.deferred]
+        return (
+            self.mode == "fast"
+            and bool(executed)
+            and all(gate.passed for gate in executed)
+        )
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1122,6 +1137,17 @@ def unavailable_check(
         f"Not applicable: no configured or supported {title.lower()} command was detected.",
         [guidance],
         applicable=False,
+    )
+
+
+def deferred_check(key: str, title: str, reason: str) -> GateResult:
+    return GateResult(
+        key,
+        title,
+        False,
+        f"Deferred in fast mode: {reason}",
+        ["Run the full certification command without --fast before shipping."],
+        deferred=True,
     )
 
 
@@ -3047,6 +3073,14 @@ def format_command(result: CommandResult) -> str:
     return f"$ {shlex.join(result.command)}\n[{status}; {result.duration_seconds:.2f}s]\n{result.stdout}".strip()
 
 
+def without_fast_flag(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command.replace(" --fast", "")
+    return shlex.join([part for part in parts if part != "--fast"])
+
+
 def master_fix_prompt(report: AnalysisReport) -> str:
     failing_functions = sorted(
         (function for function in report.functions if not function.passed),
@@ -3068,7 +3102,10 @@ def master_fix_prompt(report: AnalysisReport) -> str:
             f"{gate.title}:\n"
             + "\n".join(f"- {detail}" for detail in gate.details[:20])
             for gate in report.gates
-            if gate.applicable and not gate.passed and gate.details
+            if gate.applicable
+            and not gate.deferred
+            and not gate.passed
+            and gate.details
         )
         or "No additional command output was recorded. Read each gate summary above."
     )
@@ -3100,13 +3137,31 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     rerun_command = report.rerun_command or (
         f"python3 {shlex.quote(str(Path(__file__).resolve()))} --root ."
     )
+    full_command = without_fast_flag(rerun_command)
+    if report.mode == "fast" and report.ready_for_full:
+        objective = """The fast diagnostic checks are green. Do not claim the repository is ready to ship yet. Run the full certification command now; it executes the deferred flaky-test repetitions and exhaustive mutation gate."""
+        run_instructions = f"""Run from the repository root:
+{full_command}"""
+        loop_rule = "Run the full certification command now. If it finds failures, repair them and rerun the full gate until it exits 0."
+    elif report.mode == "fast":
+        objective = """Fix every issue measured by this fast diagnostic run. Work autonomously and rerun fast mode after each coherent batch. Fast mode can never certify the repository: once its executed checks are green, run the full certification command and continue until that full gate exits 0."""
+        run_instructions = f"""Fast diagnostic command:
+{rerun_command}
+
+Required full certification command:
+{full_command}"""
+        loop_rule = "Rerun fast mode after each coherent repair batch. Once it reports READY_FOR_FULL, run the full certification command and continue until the full gate exits 0."
+    else:
+        objective = """Fix every issue reported by the repository quality gate. Work autonomously and keep looping until the gate exits with code 0. Do not stop after fixing only the examples listed here; each rerun may reveal the next failures."""
+        run_instructions = f"""Run from the repository root:
+{rerun_command}"""
+        loop_rule = "After each coherent batch, run the focused tests, then rerun the full gate. Continue until the full gate exits 0 and report final evidence for every applicable check."
     return f"""You are the lead quality-repair agent for this repository:
 {report.root}
 
-Fix every issue reported by the repository quality gate. Work autonomously and keep looping until the gate exits with code 0. Do not stop after fixing only the examples listed here; each rerun may reveal the next failures.
+{objective}
 
-Run from the repository root:
-{rerun_command}
+{run_instructions}
 
 Non-negotiable finish conditions:
 1. Every applicable formatter and linter command passes with zero violations.
@@ -3144,10 +3199,12 @@ Repair rules:
 - Eliminate test nondeterminism at its source. Do not use retries or quarantine to conceal flaky behavior.
 - Fix architecture violations by moving responsibility, splitting a mixed module, or inverting the dependency behind an owned interface. Do not broaden rules merely to make the checker green.
 - Do not disable a gate, lower thresholds, cap mutants, add coverage exclusions, skip tests, weaken assertions, add suppressions, or replace commands with no-ops.
-- After each coherent batch, run the focused tests, then rerun the full gate. Continue until the full gate exits 0 and report final evidence for every applicable check."""
+- {loop_rule}"""
 
 
 def gate_outcome(gate: GateResult) -> str:
+    if gate.deferred:
+        return "DEFERRED"
     if not gate.applicable:
         return "NOT APPLICABLE"
     return "PASS" if gate.passed else "FAIL"
@@ -3155,11 +3212,19 @@ def gate_outcome(gate: GateResult) -> str:
 
 def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) -> str:
     step, question, kicker, explanation = presentation
-    state = "na" if not gate.applicable else ("pass" if gate.passed else "fail")
+    state = (
+        "deferred"
+        if gate.deferred
+        else ("na" if not gate.applicable else ("pass" if gate.passed else "fail"))
+    )
     badge = (
-        "NOT NEEDED"
-        if not gate.applicable
-        else ("LOOKS GOOD" if gate.passed else "FIX THIS")
+        "FULL RUN ONLY"
+        if gate.deferred
+        else (
+            "NOT NEEDED"
+            if not gate.applicable
+            else ("LOOKS GOOD" if gate.passed else "FIX THIS")
+        )
     )
     return f"""<article class="gate {state}">
       <div class="gate-top"><span class="step">{html.escape(step)}</span><span class="badge">{badge}</span></div>
@@ -3173,12 +3238,26 @@ def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) ->
 
 
 def html_report(report: AnalysisReport) -> str:
-    status = "READY TO SHIP" if report.passed else "NOT READY YET"
+    if report.mode == "fast":
+        status = (
+            "READY FOR FULL RUN" if report.ready_for_full else "FAST CHECKS NEED WORK"
+        )
+        page_heading = "Fast quality check"
+        verdict_class = "diagnostic"
+    else:
+        status = "READY TO SHIP" if report.passed else "NOT READY YET"
+        page_heading = "Can I ship this?"
+        verdict_class = "pass" if report.passed else "fail"
     coverage_limit = report.functions[0].coverage_limit if report.functions else 100
     craap_limit = report.functions[0].craap_limit if report.functions else 6
-    applicable_gates = sum(gate.applicable for gate in report.gates)
-    passed_gates = sum(gate.passed and gate.applicable for gate in report.gates)
-    not_applicable_gates = len(report.gates) - applicable_gates
+    applicable_gates = sum(
+        gate.applicable and not gate.deferred for gate in report.gates
+    )
+    passed_gates = sum(
+        gate.passed and gate.applicable and not gate.deferred for gate in report.gates
+    )
+    not_applicable_gates = sum(not gate.applicable for gate in report.gates)
+    deferred_gates = sum(gate.deferred for gate in report.gates)
     gate_language = {
         "format_lint": (
             "1",
@@ -3314,10 +3393,25 @@ def html_report(report: AnalysisReport) -> str:
         if individual_prompt_html:
             individual_prompt_html = f"""<div class="prompt-group-heading"><h3>Prefer smaller tasks?</h3>
             <p>Use these focused prompts one issue at a time, then rerun the gate.</p></div>{individual_prompt_html}"""
+        if report.mode == "fast" and report.ready_for_full:
+            prompt_kicker = "Fast checks are green · certification remains"
+            prompt_heading = "Run full certification"
+            prompt_copy = "Copy full-run prompt"
+            prompt_explanation = "The expensive flaky-test and mutation gates were deferred. Run them now before shipping."
+        elif report.mode == "fast":
+            prompt_kicker = "Fast diagnostic · one agent task"
+            prompt_heading = "Fix measured issues"
+            prompt_copy = "Copy repair prompt"
+            prompt_explanation = "Repair the executed failures quickly, rerun fast mode, then complete a full certification run."
+        else:
+            prompt_kicker = "All failing gates · one agent task"
+            prompt_heading = "Fix every issue"
+            prompt_copy = "Copy complete prompt"
+            prompt_explanation = "Paste this once. It tells the agent to repair every applicable check and keep rerunning the gate until it passes."
         prompt_html = f"""<article class="prompt master-prompt">
-          <div class="prompt-head"><div><div class="kicker">All failing gates · one agent task</div><h3>Fix every issue</h3></div>
-          <button data-copy="prompt-fix-everything">Copy complete prompt</button></div>
-          <p>Paste this once. It tells the agent to repair every applicable check and keep rerunning the gate until it passes.</p>
+          <div class="prompt-head"><div><div class="kicker">{prompt_kicker}</div><h3>{prompt_heading}</h3></div>
+          <button data-copy="prompt-fix-everything">{prompt_copy}</button></div>
+          <p>{prompt_explanation}</p>
           <pre id="prompt-fix-everything">{master_prompt}</pre>
         </article>{individual_prompt_html}"""
     notes_html = "".join(f"<li>{html.escape(note)}</li>" for note in report.notes)
@@ -3332,32 +3426,36 @@ def html_report(report: AnalysisReport) -> str:
     else:
         setup_summary = "No install was needed. Built-in tools and existing project tools were enough."
         setup_evidence = ""
+    if report.mode == "fast":
+        quick_guide = """<div><strong>Purple means diagnostic</strong>A full run is still required.</div><div><strong>Green means measured clean</strong>This executed check passed.</div><div><strong>Red means repair</strong>Fix it during the fast loop.</div><div><strong>Deferred means later</strong>It runs during certification.</div>"""
+    else:
+        quick_guide = """<div><strong>Green means go</strong>No action needed.</div><div><strong>Red means pause</strong>Fix it before shipping.</div><div><strong>Gray means not applicable</strong>No supported project check was detected.</div><div><strong>Need help?</strong>Copy an AI repair prompt below.</div>"""
     functions_passing = sum(function.passed for function in report.functions)
     mutants_killed = sum(not mutation.survived for mutation in report.mutations)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Can I ship? — {status}</title>
+<title>{page_heading} — {status}</title>
 <style>
-:root{{--bg:#f6f4ff;--ink:#17152b;--muted:#67637b;--card:#fff;--line:#ded9f0;--purple:#6d4aff;--purple-soft:#eee9ff;--good:#087a55;--good-soft:#e5f8f0;--bad:#c72c41;--bad-soft:#fff0f2;--na:#6b7280;--na-soft:#f1f2f4;--code:#19172b}}
+:root{{--bg:#f6f4ff;--ink:#17152b;--muted:#67637b;--card:#fff;--line:#ded9f0;--purple:#6d4aff;--purple-soft:#eee9ff;--good:#087a55;--good-soft:#e5f8f0;--bad:#c72c41;--bad-soft:#fff0f2;--na:#6b7280;--na-soft:#f1f2f4;--diagnostic:#7047c9;--diagnostic-soft:#f1eaff;--code:#19172b}}
 *{{box-sizing:border-box}} body{{margin:0;background:radial-gradient(circle at 8% 0,#ebe5ff 0,transparent 32%),var(--bg);color:var(--ink);font:16px/1.58 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}}
 main{{max-width:1220px;margin:auto;padding:42px 28px 72px}} h1,h2,h3{{line-height:1.12;letter-spacing:-.025em}} h1{{font-size:clamp(42px,7vw,76px);margin:.12em 0}} h2{{font-size:28px;margin:52px 0 8px}} h3{{font-size:24px;margin:8px 0 12px}}
 .eyebrow,.kicker{{color:var(--purple);font-size:13px;font-weight:900;letter-spacing:.1em;text-transform:uppercase}} .muted,.section-note{{color:var(--muted)}}
 .hero{{display:grid;grid-template-columns:1fr auto;gap:28px;align-items:end;padding:30px;border:1px solid var(--line);border-radius:26px;background:rgba(255,255,255,.78);box-shadow:0 18px 60px rgba(67,47,140,.09)}}
-.verdict{{min-width:220px;text-align:center;font-weight:950;font-size:24px;padding:18px 22px;border-radius:18px}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}}
+.verdict{{min-width:220px;text-align:center;font-weight:950;font-size:24px;padding:18px 22px;border-radius:18px}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--diagnostic);background:var(--diagnostic-soft)}}
 .progress{{margin-top:16px;color:var(--muted);font-weight:700}} .progress strong{{color:var(--ink)}} .quick-guide{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .quick-guide div{{padding:14px 16px;background:rgba(255,255,255,.7);border:1px solid var(--line);border-radius:14px}} .quick-guide strong{{display:block}}
 .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}} .gate,.prompt,.setup{{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:0 10px 35px rgba(67,47,140,.06)}}
-.gate.pass{{border-top:6px solid var(--good)}} .gate.fail{{border-top:6px solid var(--bad)}} .gate.na{{border-top:6px solid var(--na)}} .gate-top,.prompt-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .step{{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--purple-soft);color:var(--purple);font-weight:950}} .badge{{font-size:12px;font-weight:950;padding:6px 9px;border-radius:99px}} .pass .badge{{background:var(--good-soft);color:var(--good)}} .fail .badge{{background:var(--bad-soft);color:var(--bad)}} .na .badge{{background:var(--na-soft);color:var(--na)}}
-.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .na .result{{background:var(--na-soft);color:var(--na)}} .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
+.gate.pass{{border-top:6px solid var(--good)}} .gate.fail{{border-top:6px solid var(--bad)}} .gate.na{{border-top:6px solid var(--na)}} .gate.deferred{{border-top:6px solid var(--diagnostic)}} .gate-top,.prompt-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .step{{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--purple-soft);color:var(--purple);font-weight:950}} .badge{{font-size:12px;font-weight:950;padding:6px 9px;border-radius:99px}} .pass .badge{{background:var(--good-soft);color:var(--good)}} .fail .badge{{background:var(--bad-soft);color:var(--bad)}} .na .badge{{background:var(--na-soft);color:var(--na)}} .deferred .badge{{background:var(--diagnostic-soft);color:var(--diagnostic)}}
+.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .na .result{{background:var(--na-soft);color:var(--na)}} .deferred .result{{background:var(--diagnostic-soft);color:var(--diagnostic)}} .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:var(--card)}} table{{width:100%;border-collapse:collapse}} th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{background:#f0edfa;font-size:13px;text-transform:uppercase;letter-spacing:.05em}} tr.bad{{background:#fff8f9}} tr.bad td:last-child{{color:var(--bad);font-weight:900}} tr.ok td:last-child{{color:var(--good);font-weight:800}}
 code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f4f1ff;padding:15px;border-radius:12px;max-height:420px;overflow:auto}} details{{margin-top:12px}} summary{{cursor:pointer;font-weight:800;color:var(--purple)}} button{{background:var(--purple);color:#fff;border:0;border-radius:10px;padding:9px 13px;font-weight:900;cursor:pointer}} button.copied{{background:var(--good)}}
 .prompt{{border-left:5px solid var(--purple)}} .prompt h3{{font-size:18px;letter-spacing:0}} .master-prompt{{grid-column:1/-1;border:2px solid var(--purple);background:linear-gradient(135deg,#fff 0,#f5f1ff 100%)}} .master-prompt h3{{font-size:28px;margin-top:5px}} .master-prompt p{{color:var(--muted)}} .prompt-group-heading{{grid-column:1/-1;margin-top:12px}} .prompt-group-heading h3{{margin-bottom:4px}} .prompt-group-heading p{{margin:0;color:var(--muted)}} .all-clear{{grid-column:1/-1;padding:24px;background:var(--good-soft);color:var(--good);font-weight:850;border-radius:16px}} .setup{{padding:18px 22px}} ul{{padding-left:20px}}
 @media(max-width:900px){{.grid,.quick-guide{{grid-template-columns:1fr}}.stats{{grid-template-columns:1fr 1fr}}.explain{{min-height:0}}}} @media(max-width:650px){{main{{padding:18px}}.hero{{grid-template-columns:1fr;padding:22px}}.verdict{{min-width:0}}.stats{{grid-template-columns:1fr}}}}
 </style></head><body><main>
-<section class="hero"><div><div class="eyebrow">CODE CONFIDENCE CHECK · v{VERSION}</div><h1>Can I ship this?</h1>
+<section class="hero"><div><div class="eyebrow">CODE CONFIDENCE CHECK · v{VERSION} · {report.mode.upper()}</div><h1>{page_heading}</h1>
 <div class="muted">{html.escape(report.root)}<br>{html.escape(report.generated_at)} · {html.escape(language_text)}</div>
-<div class="progress"><strong>{passed_gates} of {applicable_gates}</strong> applicable checks passed · {not_applicable_gates} not applicable</div></div>
-<div class="verdict {"pass" if report.passed else "fail"}">{status}</div></section>
-<section class="quick-guide"><div><strong>Green means go</strong>No action needed.</div><div><strong>Red means pause</strong>Fix it before shipping.</div><div><strong>Gray means not applicable</strong>No supported project check was detected.</div><div><strong>Need help?</strong>Copy an AI repair prompt below.</div></section>
+<div class="progress"><strong>{passed_gates} of {applicable_gates}</strong> executed checks passed · {deferred_gates} deferred · {not_applicable_gates} not applicable</div></div>
+<div class="verdict {verdict_class}">{status}</div></section>
+<section class="quick-guide">{quick_guide}</section>
 <h2>Your quality checks</h2><p class="section-note">Start here. Technical proof is lower down when you need it.</p><section class="grid">{gate_cards}</section>
 <section class="stats"><div class="stat"><strong>{functions_passing}/{len(report.functions)}</strong><span>functions meet coverage + CRAAP</span></div><div class="stat"><strong>{mutants_killed}/{len(report.mutations)}</strong><span>wrong-code mutations caught</span></div><div class="stat"><strong>{len(report.dependency_violations)}</strong><span>architecture violations</span></div></section>
 <h2>Fix with your coding agent</h2><p class="section-note">Choose the complete all-in-one prompt or a focused prompt for one issue.</p><section class="grid">{prompt_html}</section>
@@ -3442,11 +3540,16 @@ def run(
     report_path: Path,
     cli_max_mutants: int | None,
     notes: list[str],
+    fast: bool = False,
 ) -> AnalysisReport:
     languages = detect_languages(root)
     source_files = discover_source_files(root, config["source"])
     notes.append(f"Detected languages: {', '.join(languages)}")
     notes.append(f"Selected {len(source_files)} production source files")
+    if fast:
+        notes.append(
+            "Fast diagnostic mode: flaky-test repetitions and mutation testing are deferred; this run cannot certify the repository."
+        )
     tools = bootstrap_tools(root, config, source_files)
     notes.append(
         "Mutation testing and dependency checking are built in; no package install is required for those gates."
@@ -3506,10 +3609,23 @@ def run(
             "Configure dead_code.commands with a high-confidence unused-code detector such as Vulture, Knip, or ts-prune.",
             tools.python_env,
         )
-        flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
-        mutation_gate, mutations = run_mutation_gate(
-            root, config, source_files, cli_max_mutants, test_baseline
-        )
+        if fast:
+            flaky_gate = deferred_check(
+                "flaky",
+                "Flaky-test detection",
+                "repeated complete-suite runs are reserved for full certification.",
+            )
+            mutation_gate = deferred_check(
+                "mutation",
+                "Mutation testing",
+                "the exhaustive mutant run is reserved for full certification.",
+            )
+            mutations = []
+        else:
+            flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
+            mutation_gate, mutations = run_mutation_gate(
+                root, config, source_files, cli_max_mutants, test_baseline
+            )
         dependency_gate, violations = run_dependency_gate(
             root, config, source_files, workspace
         )
@@ -3532,6 +3648,7 @@ def run(
         dependency_violations=violations,
         tool_setup=tools.setup_results,
         notes=notes,
+        mode="fast" if fast else "full",
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(html_report(analysis), encoding="utf-8")
@@ -3559,6 +3676,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-mutants", type=int, help="diagnostic cap; a capped run can never pass"
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="run one diagnostic pass and defer flaky-test repetitions and mutation testing; never certifies",
     )
     parser.add_argument(
         "--no-install",
@@ -3594,7 +3716,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         config, notes = load_config(config_path if config_path.exists() else None)
         if args.no_install:
             config["tools"]["auto_install"] = False
-        analysis = run(root, config, report_path, args.max_mutants, notes)
+        analysis = run(
+            root, config, report_path, args.max_mutants, notes, fast=args.fast
+        )
+        rerun = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
+        if args.config:
+            rerun.extend(["--config", str(config_path)])
+        rerun.extend(["--html", str(report_path)])
+        if args.no_install:
+            rerun.append("--no-install")
+        if args.fast:
+            rerun.append("--fast")
+        analysis.rerun_command = shlex.join(rerun)
+        report_path.write_text(html_report(analysis), encoding="utf-8")
     except (OSError, ValueError, KeyError, TypeError) as error:
         failure = AnalysisReport(
             root=str(root),
@@ -3619,6 +3753,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dependency_violations=[],
             tool_setup=[],
             notes=["The run stopped before all gates could be evaluated."],
+            mode="fast" if args.fast else "full",
         )
         with contextlib.suppress(OSError):
             report_path.parent.mkdir(parents=True, exist_ok=True)

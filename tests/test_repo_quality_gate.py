@@ -184,6 +184,32 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertIn("Not applicable", result.summary)
         self.assertEqual(gate.gate_outcome(result), "NOT APPLICABLE")
 
+    def test_fast_mode_deferred_gate_cannot_certify(self) -> None:
+        deferred = gate.deferred_check(
+            "mutation", "Mutation testing", "the full run owns this check."
+        )
+        report = gate.AnalysisReport(
+            root="/repo",
+            generated_at="now",
+            languages=["Python"],
+            gates=[
+                gate.GateResult("quality", "Quality", True, "Measured clean."),
+                deferred,
+            ],
+            functions=[],
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+            mode="fast",
+        )
+
+        self.assertEqual(gate.gate_outcome(deferred), "DEFERRED")
+        self.assertFalse(report.passed)
+        self.assertTrue(report.ready_for_full)
+        self.assertIn("FULL RUN ONLY", gate.html_report(report))
+        self.assertIn("READY FOR FULL RUN", gate.html_report(report))
+
     def test_output_sensitive_formatter_command_fails_on_listed_files(self) -> None:
         command_result = gate.CommandResult(
             command=["gofmt", "-l", "app.go"],
@@ -563,6 +589,50 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(passing_state["counts"]["checks_applicable"], 8)
             self.assertEqual(passing_state["counts"]["checks_passing"], 8)
             self.assertIsNone(passing_state["fix_prompt"])
+
+            fast_html = root / "fast-report.html"
+            fast = subprocess.run(
+                [
+                    sys.executable,
+                    str(LOOP_SCRIPT),
+                    "--root",
+                    str(root),
+                    "--html",
+                    str(fast_html),
+                    "--no-install",
+                    "--fast",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            fast_state = json.loads(
+                (root / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+            fast_statuses = {
+                item["key"]: item["status"] for item in fast_state["gates"]
+            }
+            fast_test_commands = [
+                command
+                for result in fast_state["gates"]
+                for command in result["commands"]
+                if command["command"][-1] == "check.py"
+            ]
+
+            self.assertEqual(fast.returncode, 1, fast.stdout + fast.stderr)
+            self.assertEqual(fast_state["status"], "ready_for_full")
+            self.assertEqual(fast_state["mode"], "fast")
+            self.assertFalse(fast_state["certified"])
+            self.assertTrue(fast_state["ready_for_full"])
+            self.assertEqual(fast_state["counts"]["checks_deferred"], 2)
+            self.assertEqual(fast_statuses["flaky"], "deferred")
+            self.assertEqual(fast_statuses["mutation"], "deferred")
+            self.assertEqual(len(fast_test_commands), 1)
+            self.assertIn("--fast", fast_state["rerun_command"])
+            self.assertNotIn("--fast", fast_state["full_rerun_command"])
+            self.assertTrue(fast_html.exists())
+            self.assertIn("FAST", fast_html.read_text(encoding="utf-8"))
 
             rules_path.unlink()
             failing = subprocess.run(
