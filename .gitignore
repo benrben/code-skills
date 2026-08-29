@@ -4,3 +4,12 @@ __pycache__/
 *.pyc
 .venv/
 .ruff_cache/
+evals/workspaces/
+evals/results/20*/
+evals/results/latest.txt
+evals/quality-workspaces/
+evals/quality-results/20*/
+evals/quality-results/latest.txt
+evals/complex-workspaces/
+evals/complex-results/20*/
+evals/complex-results/latest.txt

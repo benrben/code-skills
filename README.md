@@ -10,16 +10,12 @@ lost such an eval was deleted, not kept.
 | Skill | Task it serves | Certified record |
 |---|---|---|
 | [code-discipline](skills/code-discipline/SKILL.md) | Any coding work — writing, fixing, refactoring, reviewing. Nine verses of why, each with the terse rules that enforce it | 6–1 across 7 blind-judged execution cells, two worker models; every rule earned its place by flipping a lost cell |
-| [bugfix-proof-gate](skills/bugfix-proof-gate/SKILL.md) | Fixing a bug. Stop hook: the fix cannot finish without a regression test proven to fail on the unfixed code | Blind composite 9.40 vs 6.00 (prompt rule) vs 4.80 (nothing); the written rule was obeyed 1/5, the gate 10/10 |
-| [feature-proof-gate](skills/feature-proof-gate/SKILL.md) | Building a feature / new code. Stop hook: five-stage evidence ladder — prove, cover, and mutation-test every changed line | Certified on two codebases: 9.31 vs 7.75 (alfred), replicated 9.90 vs 7.90 (tinydb, zero losses); tests 13/13 under the gate; mutant survival 2–3% vs ~50% |
 
-Renamed 2026-08-22 for task clarity — evaluated as *modern-zen*, *red-gate*,
-and *hardener* respectively (the names the archive and gate messages still
-use); the gate scripts are byte-identical to the certified artifacts.
+Renamed 2026-08-22 for task clarity — evaluated as *modern-zen*, the name the
+archive still uses.
 
-Each skill folder follows the standard layout: `SKILL.md` (instructions +
-triggering description), `scripts/` (the executable gates — run, never loaded
-into context), `references/` (the certified evidence record).
+Each skill folder contains a `SKILL.md` with its instructions and triggering
+description.
 
 ## Install
 
@@ -27,15 +23,10 @@ Clone, then symlink skills into your personal skills directory:
 
 ```bash
 git clone https://github.com/benrben/code-skills.git
-ln -s "$(pwd)/code-skills/skills/code-discipline"   ~/.claude/skills/code-discipline
-ln -s "$(pwd)/code-skills/skills/bugfix-proof-gate" ~/.claude/skills/bugfix-proof-gate
-ln -s "$(pwd)/code-skills/skills/feature-proof-gate" ~/.claude/skills/feature-proof-gate
+ln -s "$(pwd)/code-skills/skills/code-discipline" ~/.claude/skills/code-discipline
 ```
 
-Skills auto-trigger from their frontmatter `description`. The two gates
-additionally need per-project activation — a config file and a Stop-hook entry
-in the project's `.claude/settings.json`; each `SKILL.md` carries the exact
-snippet.
+Skills auto-trigger from their frontmatter `description`.
 
 ## Method
 
