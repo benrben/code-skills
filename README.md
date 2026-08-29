@@ -111,6 +111,23 @@ gate fails with a prompt that an agent can use to create the missing evidence.
 `--max-mutants N` is available for quick diagnostics, but a capped mutation run
 can never produce a passing gate.
 
+Mutation runs can safely use parallel workers:
+
+```bash
+python3 skills/code-discipline/scripts/quality_loop.py \
+  --root /path/to/repository \
+  --mutation-workers auto
+```
+
+`auto` adds workers as the mutant set grows, up to four; an explicit positive
+integer such as `--mutation-workers 2` is also accepted. Every worker receives
+an isolated repository snapshot (copy-on-write when supported) and separate
+temporary/cache paths, so it never mutates the active worktree or another
+worker's files. Repositories whose tests share fixed ports, databases,
+accounts, or other resources should either isolate those resources using
+`QUALITY_GATE_MUTATION_WORKER` or select one worker. The default remains one
+worker for compatibility.
+
 Agents loop on the smaller core attached to `code-discipline`:
 
 ```bash

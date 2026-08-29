@@ -37,6 +37,14 @@ and mutation testing. It is diagnostic only and never exits `0`. Read
 repository. Use `--html PATH` for an explicit report file or `--artifact-dir
 DIR` for the default HTML and JSON filenames in a dedicated directory.
 
+For a full mutation run, `--mutation-workers auto` executes mutants in up to
+four isolated repository snapshots; a positive integer selects an exact upper
+bound. The active worktree is never mutated by parallel workers. Use one worker
+when tests cannot isolate fixed ports, shared databases, external accounts, or
+other process-global resources. Tests may use `QUALITY_GATE_MUTATION_WORKER` to
+derive worker-specific resources. Parallelism changes throughput only; it must
+not reduce the mutant set or weaken the zero-survivor requirement.
+
 The core writes its HTML and JSON state to a user cache, leaving the target
 worktree unchanged except for repairs the agent intentionally makes. Exit `0`
 means every applicable gate passed. Exit `1` means measured failures remain: read

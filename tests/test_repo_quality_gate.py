@@ -3,6 +3,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -445,6 +447,106 @@ const helper = require('./helper.js')
             self.assertEqual(source.read_text(encoding="utf-8"), original)
             self.assertEqual(source.stat().st_mtime_ns, original_mtime)
 
+    def test_mutation_gate_runs_parallel_workers_in_isolated_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            original = "def choose(value):\n    return value == 1 or value < 3\n"
+            source.write_text(original, encoding="utf-8")
+            config = gate.default_config()
+            config["test"]["command"] = ["test-command"]
+            config["mutation"]["operators"] = {"==": "!=", "<": ">"}
+            barrier = threading.Barrier(2)
+            lock = threading.Lock()
+            active = 0
+            maximum_active = 0
+            worker_roots: set[Path] = set()
+
+            def fake_run_command(
+                command: list[str],
+                execution_root: Path,
+                _timeout: int,
+                extra_env: dict[str, str] | None = None,
+            ) -> gate.CommandResult:
+                nonlocal active, maximum_active
+                if execution_root == root:
+                    return gate.CommandResult(command, 0, "baseline", 0.01)
+                self.assertIsNotNone(extra_env)
+                self.assertNotEqual(
+                    (execution_root / "app.py").read_text(encoding="utf-8"),
+                    original,
+                )
+                with lock:
+                    worker_roots.add(execution_root)
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                barrier.wait(timeout=5)
+                time.sleep(0.05)
+                with lock:
+                    active -= 1
+                return gate.CommandResult(command, 1, "killed", 0.05)
+
+            with (
+                mock.patch.object(gate.os, "cpu_count", return_value=8),
+                mock.patch.object(gate, "run_command", side_effect=fake_run_command),
+            ):
+                result, mutations = gate.run_mutation_gate(
+                    root,
+                    config,
+                    [source],
+                    cli_max_mutants=None,
+                    cli_mutation_workers=2,
+                )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(len(mutations), 2)
+            self.assertEqual(maximum_active, 2)
+            self.assertEqual(len(worker_roots), 2)
+            self.assertTrue(all(path != root for path in worker_roots))
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertIn("using 2 workers", result.summary)
+
+    def test_parallel_mutation_gate_runs_real_tests_in_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            original = "def selected(value):\n    return value == 1 or value < 0\n"
+            source.write_text(original, encoding="utf-8")
+            (root / "check.py").write_text(
+                "from app import selected\n"
+                "assert selected(1)\n"
+                "assert selected(-1)\n"
+                "assert not selected(2)\n",
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["test"]["command"] = [sys.executable, "check.py"]
+            config["mutation"]["operators"] = {"==": "!=", "<": ">"}
+
+            result, mutations = gate.run_mutation_gate(
+                root,
+                config,
+                [source],
+                cli_max_mutants=None,
+                cli_mutation_workers=2,
+            )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(len(mutations), 2)
+            self.assertTrue(all(not mutation.survived for mutation in mutations))
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_mutation_worker_validation(self) -> None:
+        with mock.patch.object(gate.os, "cpu_count", return_value=12):
+            self.assertEqual(gate.resolve_mutation_workers("auto", 4), 1)
+            self.assertEqual(gate.resolve_mutation_workers("auto", 20), 2)
+            self.assertEqual(gate.resolve_mutation_workers("auto", 40), 4)
+        self.assertEqual(gate.resolve_mutation_workers("8", 3), 3)
+        for invalid in (0, "0", "many", True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    gate.resolve_mutation_workers(invalid, 10)
+
     def test_dependency_gate_rejects_forbidden_edge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -574,6 +676,8 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 "--artifact-dir",
                 str(artifacts),
                 "--no-install",
+                "--mutation-workers",
+                "auto",
             ]
 
             passing = subprocess.run(
@@ -589,6 +693,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(passing_state["counts"]["checks_applicable"], 8)
             self.assertEqual(passing_state["counts"]["checks_passing"], 8)
             self.assertIsNone(passing_state["fix_prompt"])
+            self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
 
             fast_html = root / "fast-report.html"
             fast = subprocess.run(

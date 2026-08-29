@@ -22,7 +22,7 @@ from types import ModuleType
 from typing import Any, Sequence
 
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
 
 
@@ -69,6 +69,7 @@ def build_rerun_command(
     explicit_gate_script: bool,
     no_install: bool,
     fast: bool,
+    mutation_workers: str | None,
 ) -> str:
     command = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
     if explicit_config:
@@ -81,6 +82,8 @@ def build_rerun_command(
         command.extend(["--gate-script", str(gate_script)])
     if no_install:
         command.append("--no-install")
+    if mutation_workers:
+        command.extend(["--mutation-workers", mutation_workers])
     if fast:
         command.append("--fast")
     return shlex.join(command)
@@ -295,6 +298,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="diagnostic cap; capped runs can never pass",
     )
     parser.add_argument(
+        "--mutation-workers",
+        metavar="N|auto",
+        help="run mutants in N isolated repository snapshots; auto uses up to 4 workers",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="run one diagnostic pass and defer flaky-test repetitions and mutation testing; never certifies",
@@ -356,6 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         explicit_gate_script,
         args.no_install,
         args.fast,
+        args.mutation_workers,
     )
     run_error: str | None = None
     try:
@@ -369,6 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.max_mutants,
             notes,
             fast=args.fast,
+            cli_mutation_workers=args.mutation_workers,
         )
         analysis.rerun_command = command
         exit_code = 0 if analysis.passed else 1

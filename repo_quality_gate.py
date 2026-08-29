@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import dataclasses
 import fnmatch
@@ -36,7 +37,7 @@ from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 
@@ -261,6 +262,16 @@ class Mutation:
     output: str
 
 
+@dataclasses.dataclass(frozen=True)
+class MutationCandidate:
+    path: str
+    offset: int
+    line: int
+    column: int
+    original: str
+    replacement: str
+
+
 @dataclasses.dataclass
 class DependencyViolation:
     source: str
@@ -391,6 +402,7 @@ def default_config() -> dict[str, Any]:
             "test_command": None,
             "timeout_seconds": 600,
             "max_mutants": 0,
+            "workers": 1,
             "operators": OPERATOR_MUTATIONS,
             "exclude": [],
         },
@@ -2509,12 +2521,282 @@ The complete configured test suite still exited successfully.
 First decide which externally visible behavior differs under this mutation. Add the smallest behavior-focused test through the production API that fails with the mutant and passes on the original code. If the mutant is genuinely equivalent, simplify the production expression so the equivalent mutation site disappears; do not mark it ignored. Re-run the single mutant, then the full mutation gate. Do not assert implementation details or weaken the zero-survivor threshold."""
 
 
+def resolve_mutation_workers(value: Any, candidate_count: int) -> int:
+    if candidate_count < 1:
+        return 1
+    if isinstance(value, bool):
+        raise ValueError("mutation workers must be `auto` or a positive integer")
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "auto":
+            available = os.cpu_count() or 1
+            work_to_amortize_snapshots = max(1, candidate_count // 8)
+            return min(
+                candidate_count,
+                work_to_amortize_snapshots,
+                max(1, min(4, available // 2)),
+            )
+        try:
+            requested = int(normalized)
+        except ValueError as error:
+            raise ValueError(
+                "mutation workers must be `auto` or a positive integer"
+            ) from error
+    elif isinstance(value, int):
+        requested = value
+    else:
+        raise ValueError("mutation workers must be `auto` or a positive integer")
+    if requested < 1:
+        raise ValueError("mutation workers must be `auto` or a positive integer")
+    return min(candidate_count, requested)
+
+
+def copy_repository_snapshot(root: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    copy_command: list[str] | None = None
+    cp = shutil.which("cp")
+    if cp and sys.platform == "darwin":
+        copy_command = [cp, "-cRp", f"{root}{os.sep}.", str(destination)]
+    elif cp and sys.platform.startswith("linux"):
+        copy_command = [
+            cp,
+            "--archive",
+            "--reflink=auto",
+            f"{root}{os.sep}.",
+            str(destination),
+        ]
+    if copy_command:
+        destination.mkdir()
+        copied = subprocess.run(
+            copy_command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if copied.returncode == 0:
+            return
+        shutil.rmtree(destination)
+    shutil.copytree(root, destination, symlinks=True)
+
+
+def command_for_snapshot(
+    command: Sequence[str], root: Path, snapshot: Path
+) -> list[str]:
+    rewritten: list[str] = []
+    for argument in command:
+        path = Path(argument)
+        if path.is_absolute():
+            with contextlib.suppress(ValueError):
+                argument = str(snapshot / path.relative_to(root))
+        rewritten.append(argument)
+    return rewritten
+
+
+def mutation_id(candidate: MutationCandidate) -> str:
+    return hashlib.sha256(
+        f"{candidate.path}:{candidate.offset}:{candidate.original}:{candidate.replacement}".encode()
+    ).hexdigest()[:12]
+
+
+def execute_mutation_candidate(
+    candidate: MutationCandidate,
+    execution_root: Path,
+    test_command: Sequence[str],
+    timeout: int,
+    runtime_root: Path,
+    worker_number: int,
+) -> Mutation:
+    mutant_id = mutation_id(candidate)
+    path = execution_root / candidate.path
+    try:
+        original_bytes = path.read_bytes()
+        text = original_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return Mutation(
+            mutant_id,
+            candidate.path,
+            candidate.line,
+            candidate.column,
+            candidate.original,
+            candidate.replacement,
+            True,
+            False,
+            0.0,
+            str(error),
+        )
+    if (
+        text[candidate.offset : candidate.offset + len(candidate.original)]
+        != candidate.original
+    ):
+        return Mutation(
+            mutant_id,
+            candidate.path,
+            candidate.line,
+            candidate.column,
+            candidate.original,
+            candidate.replacement,
+            True,
+            False,
+            0.0,
+            "Source changed during mutation run",
+        )
+    mutated = (
+        text[: candidate.offset]
+        + candidate.replacement
+        + text[candidate.offset + len(candidate.original) :]
+    )
+    original_stat = path.stat()
+    result: CommandResult | None = None
+    mutation_error = ""
+    try:
+        path.write_text(mutated, encoding="utf-8")
+        os.chmod(path, original_stat.st_mode)
+        with tempfile.TemporaryDirectory(
+            prefix=f"mutant-{mutant_id}-", dir=runtime_root
+        ) as mutation_temp:
+            result = run_command(
+                test_command,
+                execution_root,
+                timeout,
+                {
+                    "PYTHONPYCACHEPREFIX": mutation_temp,
+                    "TMPDIR": mutation_temp,
+                    "TMP": mutation_temp,
+                    "TEMP": mutation_temp,
+                    "QUALITY_GATE_MUTATION_WORKER": str(worker_number),
+                    "QUALITY_GATE_MUTANT_ID": mutant_id,
+                },
+            )
+    except OSError as error:
+        mutation_error = str(error)
+    finally:
+        path.write_bytes(original_bytes)
+        os.chmod(path, original_stat.st_mode)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    if result is None:
+        return Mutation(
+            mutant_id,
+            candidate.path,
+            candidate.line,
+            candidate.column,
+            candidate.original,
+            candidate.replacement,
+            True,
+            False,
+            0.0,
+            mutation_error,
+        )
+    return Mutation(
+        mutant_id,
+        candidate.path,
+        candidate.line,
+        candidate.column,
+        candidate.original,
+        candidate.replacement,
+        result.returncode == 0,
+        result.timed_out,
+        result.duration_seconds,
+        result.stdout,
+    )
+
+
+def run_mutations_serially(
+    root: Path,
+    candidates: Sequence[MutationCandidate],
+    test_command: Sequence[str],
+    timeout: int,
+) -> list[Mutation]:
+    results: list[Mutation] = []
+    with tempfile.TemporaryDirectory(
+        prefix="quality-gate-mutation-runtime-"
+    ) as temporary:
+        runtime_root = Path(temporary)
+        for index, candidate in enumerate(candidates, start=1):
+            if sys.stderr.isatty():
+                print(
+                    f"[mutation {index}/{len(candidates)}] {candidate.path}:{candidate.line}:{candidate.column} {candidate.original}->{candidate.replacement}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            results.append(
+                execute_mutation_candidate(
+                    candidate,
+                    root,
+                    test_command,
+                    timeout,
+                    runtime_root,
+                    1,
+                )
+            )
+    return results
+
+
+def run_mutations_in_parallel(
+    root: Path,
+    candidates: Sequence[MutationCandidate],
+    test_command: Sequence[str],
+    timeout: int,
+    worker_count: int,
+) -> list[Mutation]:
+    indexed = list(enumerate(candidates, start=1))
+    assignments = [indexed[index::worker_count] for index in range(worker_count)]
+
+    def run_worker(
+        worker_number: int,
+        assigned: Sequence[tuple[int, MutationCandidate]],
+        pool_root: Path,
+    ) -> list[tuple[int, Mutation]]:
+        worker_parent = pool_root / f"worker-{worker_number}"
+        worker_root = worker_parent / "repository"
+        runtime_root = worker_parent / "runtime"
+        copy_repository_snapshot(root, worker_root)
+        runtime_root.mkdir()
+        worker_command = command_for_snapshot(test_command, root, worker_root)
+        completed: list[tuple[int, Mutation]] = []
+        for index, candidate in assigned:
+            if sys.stderr.isatty():
+                print(
+                    f"[mutation {index}/{len(candidates)} worker {worker_number}] {candidate.path}:{candidate.line}:{candidate.column} {candidate.original}->{candidate.replacement}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            completed.append(
+                (
+                    index,
+                    execute_mutation_candidate(
+                        candidate,
+                        worker_root,
+                        worker_command,
+                        timeout,
+                        runtime_root,
+                        worker_number,
+                    ),
+                )
+            )
+        return completed
+
+    by_index: dict[int, Mutation] = {}
+    with tempfile.TemporaryDirectory(
+        prefix="quality-gate-mutation-workers-"
+    ) as temporary:
+        pool_root = Path(temporary)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(run_worker, index + 1, assigned, pool_root)
+                for index, assigned in enumerate(assignments)
+            ]
+            for future in futures:
+                by_index.update(future.result())
+    return [by_index[index] for index in range(1, len(candidates) + 1)]
+
+
 def run_mutation_gate(
     root: Path,
     config: dict[str, Any],
     source_files: Sequence[Path],
     cli_max_mutants: int | None,
     test_baseline: CommandResult | None = None,
+    cli_mutation_workers: str | int | None = None,
 ) -> tuple[GateResult, list[Mutation]]:
     mutation_config = config["mutation"]
     if not mutation_config.get("enabled", True):
@@ -2573,7 +2855,7 @@ def run_mutation_gate(
         for key, value in mutation_config.get("operators", OPERATOR_MUTATIONS).items()
     }
     excludes = [str(pattern) for pattern in mutation_config.get("exclude", [])]
-    candidates: list[tuple[Path, int, int, int, str, str]] = []
+    candidates: list[MutationCandidate] = []
     for path in source_files:
         relative = normalize_path(path, root)
         if matches_any(relative, excludes):
@@ -2581,7 +2863,9 @@ def run_mutation_gate(
         for offset, line, column, original, replacement in operator_offsets(
             path, operators
         ):
-            candidates.append((path, offset, line, column, original, replacement))
+            candidates.append(
+                MutationCandidate(relative, offset, line, column, original, replacement)
+            )
     configured_max = int(mutation_config.get("max_mutants", 0))
     max_mutants = cli_max_mutants if cli_max_mutants is not None else configured_max
     total_candidates = len(candidates)
@@ -2600,106 +2884,18 @@ def run_mutation_gate(
                 )
             ],
         ), []
-    results: list[Mutation] = []
-    for index, (path, offset, line, column, original, replacement) in enumerate(
-        candidates, start=1
-    ):
-        relative = normalize_path(path, root)
-        if sys.stderr.isatty():
-            print(
-                f"[mutation {index}/{len(candidates)}] {relative}:{line}:{column} {original}->{replacement}",
-                file=sys.stderr,
-                flush=True,
-            )
-        mutant_id = hashlib.sha256(
-            f"{relative}:{offset}:{original}:{replacement}".encode()
-        ).hexdigest()[:12]
-        try:
-            original_bytes = path.read_bytes()
-            text = original_bytes.decode("utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            results.append(
-                Mutation(
-                    mutant_id,
-                    relative,
-                    line,
-                    column,
-                    original,
-                    replacement,
-                    True,
-                    False,
-                    0.0,
-                    str(error),
-                )
-            )
-            continue
-        if text[offset : offset + len(original)] != original:
-            results.append(
-                Mutation(
-                    mutant_id,
-                    relative,
-                    line,
-                    column,
-                    original,
-                    replacement,
-                    True,
-                    False,
-                    0.0,
-                    "Source changed during mutation run",
-                )
-            )
-            continue
-        mutated = text[:offset] + replacement + text[offset + len(original) :]
-        original_stat = path.stat()
-        result: CommandResult | None = None
-        mutation_error = ""
-        try:
-            path.write_text(mutated, encoding="utf-8")
-            os.chmod(path, original_stat.st_mode)
-            with tempfile.TemporaryDirectory(prefix="quality-gate-pycache-") as pycache:
-                result = run_command(
-                    test_command,
-                    root,
-                    timeout,
-                    {"PYTHONPYCACHEPREFIX": pycache},
-                )
-        except OSError as error:
-            mutation_error = str(error)
-        finally:
-            path.write_bytes(original_bytes)
-            os.chmod(path, original_stat.st_mode)
-            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-        if result is None:
-            results.append(
-                Mutation(
-                    mutant_id,
-                    relative,
-                    line,
-                    column,
-                    original,
-                    replacement,
-                    True,
-                    False,
-                    0.0,
-                    mutation_error,
-                )
-            )
-            continue
-        survived = result.returncode == 0
-        results.append(
-            Mutation(
-                mutant_id,
-                relative,
-                line,
-                column,
-                original,
-                replacement,
-                survived,
-                result.timed_out,
-                result.duration_seconds,
-                result.stdout,
-            )
+    configured_workers = mutation_config.get("workers", 1)
+    requested_workers = (
+        cli_mutation_workers if cli_mutation_workers is not None else configured_workers
+    )
+    worker_count = resolve_mutation_workers(requested_workers, len(candidates))
+    if worker_count == 1:
+        results = run_mutations_serially(root, candidates, test_command, timeout)
+    else:
+        results = run_mutations_in_parallel(
+            root, candidates, test_command, timeout, worker_count
         )
+    worker_summary = f"using {worker_count} worker{'s' if worker_count != 1 else ''}"
     survivors = [mutation for mutation in results if mutation.survived]
     prompts = [
         (f"Kill mutant {mutation.mutant_id}", mutation_prompt(mutation))
@@ -2710,7 +2906,7 @@ def run_mutation_gate(
             "mutation",
             "Mutation testing",
             False,
-            f"Diagnostic limit tested {len(results)} mutants; a limited run cannot pass the full gate. {len(survivors)} survived.",
+            f"Diagnostic limit tested {len(results)} mutants {worker_summary}; a limited run cannot pass the full gate. {len(survivors)} survived.",
             [
                 f"{mutation.path}:{mutation.line}:{mutation.column} {mutation.original}->{mutation.replacement}"
                 for mutation in survivors
@@ -2723,7 +2919,7 @@ def run_mutation_gate(
             "mutation",
             "Mutation testing",
             False,
-            f"{len(survivors)} of {len(results)} mutants survived; required: zero.",
+            f"{len(survivors)} of {len(results)} mutants survived {worker_summary}; required: zero.",
             [
                 f"{mutation.path}:{mutation.line}:{mutation.column} {mutation.original}->{mutation.replacement}"
                 for mutation in survivors
@@ -2735,7 +2931,7 @@ def run_mutation_gate(
         "mutation",
         "Mutation testing",
         True,
-        f"All {len(results)} mutants were killed by the full test suite.",
+        f"All {len(results)} mutants were killed by the full test suite {worker_summary}.",
         [],
         [baseline],
     ), results
@@ -3541,6 +3737,7 @@ def run(
     cli_max_mutants: int | None,
     notes: list[str],
     fast: bool = False,
+    cli_mutation_workers: str | int | None = None,
 ) -> AnalysisReport:
     languages = detect_languages(root)
     source_files = discover_source_files(root, config["source"])
@@ -3624,7 +3821,12 @@ def run(
         else:
             flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
             mutation_gate, mutations = run_mutation_gate(
-                root, config, source_files, cli_max_mutants, test_baseline
+                root,
+                config,
+                source_files,
+                cli_max_mutants,
+                test_baseline,
+                cli_mutation_workers,
             )
         dependency_gate, violations = run_dependency_gate(
             root, config, source_files, workspace
@@ -3678,6 +3880,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-mutants", type=int, help="diagnostic cap; a capped run can never pass"
     )
     parser.add_argument(
+        "--mutation-workers",
+        metavar="N|auto",
+        help="run mutants in N isolated repository snapshots; auto uses up to 4 workers",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="run one diagnostic pass and defer flaky-test repetitions and mutation testing; never certifies",
@@ -3717,7 +3924,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.no_install:
             config["tools"]["auto_install"] = False
         analysis = run(
-            root, config, report_path, args.max_mutants, notes, fast=args.fast
+            root,
+            config,
+            report_path,
+            args.max_mutants,
+            notes,
+            fast=args.fast,
+            cli_mutation_workers=args.mutation_workers,
         )
         rerun = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
         if args.config:
@@ -3725,6 +3938,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rerun.extend(["--html", str(report_path)])
         if args.no_install:
             rerun.append("--no-install")
+        if args.mutation_workers:
+            rerun.extend(["--mutation-workers", args.mutation_workers])
         if args.fast:
             rerun.append("--fast")
         analysis.rerun_command = shlex.join(rerun)
