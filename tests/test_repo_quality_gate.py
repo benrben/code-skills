@@ -2,6 +2,7 @@ import json
 import importlib.util
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -32,6 +33,42 @@ quality_loop = load_quality_loop()
 
 
 class QualityGateUnitTests(unittest.TestCase):
+    def test_readme_documents_every_cli_option_and_auto_install(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        help_commands = (
+            [sys.executable, str(ROOT / "repo_quality_gate.py"), "--help"],
+            [sys.executable, str(LOOP_SCRIPT), "--help"],
+        )
+        documented_options: set[str] = set()
+        for command in help_commands:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            documented_options.update(re.findall(r"--[a-z][a-z-]*", completed.stdout))
+
+        missing_options = sorted(
+            option for option in documented_options if f"`{option}" not in readme
+        )
+        self.assertEqual(missing_options, [])
+        for package in (
+            "lizard",
+            "coverage",
+            "ruff",
+            "mypy",
+            "vulture",
+            "jsonschema",
+            "openapi-spec-validator",
+            "@vitest/coverage-v8",
+            "@stryker-mutator/core@9.6.1",
+            "cargo-llvm-cov",
+        ):
+            with self.subTest(package=package):
+                self.assertIn(package, readme)
+
     def test_bootstrap_auto_installs_json_schema_validator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
