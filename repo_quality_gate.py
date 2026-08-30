@@ -39,7 +39,7 @@ from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 STRYKER_VERSION = "9.6.1"
@@ -287,6 +287,7 @@ class Mutation:
     duration_seconds: float
     output: str
     status: str = ""
+    static: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -430,6 +431,10 @@ def default_config() -> dict[str, Any]:
             "engine": "auto",
             "incremental": True,
             "test_command": None,
+            "test_files": [],
+            "vitest_config": None,
+            "vitest_dir": None,
+            "vitest_related": True,
             "timeout_seconds": 600,
             "max_mutants": 0,
             "workers": "auto",
@@ -2624,7 +2629,7 @@ def mutation_prompt(mutation: Mutation) -> str:
     return f"""You are the hardener agent. Kill surviving mutant `{mutation.mutant_id}` in {mutation.path}:{mutation.line}:{mutation.column}.
 
 Mutation: `{mutation.original}` -> `{mutation.replacement}`
-Mutation result: `{mutation.status or 'Survived'}`. {mutation.output}
+Mutation result: `{mutation.status or "Survived"}`. {mutation.output}
 
 First decide which externally visible behavior differs under this mutation. Add the smallest behavior-focused test through the production API that fails with the mutant and passes on the original code. If the mutant is genuinely equivalent, simplify the production expression so the equivalent mutation site disappears; do not mark it ignored. Re-run the single mutant, then the full mutation gate. Do not assert implementation details or weaken the zero-survivor threshold."""
 
@@ -2636,15 +2641,42 @@ def stryker_config(
     incremental_path: Path,
     workers: int,
     incremental: bool = True,
+    mutation_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a semantic operator-only Stryker configuration for an isolated snapshot."""
+    mutation_config = mutation_config or {}
     mutate = [
         normalize_path(path, root)
         for path in source_files
         if path.suffix.lower() in JAVASCRIPT_MUTATION_EXTENSIONS
         and not path.name.endswith(".d.ts")
     ]
-    return {
+    test_files = mutation_config.get("test_files", [])
+    if not isinstance(test_files, list) or any(
+        not isinstance(pattern, str) or not pattern.strip() for pattern in test_files
+    ):
+        raise ValueError("mutation.test_files must be an array of non-empty globs")
+    if any(
+        Path(pattern.lstrip("!")).is_absolute()
+        or ".." in Path(pattern.lstrip("!")).parts
+        for pattern in test_files
+    ):
+        raise ValueError("mutation.test_files globs must stay inside the repository")
+    related = mutation_config.get("vitest_related", True)
+    if not isinstance(related, bool):
+        raise ValueError("mutation.vitest_related must be true or false")
+    vitest: dict[str, Any] = {"related": related}
+    config_path = mutation_vitest_config_path(
+        root, mutation_config.get("vitest_config")
+    )
+    if config_path:
+        vitest["configFile"] = config_path
+    vitest_dir = snapshot_relative_directory(
+        root, mutation_config.get("vitest_dir"), "mutation.vitest_dir"
+    )
+    if vitest_dir:
+        vitest["dir"] = vitest_dir
+    config: dict[str, Any] = {
         "testRunner": "vitest",
         "mutate": mutate,
         "mutator": {"excludedMutations": STRYKER_EXCLUDED_MUTATORS},
@@ -2656,14 +2688,58 @@ def stryker_config(
         "tempDirName": "node_modules/.cache/repo-quality-gate-stryker",
         "cleanTempDir": "always",
         "concurrency": workers,
-        "vitest": {"related": True},
+        "vitest": vitest,
         "thresholds": {"high": 100, "low": 100, "break": 100},
     }
+    if test_files:
+        config["testFiles"] = test_files
+    return config
 
 
-def source_range(
-    source: str, start: dict[str, Any], end: dict[str, Any]
-) -> str:
+MUTATION_VITEST_CONFIG_NAMES = (
+    "vitest.mutation.config.ts",
+    "vitest.mutation.config.js",
+    "vitest.mutation.config.mts",
+    "vitest.mutation.config.mjs",
+    "vitest.mutation.config.cts",
+    "vitest.mutation.config.cjs",
+)
+
+
+def snapshot_relative_path(root: Path, value: Any, key: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a repository-relative path")
+    path = Path(value)
+    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+    try:
+        relative = resolved.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError(f"{key} must stay inside the repository") from error
+    return relative.as_posix()
+
+
+def mutation_vitest_config_path(root: Path, configured: Any) -> str | None:
+    relative = snapshot_relative_path(root, configured, "mutation.vitest_config")
+    if relative is None:
+        relative = next(
+            (name for name in MUTATION_VITEST_CONFIG_NAMES if (root / name).is_file()),
+            None,
+        )
+    if relative is not None and not (root / relative).is_file():
+        raise ValueError(f"mutation.vitest_config does not exist: {relative}")
+    return relative
+
+
+def snapshot_relative_directory(root: Path, value: Any, key: str) -> str | None:
+    relative = snapshot_relative_path(root, value, key)
+    if relative is not None and not (root / relative).is_dir():
+        raise ValueError(f"{key} is not a directory: {relative}")
+    return relative
+
+
+def source_range(source: str, start: dict[str, Any], end: dict[str, Any]) -> str:
     lines = source.splitlines(keepends=True)
     try:
         start_line = int(start["line"])
@@ -2681,7 +2757,9 @@ def parse_stryker_report(path: Path) -> list[Mutation]:
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Cannot read Stryker mutation report {path}: {error}") from error
+        raise ValueError(
+            f"Cannot read Stryker mutation report {path}: {error}"
+        ) from error
     files = report.get("files") if isinstance(report, dict) else None
     if not isinstance(files, dict):
         raise ValueError("Stryker mutation report is missing its files object")
@@ -2706,9 +2784,7 @@ def parse_stryker_report(path: Path) -> list[Mutation]:
             if status == "Ignored" and mutator_name in STRYKER_EXCLUDED_MUTATORS:
                 continue
             line = int(start.get("line", 0)) if isinstance(start, dict) else 0
-            column = (
-                int(start.get("column", 0)) + 1 if isinstance(start, dict) else 0
-            )
+            column = int(start.get("column", 0)) + 1 if isinstance(start, dict) else 0
             identity = hashlib.sha256(
                 f"{filename}:{line}:{column}:{original}:{replacement}".encode()
             ).hexdigest()[:12]
@@ -2729,13 +2805,31 @@ def parse_stryker_report(path: Path) -> list[Mutation]:
                     float(mutant.get("duration", 0) or 0),
                     output,
                     status,
+                    bool(mutant.get("static", False)),
                 )
             )
     return results
 
 
-def stryker_environment_fingerprint(root: Path) -> str:
+def stryker_environment_fingerprint(
+    root: Path, mutation_config: dict[str, Any] | None = None
+) -> str:
     digest = hashlib.sha256(f"stryker-{STRYKER_VERSION}".encode())
+    mutation_config = mutation_config or {}
+    digest.update(
+        json.dumps(
+            {
+                key: mutation_config.get(key)
+                for key in (
+                    "test_files",
+                    "vitest_config",
+                    "vitest_dir",
+                    "vitest_related",
+                )
+            },
+            sort_keys=True,
+        ).encode()
+    )
     relevant_names = {
         "package.json",
         "package-lock.json",
@@ -2751,24 +2845,32 @@ def stryker_environment_fingerprint(root: Path) -> str:
             name in relevant_names
             or name.startswith("tsconfig")
             or name.startswith("vitest.config")
+            or name.startswith("vitest.mutation.config")
             or name.startswith("vite.config")
         ):
             continue
         digest.update(normalize_path(path, root).encode())
         with contextlib.suppress(OSError):
             digest.update(path.read_bytes())
+    configured_vitest = mutation_vitest_config_path(
+        root, mutation_config.get("vitest_config")
+    )
+    if configured_vitest:
+        path = root / configured_vitest
+        digest.update(configured_vitest.encode())
+        with contextlib.suppress(OSError):
+            digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
 
-def stryker_incremental_path(root: Path, tools: ToolContext) -> Path:
+def stryker_incremental_path(
+    root: Path,
+    tools: ToolContext,
+    mutation_config: dict[str, Any] | None = None,
+) -> Path:
     repository_key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
-    fingerprint = stryker_environment_fingerprint(root)
-    return (
-        tools.cache_dir
-        / "mutation"
-        / repository_key
-        / f"stryker-{fingerprint}.json"
-    )
+    fingerprint = stryker_environment_fingerprint(root, mutation_config)
+    return tools.cache_dir / "mutation" / repository_key / f"stryker-{fingerprint}.json"
 
 
 def mutation_proof_fingerprint(
@@ -2776,7 +2878,9 @@ def mutation_proof_fingerprint(
     source_files: Sequence[Path],
     mutation_config: dict[str, Any],
 ) -> str:
-    digest = hashlib.sha256(stryker_environment_fingerprint(root).encode())
+    digest = hashlib.sha256(
+        stryker_environment_fingerprint(root, mutation_config).encode()
+    )
     digest.update(json.dumps(mutation_config, sort_keys=True).encode())
     digest.update(json.dumps(STRYKER_EXCLUDED_MUTATORS, sort_keys=True).encode())
     included: set[Path] = set()
@@ -2823,9 +2927,7 @@ def store_stryker_proof_cache(
     fingerprint: str,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_temporary = report_path.with_name(
-        f".{report_path.name}.{os.getpid()}.tmp"
-    )
+    report_temporary = report_path.with_name(f".{report_path.name}.{os.getpid()}.tmp")
     metadata_temporary = metadata_path.with_name(
         f".{metadata_path.name}.{os.getpid()}.tmp"
     )
@@ -2851,11 +2953,13 @@ def resolve_stryker_workers(value: Any) -> int:
         raise ValueError("mutation workers must be `auto` or a positive integer")
     if isinstance(value, str) and value.strip().lower() == "auto":
         available = os.cpu_count() or 1
-        return max(1, min(4, available // 2))
+        return available if available <= 4 else available - 1
     try:
         workers = int(value)
     except (TypeError, ValueError) as error:
-        raise ValueError("mutation workers must be `auto` or a positive integer") from error
+        raise ValueError(
+            "mutation workers must be `auto` or a positive integer"
+        ) from error
     if workers < 1:
         raise ValueError("mutation workers must be `auto` or a positive integer")
     return workers
@@ -2897,6 +3001,11 @@ def finish_stryker_mutation_gate(
             ],
         ), []
     failures = [mutation for mutation in mutations if mutation.survived]
+    static_count = sum(mutation.static for mutation in mutations)
+    performance_summary = (
+        f"; {static_count} static mutant{'s' if static_count != 1 else ''}; "
+        f"native phase {result.duration_seconds:.2f}s"
+    )
     prompts = [
         (f"Kill mutant {mutation.mutant_id}", mutation_prompt(mutation))
         for mutation in failures
@@ -2912,9 +3021,9 @@ def finish_stryker_mutation_gate(
             "mutation",
             "Mutation testing",
             False,
-            f"Native semantic mutation tested {len(mutations)} mutants with {workers} workers{cache_summary}; {len(failures)} were not assertion-killed ({status_summary}).",
+            f"Native semantic mutation tested {len(mutations)} mutants with {workers} workers{cache_summary}{performance_summary}; {len(failures)} were not assertion-killed ({status_summary}).",
             [
-                f"{mutation.path}:{mutation.line}:{mutation.column} {mutation.status} {mutation.original}->{mutation.replacement}"
+                f"{mutation.path}:{mutation.line}:{mutation.column} {mutation.status} {mutation.original}->{mutation.replacement}{' [static]' if mutation.static else ''}"
                 for mutation in failures
             ],
             [baseline, result],
@@ -2924,7 +3033,7 @@ def finish_stryker_mutation_gate(
         "mutation",
         "Mutation testing",
         True,
-        f"Native semantic mutation assertion-killed all {len(mutations)} mutants with {workers} workers{cache_summary}.",
+        f"Native semantic mutation assertion-killed all {len(mutations)} mutants with {workers} workers{cache_summary}{performance_summary}.",
         [],
         [baseline, result],
     ), mutations
@@ -2940,7 +3049,7 @@ def run_stryker_mutation_gate(
     timeout: int,
 ) -> tuple[GateResult, list[Mutation]]:
     workers = resolve_stryker_workers(requested_workers)
-    incremental_path = stryker_incremental_path(root, tools)
+    incremental_path = stryker_incremental_path(root, tools, mutation_config)
     incremental_path.parent.mkdir(parents=True, exist_ok=True)
     proof_report_path = incremental_path.with_name(
         f"{incremental_path.stem}-proof-report.json"
@@ -2948,9 +3057,7 @@ def run_stryker_mutation_gate(
     proof_metadata_path = incremental_path.with_name(
         f"{incremental_path.stem}-proof.json"
     )
-    proof_fingerprint = mutation_proof_fingerprint(
-        root, source_files, mutation_config
-    )
+    proof_fingerprint = mutation_proof_fingerprint(root, source_files, mutation_config)
     cached = load_stryker_proof_cache(
         proof_report_path, proof_metadata_path, proof_fingerprint
     )
@@ -2983,6 +3090,7 @@ def run_stryker_mutation_gate(
             incremental_path,
             workers,
             bool(mutation_config.get("incremental", True)),
+            mutation_config,
         )
         config_path.write_text(
             json.dumps(config_value, indent=2) + "\n", encoding="utf-8"
@@ -3002,7 +3110,12 @@ def run_stryker_mutation_gate(
                 "The native Vitest mutation adapter failed before producing a report.",
                 [result.stdout],
                 [baseline, result],
-                [("Repair native mutation adapter", generic_adapter_prompt("mutation", result))],
+                [
+                    (
+                        "Repair native mutation adapter",
+                        generic_adapter_prompt("mutation", result),
+                    )
+                ],
             ), []
         try:
             mutations = parse_stryker_report(report_path)
@@ -3014,7 +3127,12 @@ def run_stryker_mutation_gate(
                 str(error),
                 [result.stdout],
                 [baseline, result],
-                [("Repair native mutation report", generic_adapter_prompt("mutation", result))],
+                [
+                    (
+                        "Repair native mutation report",
+                        generic_adapter_prompt("mutation", result),
+                    )
+                ],
             ), []
         if not result.timed_out:
             store_stryker_proof_cache(
@@ -4110,13 +4228,13 @@ def html_report(report: AnalysisReport) -> str:
             f"""<tr class="{"bad" if mutation.survived else "ok"}"><td><code>{mutation.mutant_id}</code></td>
         <td><code>{html.escape(mutation.path)}:{mutation.line}:{mutation.column}</code></td>
         <td><code>{html.escape(mutation.original)} → {html.escape(mutation.replacement)}</code></td>
-        <td>{html.escape((mutation.status or ("Survived" if mutation.survived else "Killed")).upper())}</td><td>{mutation.duration_seconds:.2f}s</td></tr>"""
+        <td>{html.escape((mutation.status or ("Survived" if mutation.survived else "Killed")).upper())}</td><td>{"YES" if mutation.static else "NO"}</td><td>{mutation.duration_seconds:.2f}s</td></tr>"""
             for mutation in shown_mutations
         )
-        or '<tr><td colspan="5">No mutants executed.</td></tr>'
+        or '<tr><td colspan="6">No mutants executed.</td></tr>'
     )
     if len(ordered_mutations) > len(shown_mutations):
-        mutation_rows += f'<tr><td colspan="5">Showing 200 priority mutants out of {len(ordered_mutations)}.</td></tr>'
+        mutation_rows += f'<tr><td colspan="6">Showing 200 priority mutants out of {len(ordered_mutations)}.</td></tr>'
     shown_dependencies = report.dependency_violations[:200]
     dependency_rows = (
         "".join(
@@ -4219,7 +4337,7 @@ code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white
 <h2>Function health</h2><p class="section-note">Lower CRAAP is better. Required: {coverage_limit:g}% executable-line coverage and CRAAP ≤ {craap_limit:g}.</p>
 <div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div>
 <h2>Test strength</h2><p class="section-note">A “survived” mutant is a tiny wrong-code change your tests failed to catch. Required: zero survivors.</p>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div>
 <h2>Architecture boundaries</h2><p class="section-note">These imports cross a boundary your project says should stay closed.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div>
 <h2>Run details</h2><section class="setup"><ul>{notes_html}</ul></section>
 </main><script>
@@ -4312,6 +4430,19 @@ def run(
         notes.append(
             "Mutation testing selected the native Vitest/Stryker adapter with semantic operator discovery, per-test execution, and a persistent incremental cache."
         )
+        mutation_config = config["mutation"]
+        dedicated_test_files = mutation_config.get("test_files", [])
+        if dedicated_test_files:
+            notes.append(
+                f"Native mutation is restricted to {len(dedicated_test_files)} configured fast-test glob(s); the complete baseline suite still runs separately."
+            )
+        configured_vitest = mutation_vitest_config_path(
+            root, mutation_config.get("vitest_config")
+        )
+        if configured_vitest:
+            notes.append(
+                f"Native mutation uses the dedicated Vitest configuration {configured_vitest}."
+            )
     else:
         notes.append(
             "Mutation testing selected the portable built-in fallback; dependency checking remains built in."
@@ -4439,7 +4570,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mutation-workers",
         metavar="N|auto",
-        help="run mutants in N isolated repository snapshots; auto uses up to 4 workers",
+        help="run mutants with N workers; native auto follows Stryker's CPU default, while the portable fallback uses up to 4 isolated workers",
     )
     parser.add_argument(
         "--fast",

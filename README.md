@@ -168,7 +168,7 @@ python3 skills/code-discipline/scripts/quality_loop.py [OPTIONS]
 | `--html PATH` | Write the HTML here and `quality-gate-state.json` beside it. Cannot be combined with `--artifact-dir`. |
 | `--gate-script PATH` | Load an alternate `repo_quality_gate.py`; intended for engine development. |
 | `--max-mutants N` | Execute at most `N` mutants for diagnosis. A capped run can never pass. |
-| `--mutation-workers auto` | Use up to four native/portable mutation workers. This is also the default. |
+| `--mutation-workers auto` | Native Vitest/Stryker follows Stryker's CPU default; the portable fallback uses up to four workers. This is also the default. |
 | `--mutation-workers N` | Use exactly `N` positive mutation workers. More workers can increase memory use. |
 | `--fast` | Defer flaky repetitions and mutation testing. Never certifies. |
 | `--no-install` | Forbid automatic analysis-tool installation; useful offline or in read-only setups. |
@@ -232,7 +232,7 @@ The standalone options are:
 | `--html PATH` | HTML path; defaults to `quality-gate-report.html`. |
 | `--init` | Generate detected configuration and exit without running gates. |
 | `--max-mutants N` | Diagnostic mutant cap; a capped run can never pass. |
-| `--mutation-workers auto` | Automatically use up to four workers. |
+| `--mutation-workers auto` | Native Vitest/Stryker follows Stryker's CPU default; the portable fallback uses up to four workers. |
 | `--mutation-workers N` | Use exactly `N` positive workers. |
 | `--fast` | Run one diagnostic pass and defer flake/mutation work. Never certifies. |
 | `--no-install` | Do not install missing analysis tools. |
@@ -370,6 +370,10 @@ Repository-specific commands are argument arrays, not shell strings:
     "enabled": true,
     "engine": "auto",
     "incremental": true,
+    "test_files": [],
+    "vitest_config": null,
+    "vitest_dir": null,
+    "vitest_related": true,
     "workers": "auto",
     "max_mutants": 0,
     "timeout_seconds": 600
@@ -441,9 +445,13 @@ import syntax can use `dependencies.command` plus
 
 ## Mutation performance
 
-`--mutation-workers auto` uses up to four workers. An explicit value such as
-`--mutation-workers 2` can reduce memory pressure; a larger value can help only
-when the machine and test runner have spare CPU and memory.
+For native Vitest/Stryker, `--mutation-workers auto` follows Stryker's CPU
+default: all logical CPUs on machines with four or fewer, otherwise logical
+CPUs minus one. The portable fallback remains conservatively capped at four
+because each worker executes the repository's external test command in its own
+snapshot. An explicit value such as `--mutation-workers 4` can reduce memory or
+shared-resource pressure; more workers help only while CPU, memory, databases,
+ports, and files remain uncontended.
 
 Vitest repositories use Stryker semantic mutation, per-test selection,
 bail-first execution, and persistent incremental results inside one disposable
@@ -452,6 +460,35 @@ when production source, tests, quality configuration, and dependency manifests
 have not changed. A relevant edit reruns affected mutants. The first cold full
 certification must still build the complete proof and is expected to be much
 slower than one unit-test run.
+
+Large repositories should give Stryker a dedicated fast unit-test project:
+
+```json
+{
+  "mutation": {
+    "test_files": ["tests/unit/**/*.test.ts"],
+    "vitest_config": "vitest.mutation.config.ts",
+    "vitest_dir": "tests/unit",
+    "vitest_related": true
+  }
+}
+```
+
+`vitest.mutation.config.ts`, `.js`, `.mts`, `.mjs`, `.cts`, or `.cjs` is also
+detected automatically when `vitest_config` is omitted. These settings narrow
+only the tests repeated by Stryker. The complete baseline suite still runs
+separately, and any mutant not killed by the selected unit tests remains a gate
+failure. Keep unit tests independent and import their production modules
+directly so related-test and per-test selection remain accurate.
+
+The mutation summary and HTML table report the native phase duration and mark
+static mutants. Static mutants execute during module loading and may require
+many more tests; refactor important module-load calculations behind callable
+functions instead of ignoring them. Persist
+`${XDG_CACHE_HOME:-~/.cache}/repo-quality-gate/` between CI jobs to retain the
+incremental and exact-proof caches. Run an occasional clean certification after
+toolchain or environment changes because upstream incremental matching cannot
+observe every external input.
 
 Other stacks use the portable snapshot-per-worker engine. Neither engine edits
 the active worktree. `--max-mutants N` is useful to debug the adapter quickly,

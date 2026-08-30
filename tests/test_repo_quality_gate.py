@@ -21,7 +21,9 @@ import repo_quality_gate as gate  # noqa: E402
 
 
 def load_quality_loop():
-    spec = importlib.util.spec_from_file_location("quality_loop_test_module", LOOP_SCRIPT)
+    spec = importlib.util.spec_from_file_location(
+        "quality_loop_test_module", LOOP_SCRIPT
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load quality loop: {LOOP_SCRIPT}")
     module = importlib.util.module_from_spec(spec)
@@ -476,7 +478,9 @@ class QualityGateUnitTests(unittest.TestCase):
                 duration_seconds=0.1,
             )
             with (
-                mock.patch.object(gate, "node_package_version", side_effect=package_version),
+                mock.patch.object(
+                    gate, "node_package_version", side_effect=package_version
+                ),
                 mock.patch.object(gate, "executable", return_value="npm"),
                 mock.patch.object(gate, "run_command", return_value=install) as runner,
             ):
@@ -486,7 +490,9 @@ class QualityGateUnitTests(unittest.TestCase):
             self.assertIn("@stryker-mutator/core@9.6.1", install_command)
             self.assertIn("@stryker-mutator/vitest-runner@9.6.1", install_command)
             self.assertIn("--no-save", install_command)
-            self.assertEqual(tools.stryker_command, [str(root / "node_modules/.bin/stryker")])
+            self.assertEqual(
+                tools.stryker_command, [str(root / "node_modules/.bin/stryker")]
+            )
 
     def test_stryker_config_is_incremental_and_safe_inside_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -514,6 +520,63 @@ class QualityGateUnitTests(unittest.TestCase):
             self.assertTrue(config["tempDirName"].startswith("node_modules/"))
             self.assertEqual(config["reporters"], ["json"])
 
+    def test_stryker_config_uses_a_dedicated_vitest_unit_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src/app.ts"
+            source.parent.mkdir()
+            source.write_text("export const value = 1\n", encoding="utf-8")
+            (root / "tests/unit").mkdir(parents=True)
+            (root / "vitest.mutation.config.ts").write_text(
+                "export default {}\n", encoding="utf-8"
+            )
+
+            config = gate.stryker_config(
+                root,
+                [source],
+                root / "mutation.json",
+                root / "incremental.json",
+                workers=6,
+                mutation_config={
+                    "test_files": ["tests/unit/**/*.test.ts"],
+                    "vitest_dir": "tests/unit",
+                    "vitest_related": True,
+                },
+            )
+
+            self.assertEqual(config["testFiles"], ["tests/unit/**/*.test.ts"])
+            self.assertEqual(
+                config["vitest"],
+                {
+                    "related": True,
+                    "configFile": "vitest.mutation.config.ts",
+                    "dir": "tests/unit",
+                },
+            )
+            self.assertEqual(config["concurrency"], 6)
+
+    def test_stryker_config_rejects_dedicated_paths_outside_repository(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = parent / "repo"
+            source = root / "src/app.ts"
+            source.parent.mkdir(parents=True)
+            source.write_text("export const value = 1\n", encoding="utf-8")
+            outside = parent / "outside-vitest.ts"
+            outside.write_text("export default {}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "must stay inside"):
+                gate.stryker_config(
+                    root,
+                    [source],
+                    root / "mutation.json",
+                    root / "incremental.json",
+                    workers=2,
+                    mutation_config={"vitest_config": str(outside)},
+                )
+
     def test_stryker_report_requires_an_assertion_kill_for_every_mutant(self) -> None:
         report = {
             "files": {
@@ -525,6 +588,8 @@ class QualityGateUnitTests(unittest.TestCase):
                             "mutatorName": "EqualityOperator",
                             "replacement": ">",
                             "status": "Killed",
+                            "static": True,
+                            "duration": 1.25,
                             "location": {
                                 "start": {"line": 1, "column": 30},
                                 "end": {"line": 1, "column": 31},
@@ -600,8 +665,24 @@ class QualityGateUnitTests(unittest.TestCase):
             [False, True, True, True, True],
         )
         self.assertTrue(mutations[-2].timed_out)
+        self.assertTrue(mutations[0].static)
+        self.assertEqual(mutations[0].duration_seconds, 1.25)
 
-    def test_exact_stryker_proof_cache_requires_matching_content_fingerprint(self) -> None:
+        baseline = gate.CommandResult(["npm", "test"], 0, "green", 0.1)
+        native_run = gate.CommandResult(["stryker", "run"], 1, "done", 12.5)
+        result, _ = gate.finish_stryker_mutation_gate(
+            mutations,
+            baseline,
+            native_run,
+            workers=6,
+            cache_summary="; initialized cache",
+        )
+        self.assertIn("1 static mutant", result.summary)
+        self.assertIn("12.50s", result.summary)
+
+    def test_exact_stryker_proof_cache_requires_matching_content_fingerprint(
+        self,
+    ) -> None:
         report = {
             "files": {
                 "src/app.ts": {
@@ -631,9 +712,7 @@ class QualityGateUnitTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            cached = gate.load_stryker_proof_cache(
-                incremental, metadata, "matching"
-            )
+            cached = gate.load_stryker_proof_cache(incremental, metadata, "matching")
             stale = gate.load_stryker_proof_cache(incremental, metadata, "changed")
 
         self.assertIsNotNone(cached)
@@ -659,6 +738,25 @@ class QualityGateUnitTests(unittest.TestCase):
 
         self.assertNotEqual(original, after_test)
         self.assertNotEqual(after_test, after_source)
+
+    def test_stryker_environment_fingerprint_changes_with_dedicated_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config/mutation-vitest.ts"
+            config_path.parent.mkdir()
+            config_path.write_text("export default { test: {} }\n", encoding="utf-8")
+            mutation_config = {"vitest_config": "config/mutation-vitest.ts"}
+
+            original = gate.stryker_environment_fingerprint(root, mutation_config)
+            config_path.write_text(
+                "export default { test: { environment: 'node' } }\n",
+                encoding="utf-8",
+            )
+            changed = gate.stryker_environment_fingerprint(root, mutation_config)
+
+        self.assertNotEqual(original, changed)
 
     def test_command_substitution_preserves_unrelated_braces(self) -> None:
         command = gate.command_list(
@@ -794,9 +892,7 @@ const helper = require('./helper.js')
                 )
                 return gate.CommandResult(command, 1, "killed", 0.01)
 
-            with mock.patch.object(
-                gate, "run_command", side_effect=fake_run_command
-            ):
+            with mock.patch.object(gate, "run_command", side_effect=fake_run_command):
                 result, mutations = gate.run_mutation_gate(
                     root,
                     config,
@@ -900,7 +996,9 @@ const helper = require('./helper.js')
             self.assertTrue(all(not mutation.survived for mutation in mutations))
             self.assertEqual(source.read_text(encoding="utf-8"), original)
 
-    def test_native_vitest_mutation_reuses_completed_proof_without_a_runner(self) -> None:
+    def test_native_vitest_mutation_reuses_completed_proof_without_a_runner(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "src/app.ts"
@@ -931,7 +1029,9 @@ const helper = require('./helper.js')
                 nonlocal runner_calls
                 runner_calls += 1
                 self.assertNotEqual(execution_root, root)
-                stryker_options = json.loads(Path(command[-1]).read_text(encoding="utf-8"))
+                stryker_options = json.loads(
+                    Path(command[-1]).read_text(encoding="utf-8")
+                )
                 self.assertTrue(stryker_options["inPlace"])
                 report = {
                     "files": {
@@ -987,6 +1087,10 @@ const helper = require('./helper.js')
 
     def test_mutation_worker_validation(self) -> None:
         with mock.patch.object(gate.os, "cpu_count", return_value=12):
+            self.assertEqual(gate.resolve_stryker_workers("auto"), 11)
+        with mock.patch.object(gate.os, "cpu_count", return_value=4):
+            self.assertEqual(gate.resolve_stryker_workers("auto"), 4)
+        with mock.patch.object(gate.os, "cpu_count", return_value=12):
             self.assertEqual(gate.resolve_mutation_workers("auto", 4), 1)
             self.assertEqual(gate.resolve_mutation_workers("auto", 20), 2)
             self.assertEqual(gate.resolve_mutation_workers("auto", 40), 4)
@@ -996,7 +1100,9 @@ const helper = require('./helper.js')
                 with self.assertRaises(ValueError):
                     gate.resolve_mutation_workers(invalid, 10)
 
-    def test_quality_loop_rejects_a_concurrent_run_for_the_same_repository(self) -> None:
+    def test_quality_loop_rejects_a_concurrent_run_for_the_same_repository(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache = root / "cache"
@@ -1225,6 +1331,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(len(passing_state["gates"]), 8)
             self.assertEqual(passing_state["counts"]["checks_applicable"], 8)
             self.assertEqual(passing_state["counts"]["checks_passing"], 8)
+            self.assertEqual(passing_state["counts"]["mutants_static"], 0)
             self.assertIsNone(passing_state["fix_prompt"])
             self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
 
@@ -1378,6 +1485,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertNotIn("Gherkin", rendered)
             self.assertNotIn("Executable UI", rendered)
             self.assertIn("All 1 mutants were killed", rendered)
+            self.assertIn("<th>Static</th>", rendered)
 
 
 if __name__ == "__main__":

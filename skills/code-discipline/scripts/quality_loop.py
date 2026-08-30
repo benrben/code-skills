@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Iterator, Sequence, TextIO
 
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
 
 
@@ -208,6 +208,7 @@ def mutation_failure(mutation: Any) -> dict[str, Any]:
         "column": mutation.column,
         "change": f"{mutation.original} -> {mutation.replacement}",
         "status": mutation.status or ("Survived" if mutation.survived else "Killed"),
+        "static": bool(getattr(mutation, "static", False)),
     }
 
 
@@ -299,6 +300,9 @@ def analysis_state(
             "functions_failing": len(failing_functions),
             "mutants_total": len(analysis.mutations),
             "mutants_surviving": len(survivors),
+            "mutants_static": sum(
+                bool(getattr(item, "static", False)) for item in analysis.mutations
+            ),
             "dependency_violations": len(violations),
         },
         "failures": {
@@ -401,7 +405,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mutation-workers",
         metavar="N|auto",
-        help="run native mutation workers inside one isolated snapshot; portable fallback uses isolated snapshots; auto uses up to 4 workers",
+        help="run native mutation workers inside one isolated snapshot; native auto follows Stryker's CPU default, while the portable fallback uses up to 4 isolated workers",
     )
     parser.add_argument(
         "--fast",

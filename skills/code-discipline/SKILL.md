@@ -37,20 +37,27 @@ and mutation testing. It is diagnostic only and never exits `0`. Read
 repository. Use `--html PATH` for an explicit report file or `--artifact-dir
 DIR` for the default HTML and JSON filenames in a dedicated directory.
 
-For a full mutation run, use `--mutation-workers auto`; a positive integer sets
-an exact worker bound. Vitest repositories automatically use the native
-Stryker adapter in one disposable repository snapshot: semantic operator
-discovery, per-test coverage, bail-on-first-failure, and incremental results
-replace one full-suite process per text match. A content-addressed proof cache
-skips Stryker entirely when production source, tests, tool configuration, and
-dependency manifests are byte-for-byte unchanged. Any relevant change
-invalidates that shortcut and Stryker retests affected mutants; the complete
-cold run establishes the initial proof. Other stacks retain the portable
-snapshot-per-worker fallback. Both engines keep the active worktree unchanged
-and require every in-scope mutant to be assertion-killed; `Survived`,
-`NoCoverage`, `Timeout`, and runner-error results fail the gate. Only one
-quality loop may run per repository because coverage tools commonly share
-temporary paths.
+For a full mutation run, use `--mutation-workers auto`; native Vitest/Stryker
+uses Stryker's CPU-based worker default, while a positive integer sets an exact
+bound. Vitest repositories automatically use the native Stryker adapter in one
+disposable repository snapshot: semantic operator discovery, per-test coverage,
+related-test selection, bail-on-first-failure, and incremental results replace
+one full-suite process per text match. Repositories with a large integration
+suite may configure `mutation.test_files`, `mutation.vitest_config`, and
+`mutation.vitest_dir` for a dedicated fast unit-test project; this narrows only
+the tests Stryker repeats, never the separate complete baseline suite, and any
+uncovered mutant still fails. A `vitest.mutation.config.*` file is detected
+automatically. A content-addressed proof cache skips Stryker entirely when
+production source, tests, tool configuration, and dependency manifests are
+byte-for-byte unchanged. Any relevant change invalidates that shortcut and
+Stryker retests affected mutants; the complete cold run establishes the initial
+proof. The report names static mutants and native phase time so expensive
+module-load mutations are visible rather than silently ignored. Other stacks
+retain the conservative portable snapshot-per-worker fallback. Both engines
+keep the active worktree unchanged and require every in-scope mutant to be
+assertion-killed; `Survived`, `NoCoverage`, `Timeout`, and runner-error results
+fail the gate. Only one quality loop may run per repository because coverage
+tools commonly share temporary paths.
 
 The core writes its HTML and JSON state to a user cache, leaving the target
 worktree unchanged except for repairs the agent intentionally makes. Exit `0`
