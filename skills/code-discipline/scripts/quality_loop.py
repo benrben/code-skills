@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Iterator, Sequence, TextIO
 
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
 
 
@@ -207,6 +207,7 @@ def mutation_failure(mutation: Any) -> dict[str, Any]:
         "line": mutation.line,
         "column": mutation.column,
         "change": f"{mutation.original} -> {mutation.replacement}",
+        "status": mutation.status or ("Survived" if mutation.survived else "Killed"),
     }
 
 
@@ -400,7 +401,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mutation-workers",
         metavar="N|auto",
-        help="run mutants in N isolated repository snapshots; auto uses up to 4 workers",
+        help="run native mutation workers inside one isolated snapshot; portable fallback uses isolated snapshots; auto uses up to 4 workers",
     )
     parser.add_argument(
         "--fast",

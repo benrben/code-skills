@@ -398,11 +398,230 @@ class QualityGateUnitTests(unittest.TestCase):
             ):
                 tools = gate.bootstrap_tools(root, config, [source])
 
-            self.assertEqual(len(tools.setup_results), 1)
-            command = tools.setup_results[0].command
+            coverage_installs = [
+                result
+                for result in tools.setup_results
+                if any("@vitest/coverage-v8" in item for item in result.command)
+            ]
+            self.assertEqual(len(coverage_installs), 1)
+            command = coverage_installs[0].command
             self.assertIn("--no-save", command)
             self.assertIn("--package-lock=false", command)
             self.assertIn("@vitest/coverage-v8@4.1.11", command)
+
+    def test_bootstrap_auto_installs_native_vitest_mutation_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.ts"
+            source.write_text("export const value = 1\n", encoding="utf-8")
+            (root / "package.json").write_text(
+                json.dumps(
+                    {
+                        "scripts": {"test": "vitest run"},
+                        "devDependencies": {
+                            "vitest": "4.1.11",
+                            "@vitest/coverage-v8": "4.1.11",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["metrics"]["report"] = "metrics.json"
+
+            def package_version(_root: Path, name: str) -> str | None:
+                return "4.1.11" if name in {"vitest", "@vitest/coverage-v8"} else None
+
+            install = gate.CommandResult(
+                command=["npm", "install"],
+                returncode=0,
+                stdout="installed",
+                duration_seconds=0.1,
+            )
+            with (
+                mock.patch.object(gate, "node_package_version", side_effect=package_version),
+                mock.patch.object(gate, "executable", return_value="npm"),
+                mock.patch.object(gate, "run_command", return_value=install) as runner,
+            ):
+                tools = gate.bootstrap_tools(root, config, [source])
+
+            install_command = runner.call_args.args[0]
+            self.assertIn("@stryker-mutator/core@9.6.1", install_command)
+            self.assertIn("@stryker-mutator/vitest-runner@9.6.1", install_command)
+            self.assertIn("--no-save", install_command)
+            self.assertEqual(tools.stryker_command, [str(root / "node_modules/.bin/stryker")])
+
+    def test_stryker_config_is_incremental_and_safe_inside_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src/app.ts"
+            source.parent.mkdir()
+            source.write_text("export const value = 1\n", encoding="utf-8")
+            report = root / "artifacts/report.json"
+            incremental = root / "cache/incremental.json"
+
+            config = gate.stryker_config(
+                root,
+                [source],
+                report,
+                incremental,
+                workers=4,
+            )
+
+            self.assertEqual(config["testRunner"], "vitest")
+            self.assertTrue(config["inPlace"])
+            self.assertTrue(config["incremental"])
+            self.assertEqual(config["incrementalFile"], str(incremental))
+            self.assertEqual(config["mutate"], ["src/app.ts"])
+            self.assertEqual(config["concurrency"], 4)
+            self.assertTrue(config["tempDirName"].startswith("node_modules/"))
+            self.assertEqual(config["reporters"], ["json"])
+
+    def test_stryker_report_requires_an_assertion_kill_for_every_mutant(self) -> None:
+        report = {
+            "files": {
+                "src/app.ts": {
+                    "source": "export const selected = value < 3;\n",
+                    "mutants": [
+                        {
+                            "id": "killed",
+                            "mutatorName": "EqualityOperator",
+                            "replacement": ">",
+                            "status": "Killed",
+                            "location": {
+                                "start": {"line": 1, "column": 30},
+                                "end": {"line": 1, "column": 31},
+                            },
+                        },
+                        {
+                            "id": "survived",
+                            "mutatorName": "EqualityOperator",
+                            "replacement": ">=",
+                            "status": "Survived",
+                            "location": {
+                                "start": {"line": 1, "column": 30},
+                                "end": {"line": 1, "column": 31},
+                            },
+                        },
+                        {
+                            "id": "uncovered",
+                            "mutatorName": "EqualityOperator",
+                            "replacement": "<=",
+                            "status": "NoCoverage",
+                            "location": {
+                                "start": {"line": 1, "column": 30},
+                                "end": {"line": 1, "column": 31},
+                            },
+                        },
+                        {
+                            "id": "timeout",
+                            "mutatorName": "EqualityOperator",
+                            "replacement": "==",
+                            "status": "Timeout",
+                            "statusReason": "hit limit",
+                            "location": {
+                                "start": {"line": 1, "column": 30},
+                                "end": {"line": 1, "column": 31},
+                            },
+                        },
+                        {
+                            "id": "excluded",
+                            "mutatorName": "StringLiteral",
+                            "replacement": '""',
+                            "status": "Ignored",
+                            "location": {
+                                "start": {"line": 1, "column": 13},
+                                "end": {"line": 1, "column": 21},
+                            },
+                        },
+                        {
+                            "id": "suppressed-operator",
+                            "mutatorName": "EqualityOperator",
+                            "replacement": "!=",
+                            "status": "Ignored",
+                            "location": {
+                                "start": {"line": 1, "column": 30},
+                                "end": {"line": 1, "column": 31},
+                            },
+                        },
+                    ],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mutation.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            mutations = gate.parse_stryker_report(path)
+
+        self.assertEqual([mutation.original for mutation in mutations], ["<"] * 5)
+        self.assertEqual(
+            [mutation.status for mutation in mutations],
+            ["Killed", "Survived", "NoCoverage", "Timeout", "Ignored"],
+        )
+        self.assertEqual(
+            [mutation.survived for mutation in mutations],
+            [False, True, True, True, True],
+        )
+        self.assertTrue(mutations[-2].timed_out)
+
+    def test_exact_stryker_proof_cache_requires_matching_content_fingerprint(self) -> None:
+        report = {
+            "files": {
+                "src/app.ts": {
+                    "source": "export const value = 1;\n",
+                    "mutants": [
+                        {
+                            "id": "one",
+                            "mutatorName": "EqualityOperator",
+                            "replacement": "2",
+                            "status": "Killed",
+                            "location": {
+                                "start": {"line": 1, "column": 21},
+                                "end": {"line": 1, "column": 22},
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            incremental = root / "incremental.json"
+            metadata = root / "proof.json"
+            incremental.write_text(json.dumps(report), encoding="utf-8")
+            metadata.write_text(
+                json.dumps({"fingerprint": "matching", "complete": True}),
+                encoding="utf-8",
+            )
+
+            cached = gate.load_stryker_proof_cache(
+                incremental, metadata, "matching"
+            )
+            stale = gate.load_stryker_proof_cache(incremental, metadata, "changed")
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(len(cached or []), 1)
+        self.assertIsNone(stale)
+
+    def test_mutation_proof_fingerprint_changes_with_tests_and_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src/app.ts"
+            test = root / "tests/app.test.ts"
+            source.parent.mkdir()
+            test.parent.mkdir()
+            source.write_text("export const value = 1;\n", encoding="utf-8")
+            test.write_text("expect(value).toBe(1);\n", encoding="utf-8")
+            config = gate.default_config()["mutation"]
+
+            original = gate.mutation_proof_fingerprint(root, [source], config)
+            test.write_text("expect(value).toBe(2);\n", encoding="utf-8")
+            after_test = gate.mutation_proof_fingerprint(root, [source], config)
+            source.write_text("export const value = 2;\n", encoding="utf-8")
+            after_source = gate.mutation_proof_fingerprint(root, [source], config)
+
+        self.assertNotEqual(original, after_test)
+        self.assertNotEqual(after_test, after_source)
 
     def test_command_substitution_preserves_unrelated_braces(self) -> None:
         command = gate.command_list(
@@ -642,6 +861,91 @@ const helper = require('./helper.js')
             self.assertTrue(result.passed)
             self.assertEqual(len(mutations), 2)
             self.assertTrue(all(not mutation.survived for mutation in mutations))
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
+    def test_native_vitest_mutation_reuses_completed_proof_without_a_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src/app.ts"
+            source.parent.mkdir()
+            original = "export const selected = value == 1;\n"
+            source.write_text(original, encoding="utf-8")
+            (root / "package.json").write_text(
+                json.dumps({"devDependencies": {"vitest": "4.1.11"}}),
+                encoding="utf-8",
+            )
+            tools = gate.ToolContext(
+                cache_dir=root / "tool-cache",
+                python=sys.executable,
+                python_path=root / "python-tools",
+                stryker_command=[str(root / "node_modules/.bin/stryker")],
+            )
+            config = gate.default_config()
+            config["test"]["command"] = ["npm", "test"]
+            baseline = gate.CommandResult(["npm", "test"], 0, "green", 0.1)
+            runner_calls = 0
+
+            def fake_stryker(
+                command: list[str],
+                execution_root: Path,
+                _timeout: int,
+                _extra_env: dict[str, str] | None = None,
+            ) -> gate.CommandResult:
+                nonlocal runner_calls
+                runner_calls += 1
+                self.assertNotEqual(execution_root, root)
+                stryker_options = json.loads(Path(command[-1]).read_text(encoding="utf-8"))
+                self.assertTrue(stryker_options["inPlace"])
+                report = {
+                    "files": {
+                        "src/app.ts": {
+                            "source": original,
+                            "mutants": [
+                                {
+                                    "id": "one",
+                                    "mutatorName": "EqualityOperator",
+                                    "replacement": "!=",
+                                    "status": "Killed",
+                                    "location": {
+                                        "start": {"line": 1, "column": 30},
+                                        "end": {"line": 1, "column": 32},
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                }
+                Path(stryker_options["jsonReporter"]["fileName"]).write_text(
+                    json.dumps(report), encoding="utf-8"
+                )
+                return gate.CommandResult(command, 0, "cold native run", 0.2)
+
+            with mock.patch.object(gate, "run_command", side_effect=fake_stryker):
+                cold, cold_mutations = gate.run_mutation_gate(
+                    root,
+                    config,
+                    [source],
+                    cli_max_mutants=None,
+                    test_baseline=baseline,
+                    cli_mutation_workers="auto",
+                    tools=tools,
+                )
+                cached, cached_mutations = gate.run_mutation_gate(
+                    root,
+                    config,
+                    [source],
+                    cli_max_mutants=None,
+                    test_baseline=baseline,
+                    cli_mutation_workers="auto",
+                    tools=tools,
+                )
+
+            self.assertTrue(cold.passed)
+            self.assertTrue(cached.passed)
+            self.assertEqual(runner_calls, 1)
+            self.assertEqual(len(cold_mutations), 1)
+            self.assertEqual(len(cached_mutations), 1)
+            self.assertIn("reused exact proof", cached.summary)
             self.assertEqual(source.read_text(encoding="utf-8"), original)
 
     def test_mutation_worker_validation(self) -> None:

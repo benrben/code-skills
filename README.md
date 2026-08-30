@@ -111,7 +111,7 @@ gate fails with a prompt that an agent can use to create the missing evidence.
 `--max-mutants N` is available for quick diagnostics, but a capped mutation run
 can never produce a passing gate.
 
-Mutation runs can safely use parallel workers:
+Mutation runs safely select the fastest supported engine:
 
 ```bash
 python3 skills/code-discipline/scripts/quality_loop.py \
@@ -119,17 +119,22 @@ python3 skills/code-discipline/scripts/quality_loop.py \
   --mutation-workers auto
 ```
 
-`auto` adds workers as the mutant set grows, up to four; an explicit positive
-integer such as `--mutation-workers 2` is also accepted. Every worker receives
-an isolated repository snapshot (copy-on-write when supported) and separate
-temporary/cache paths, so it never mutates the active worktree or another
-worker's files. Repositories whose tests share fixed ports, databases,
-accounts, or other resources should either isolate those resources using
-`QUALITY_GATE_MUTATION_WORKER` or select one worker. The default remains one
-worker for compatibility. A repository-specific lock rejects overlapping
-quality-loop runs before they can race over shared coverage output. Interrupts
-and command timeouts stop the complete spawned process tree and release that
-lock cleanly.
+`auto` uses up to four workers; an explicit positive integer such as
+`--mutation-workers 2` is also accepted. Vitest repositories automatically use
+Stryker's semantic operator mutation, per-test selection, bail-first execution,
+and persistent incremental results inside one disposable copy-on-write
+snapshot. An exact content-addressed proof bypasses Stryker when production
+source, tests, configuration, and dependency manifests have not changed. A
+relevant edit invalidates the shortcut and reruns affected mutants; the first
+cold certification builds the complete proof. Other stacks use the portable
+snapshot-per-worker engine. Neither engine mutates the active worktree.
+
+The mutation gate counts only the requested arithmetic and equality operator
+families. Deliberately excluded Stryker mutation kinds are not failures, while
+`Survived`, `NoCoverage`, `Timeout`, and runner-error results all fail because
+they were not killed by an assertion. A repository-specific lock rejects
+overlapping quality-loop runs before shared coverage output can race.
+Interrupts and timeouts stop the complete process tree and release the lock.
 
 Agents loop on the smaller core attached to `code-discipline`:
 

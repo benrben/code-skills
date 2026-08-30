@@ -39,9 +39,33 @@ from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 CONFIG_NAME = ".quality-gate.json"
 DEFAULT_REPORT = "quality-gate-report.html"
+STRYKER_VERSION = "9.6.1"
+JAVASCRIPT_MUTATION_EXTENSIONS = {
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+}
+STRYKER_EXCLUDED_MUTATORS = [
+    "ArrayDeclaration",
+    "ArrowFunction",
+    "BlockStatement",
+    "BooleanLiteral",
+    "ConditionalExpression",
+    "LogicalOperator",
+    "MethodExpression",
+    "ObjectLiteral",
+    "OptionalChaining",
+    "Regex",
+    "StringLiteral",
+    "UnaryOperator",
+    "UpdateOperator",
+]
 
 SOURCE_EXTENSIONS = {
     ".py",
@@ -262,6 +286,7 @@ class Mutation:
     timed_out: bool
     duration_seconds: float
     output: str
+    status: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,6 +329,7 @@ class ToolContext:
     python_path: Path
     lizard_available: bool = False
     cargo_llvm_cov: str | None = None
+    stryker_command: list[str] | None = None
     setup_results: list[CommandResult] = dataclasses.field(default_factory=list)
 
     @property
@@ -401,10 +427,12 @@ def default_config() -> dict[str, Any]:
         },
         "mutation": {
             "enabled": True,
+            "engine": "auto",
+            "incremental": True,
             "test_command": None,
             "timeout_seconds": 600,
             "max_mutants": 0,
-            "workers": 1,
+            "workers": "auto",
             "operators": OPERATOR_MUTATIONS,
             "exclude": [],
         },
@@ -861,6 +889,42 @@ def bootstrap_tools(
             900,
         )
         context.setup_results.append(install)
+
+    mutation_config = config.get("mutation", {})
+    mutation_engine = str(mutation_config.get("engine", "auto")).lower()
+    needs_stryker = (
+        mutation_config.get("enabled", True)
+        and mutation_engine in {"auto", "stryker"}
+        and "vitest" in dependencies
+        and any(
+            path.suffix.lower() in JAVASCRIPT_MUTATION_EXTENSIONS
+            for path in source_files
+        )
+    )
+    has_stryker = bool(
+        node_package_version(root, "@stryker-mutator/core")
+        and node_package_version(root, "@stryker-mutator/vitest-runner")
+    )
+    stryker_install_succeeded = False
+    if needs_stryker and not has_stryker and auto_install and executable(root, "npm"):
+        install = run_command(
+            [
+                executable(root, "npm") or "npm",
+                "install",
+                "--no-save",
+                "--package-lock=false",
+                "--ignore-scripts",
+                f"@stryker-mutator/core@{STRYKER_VERSION}",
+                f"@stryker-mutator/vitest-runner@{STRYKER_VERSION}",
+            ],
+            root,
+            900,
+        )
+        context.setup_results.append(install)
+        stryker_install_succeeded = install.returncode == 0
+    if needs_stryker and (has_stryker or stryker_install_succeeded):
+        binary_name = "stryker.cmd" if os.name == "nt" else "stryker"
+        context.stryker_command = [str(root / "node_modules" / ".bin" / binary_name)]
 
     cargo_root = cache_dir / "cargo"
     cargo_binary = (
@@ -2560,9 +2624,418 @@ def mutation_prompt(mutation: Mutation) -> str:
     return f"""You are the hardener agent. Kill surviving mutant `{mutation.mutant_id}` in {mutation.path}:{mutation.line}:{mutation.column}.
 
 Mutation: `{mutation.original}` -> `{mutation.replacement}`
-The complete configured test suite still exited successfully.
+Mutation result: `{mutation.status or 'Survived'}`. {mutation.output}
 
 First decide which externally visible behavior differs under this mutation. Add the smallest behavior-focused test through the production API that fails with the mutant and passes on the original code. If the mutant is genuinely equivalent, simplify the production expression so the equivalent mutation site disappears; do not mark it ignored. Re-run the single mutant, then the full mutation gate. Do not assert implementation details or weaken the zero-survivor threshold."""
+
+
+def stryker_config(
+    root: Path,
+    source_files: Sequence[Path],
+    report_path: Path,
+    incremental_path: Path,
+    workers: int,
+    incremental: bool = True,
+) -> dict[str, Any]:
+    """Build a semantic operator-only Stryker configuration for an isolated snapshot."""
+    mutate = [
+        normalize_path(path, root)
+        for path in source_files
+        if path.suffix.lower() in JAVASCRIPT_MUTATION_EXTENSIONS
+        and not path.name.endswith(".d.ts")
+    ]
+    return {
+        "testRunner": "vitest",
+        "mutate": mutate,
+        "mutator": {"excludedMutations": STRYKER_EXCLUDED_MUTATORS},
+        "reporters": ["json"],
+        "jsonReporter": {"fileName": str(report_path)},
+        "incremental": incremental,
+        "incrementalFile": str(incremental_path),
+        "inPlace": True,
+        "tempDirName": "node_modules/.cache/repo-quality-gate-stryker",
+        "cleanTempDir": "always",
+        "concurrency": workers,
+        "vitest": {"related": True},
+        "thresholds": {"high": 100, "low": 100, "break": 100},
+    }
+
+
+def source_range(
+    source: str, start: dict[str, Any], end: dict[str, Any]
+) -> str:
+    lines = source.splitlines(keepends=True)
+    try:
+        start_line = int(start["line"])
+        end_line = int(end["line"])
+        start_column = int(start["column"])
+        end_column = int(end["column"])
+        start_offset = sum(len(line) for line in lines[: start_line - 1]) + start_column
+        end_offset = sum(len(line) for line in lines[: end_line - 1]) + end_column
+    except (KeyError, TypeError, ValueError):
+        return "unknown"
+    return source[start_offset:end_offset]
+
+
+def parse_stryker_report(path: Path) -> list[Mutation]:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read Stryker mutation report {path}: {error}") from error
+    files = report.get("files") if isinstance(report, dict) else None
+    if not isinstance(files, dict):
+        raise ValueError("Stryker mutation report is missing its files object")
+    results: list[Mutation] = []
+    for filename, file_report in files.items():
+        if not isinstance(file_report, dict):
+            continue
+        source = str(file_report.get("source", ""))
+        mutants = file_report.get("mutants", [])
+        if not isinstance(mutants, list):
+            continue
+        for mutant in mutants:
+            if not isinstance(mutant, dict):
+                continue
+            location = mutant.get("location", {})
+            start = location.get("start", {}) if isinstance(location, dict) else {}
+            end = location.get("end", {}) if isinstance(location, dict) else {}
+            original = source_range(source, start, end)
+            replacement = str(mutant.get("replacement", ""))
+            status = str(mutant.get("status", "Unknown"))
+            mutator_name = str(mutant.get("mutatorName", ""))
+            if status == "Ignored" and mutator_name in STRYKER_EXCLUDED_MUTATORS:
+                continue
+            line = int(start.get("line", 0)) if isinstance(start, dict) else 0
+            column = (
+                int(start.get("column", 0)) + 1 if isinstance(start, dict) else 0
+            )
+            identity = hashlib.sha256(
+                f"{filename}:{line}:{column}:{original}:{replacement}".encode()
+            ).hexdigest()[:12]
+            reason = str(mutant.get("statusReason", "")).strip()
+            output = f"Stryker status: {status}"
+            if reason:
+                output += f" ({reason})"
+            results.append(
+                Mutation(
+                    identity,
+                    str(filename),
+                    line,
+                    column,
+                    original[:200],
+                    replacement[:200],
+                    status != "Killed",
+                    status == "Timeout",
+                    float(mutant.get("duration", 0) or 0),
+                    output,
+                    status,
+                )
+            )
+    return results
+
+
+def stryker_environment_fingerprint(root: Path) -> str:
+    digest = hashlib.sha256(f"stryker-{STRYKER_VERSION}".encode())
+    relevant_names = {
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    }
+    for path in sorted(walk_files(root)):
+        name = path.name.lower()
+        if not (
+            name in relevant_names
+            or name.startswith("tsconfig")
+            or name.startswith("vitest.config")
+            or name.startswith("vite.config")
+        ):
+            continue
+        digest.update(normalize_path(path, root).encode())
+        with contextlib.suppress(OSError):
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def stryker_incremental_path(root: Path, tools: ToolContext) -> Path:
+    repository_key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    fingerprint = stryker_environment_fingerprint(root)
+    return (
+        tools.cache_dir
+        / "mutation"
+        / repository_key
+        / f"stryker-{fingerprint}.json"
+    )
+
+
+def mutation_proof_fingerprint(
+    root: Path,
+    source_files: Sequence[Path],
+    mutation_config: dict[str, Any],
+) -> str:
+    digest = hashlib.sha256(stryker_environment_fingerprint(root).encode())
+    digest.update(json.dumps(mutation_config, sort_keys=True).encode())
+    digest.update(json.dumps(STRYKER_EXCLUDED_MUTATORS, sort_keys=True).encode())
+    included: set[Path] = set()
+    for path in source_files:
+        included.add(path.resolve())
+    for path in walk_files(root):
+        relative = normalize_path(path, root)
+        if matches_any(relative, DEFAULT_TEST_PATTERNS):
+            included.add(path.resolve())
+    for path in sorted(included):
+        digest.update(normalize_path(path, root).encode())
+        try:
+            digest.update(path.read_bytes())
+        except OSError as error:
+            digest.update(f"unreadable:{error}".encode())
+    return digest.hexdigest()
+
+
+def load_stryker_proof_cache(
+    report_path: Path, metadata_path: Path, fingerprint: str
+) -> list[Mutation] | None:
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    if (
+        metadata.get("fingerprint") != fingerprint
+        or metadata.get("complete") is not True
+    ):
+        return None
+    try:
+        mutations = parse_stryker_report(report_path)
+    except ValueError:
+        return None
+    return mutations or None
+
+
+def store_stryker_proof_cache(
+    source_report: Path,
+    report_path: Path,
+    metadata_path: Path,
+    fingerprint: str,
+) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_temporary = report_path.with_name(
+        f".{report_path.name}.{os.getpid()}.tmp"
+    )
+    metadata_temporary = metadata_path.with_name(
+        f".{metadata_path.name}.{os.getpid()}.tmp"
+    )
+    shutil.copyfile(source_report, report_temporary)
+    os.replace(report_temporary, report_path)
+    metadata_temporary.write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "fingerprint": fingerprint,
+                "stryker_version": STRYKER_VERSION,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(metadata_temporary, metadata_path)
+
+
+def resolve_stryker_workers(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("mutation workers must be `auto` or a positive integer")
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        available = os.cpu_count() or 1
+        return max(1, min(4, available // 2))
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("mutation workers must be `auto` or a positive integer") from error
+    if workers < 1:
+        raise ValueError("mutation workers must be `auto` or a positive integer")
+    return workers
+
+
+def supports_native_vitest_mutation(
+    root: Path, source_files: Sequence[Path], tools: ToolContext | None
+) -> bool:
+    return bool(
+        tools
+        and tools.stryker_command
+        and source_files
+        and all(
+            path.suffix.lower() in JAVASCRIPT_MUTATION_EXTENSIONS
+            for path in source_files
+        )
+        and "vitest" in package_dependencies(root)
+    )
+
+
+def finish_stryker_mutation_gate(
+    mutations: list[Mutation],
+    baseline: CommandResult,
+    result: CommandResult,
+    workers: int,
+    cache_summary: str,
+) -> tuple[GateResult, list[Mutation]]:
+    if not mutations:
+        return GateResult(
+            "mutation",
+            "Mutation testing",
+            False,
+            "The native adapter generated no semantic operator mutants.",
+            prompts=[
+                (
+                    "Repair mutation discovery",
+                    "Inspect the selected JavaScript/TypeScript production files and Stryker configuration. Do not claim zero survivors from an empty mutant set.",
+                )
+            ],
+        ), []
+    failures = [mutation for mutation in mutations if mutation.survived]
+    prompts = [
+        (f"Kill mutant {mutation.mutant_id}", mutation_prompt(mutation))
+        for mutation in failures
+    ]
+    if failures:
+        status_counts: dict[str, int] = {}
+        for mutation in failures:
+            status_counts[mutation.status] = status_counts.get(mutation.status, 0) + 1
+        status_summary = ", ".join(
+            f"{count} {status}" for status, count in sorted(status_counts.items())
+        )
+        return GateResult(
+            "mutation",
+            "Mutation testing",
+            False,
+            f"Native semantic mutation tested {len(mutations)} mutants with {workers} workers{cache_summary}; {len(failures)} were not assertion-killed ({status_summary}).",
+            [
+                f"{mutation.path}:{mutation.line}:{mutation.column} {mutation.status} {mutation.original}->{mutation.replacement}"
+                for mutation in failures
+            ],
+            [baseline, result],
+            prompts,
+        ), mutations
+    return GateResult(
+        "mutation",
+        "Mutation testing",
+        True,
+        f"Native semantic mutation assertion-killed all {len(mutations)} mutants with {workers} workers{cache_summary}.",
+        [],
+        [baseline, result],
+    ), mutations
+
+
+def run_stryker_mutation_gate(
+    root: Path,
+    mutation_config: dict[str, Any],
+    source_files: Sequence[Path],
+    baseline: CommandResult,
+    tools: ToolContext,
+    requested_workers: Any,
+    timeout: int,
+) -> tuple[GateResult, list[Mutation]]:
+    workers = resolve_stryker_workers(requested_workers)
+    incremental_path = stryker_incremental_path(root, tools)
+    incremental_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_report_path = incremental_path.with_name(
+        f"{incremental_path.stem}-proof-report.json"
+    )
+    proof_metadata_path = incremental_path.with_name(
+        f"{incremental_path.stem}-proof.json"
+    )
+    proof_fingerprint = mutation_proof_fingerprint(
+        root, source_files, mutation_config
+    )
+    cached = load_stryker_proof_cache(
+        proof_report_path, proof_metadata_path, proof_fingerprint
+    )
+    if cached is not None:
+        cached_result = CommandResult(
+            [*(tools.stryker_command or ["stryker"]), "proof-cache"],
+            0,
+            "Exact source, test, configuration, and dependency fingerprint matched the completed native mutation proof.",
+            0.0,
+        )
+        return finish_stryker_mutation_gate(
+            cached,
+            baseline,
+            cached_result,
+            workers,
+            f"; reused exact proof for all {len(cached)} mutants",
+        )
+    with tempfile.TemporaryDirectory(
+        prefix="quality-gate-stryker-worker-"
+    ) as temporary:
+        worker_parent = Path(temporary)
+        worker_root = worker_parent / "repository"
+        report_path = worker_parent / "mutation.json"
+        config_path = worker_parent / "stryker.config.json"
+        copy_repository_snapshot(root, worker_root)
+        config_value = stryker_config(
+            root,
+            source_files,
+            report_path,
+            incremental_path,
+            workers,
+            bool(mutation_config.get("incremental", True)),
+        )
+        config_path.write_text(
+            json.dumps(config_value, indent=2) + "\n", encoding="utf-8"
+        )
+        command = command_for_snapshot(tools.stryker_command or [], root, worker_root)
+        result = run_command(
+            [*command, "run", str(config_path)],
+            worker_root,
+            timeout,
+            {"QUALITY_GATE_MUTATION_WORKER": "1"},
+        )
+        if not report_path.exists():
+            return GateResult(
+                "mutation",
+                "Mutation testing",
+                False,
+                "The native Vitest mutation adapter failed before producing a report.",
+                [result.stdout],
+                [baseline, result],
+                [("Repair native mutation adapter", generic_adapter_prompt("mutation", result))],
+            ), []
+        try:
+            mutations = parse_stryker_report(report_path)
+        except ValueError as error:
+            return GateResult(
+                "mutation",
+                "Mutation testing",
+                False,
+                str(error),
+                [result.stdout],
+                [baseline, result],
+                [("Repair native mutation report", generic_adapter_prompt("mutation", result))],
+            ), []
+        if not result.timed_out:
+            store_stryker_proof_cache(
+                report_path,
+                proof_report_path,
+                proof_metadata_path,
+                proof_fingerprint,
+            )
+    reused_match = re.search(
+        r"(\d+) of (\d+) mutant result\(s\) (?:are|is) reused", result.stdout
+    )
+    if reused_match:
+        reused_count = min(int(reused_match.group(1)), len(mutations))
+        cache_summary = (
+            f"; reused {reused_count}/{len(mutations)} in-scope cached results"
+        )
+    else:
+        cache_summary = "; initialized or refreshed the incremental cache"
+    return finish_stryker_mutation_gate(
+        mutations, baseline, result, workers, cache_summary
+    )
 
 
 def resolve_mutation_workers(value: Any, candidate_count: int) -> int:
@@ -2855,6 +3328,7 @@ def run_mutation_gate(
     cli_max_mutants: int | None,
     test_baseline: CommandResult | None = None,
     cli_mutation_workers: str | int | None = None,
+    tools: ToolContext | None = None,
 ) -> tuple[GateResult, list[Mutation]]:
     mutation_config = config["mutation"]
     if not mutation_config.get("enabled", True):
@@ -2908,6 +3382,40 @@ def run_mutation_gate(
             [baseline],
             [("Repair baseline tests", generic_adapter_prompt("test", baseline))],
         ), []
+    engine = str(mutation_config.get("engine", "auto")).strip().lower()
+    if engine not in {"auto", "builtin", "stryker"}:
+        raise ValueError("mutation.engine must be `auto`, `builtin`, or `stryker`")
+    configured_max = int(mutation_config.get("max_mutants", 0))
+    max_mutants = cli_max_mutants if cli_max_mutants is not None else configured_max
+    configured_workers = mutation_config.get("workers", "auto")
+    requested_workers = (
+        cli_mutation_workers if cli_mutation_workers is not None else configured_workers
+    )
+    native_supported = supports_native_vitest_mutation(root, source_files, tools)
+    if engine == "stryker" and not native_supported:
+        return GateResult(
+            "mutation",
+            "Mutation testing",
+            False,
+            "The Stryker engine was requested but a compatible local Vitest runner is unavailable.",
+            prompts=[
+                (
+                    "Install native mutation tools",
+                    f"Install @stryker-mutator/core@{STRYKER_VERSION} and @stryker-mutator/vitest-runner@{STRYKER_VERSION}, or enable automatic tool installation. Keep the complete Vitest suite green before rerunning.",
+                )
+            ],
+        ), []
+    if native_supported and not max_mutants and engine in {"auto", "stryker"}:
+        assert tools is not None
+        return run_stryker_mutation_gate(
+            root,
+            mutation_config,
+            source_files,
+            baseline,
+            tools,
+            requested_workers,
+            timeout,
+        )
     operators = {
         str(key): str(value)
         for key, value in mutation_config.get("operators", OPERATOR_MUTATIONS).items()
@@ -2924,8 +3432,6 @@ def run_mutation_gate(
             candidates.append(
                 MutationCandidate(relative, offset, line, column, original, replacement)
             )
-    configured_max = int(mutation_config.get("max_mutants", 0))
-    max_mutants = cli_max_mutants if cli_max_mutants is not None else configured_max
     total_candidates = len(candidates)
     if max_mutants and len(candidates) > max_mutants:
         candidates = candidates[:max_mutants]
@@ -2942,10 +3448,6 @@ def run_mutation_gate(
                 )
             ],
         ), []
-    configured_workers = mutation_config.get("workers", 1)
-    requested_workers = (
-        cli_mutation_workers if cli_mutation_workers is not None else configured_workers
-    )
     worker_count = resolve_mutation_workers(requested_workers, len(candidates))
     if worker_count == 1:
         results = run_mutations_serially(root, candidates, test_command, timeout)
@@ -3608,7 +4110,7 @@ def html_report(report: AnalysisReport) -> str:
             f"""<tr class="{"bad" if mutation.survived else "ok"}"><td><code>{mutation.mutant_id}</code></td>
         <td><code>{html.escape(mutation.path)}:{mutation.line}:{mutation.column}</code></td>
         <td><code>{html.escape(mutation.original)} → {html.escape(mutation.replacement)}</code></td>
-        <td>{"SURVIVED" if mutation.survived else "KILLED"}</td><td>{mutation.duration_seconds:.2f}s</td></tr>"""
+        <td>{html.escape((mutation.status or ("Survived" if mutation.survived else "Killed")).upper())}</td><td>{mutation.duration_seconds:.2f}s</td></tr>"""
             for mutation in shown_mutations
         )
         or '<tr><td colspan="5">No mutants executed.</td></tr>'
@@ -3806,9 +4308,14 @@ def run(
             "Fast diagnostic mode: flaky-test repetitions and mutation testing are deferred; this run cannot certify the repository."
         )
     tools = bootstrap_tools(root, config, source_files)
-    notes.append(
-        "Mutation testing and dependency checking are built in; no package install is required for those gates."
-    )
+    if tools.stryker_command:
+        notes.append(
+            "Mutation testing selected the native Vitest/Stryker adapter with semantic operator discovery, per-test execution, and a persistent incremental cache."
+        )
+    else:
+        notes.append(
+            "Mutation testing selected the portable built-in fallback; dependency checking remains built in."
+        )
     if tools.setup_results:
         succeeded = sum(result.returncode == 0 for result in tools.setup_results)
         notes.append(
@@ -3876,6 +4383,7 @@ def run(
                 cli_max_mutants,
                 test_baseline,
                 cli_mutation_workers,
+                tools,
             )
         dependency_gate, violations = run_dependency_gate(
             root, config, source_files, workspace

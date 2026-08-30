@@ -37,15 +37,20 @@ and mutation testing. It is diagnostic only and never exits `0`. Read
 repository. Use `--html PATH` for an explicit report file or `--artifact-dir
 DIR` for the default HTML and JSON filenames in a dedicated directory.
 
-For a full mutation run, `--mutation-workers auto` executes mutants in up to
-four isolated repository snapshots; a positive integer selects an exact upper
-bound. Every worker, including a single worker, uses a disposable snapshot, so
-the active worktree is never mutated. Use one worker when tests cannot isolate
-fixed ports, shared databases, external accounts, or other process-global
-resources. Tests may use `QUALITY_GATE_MUTATION_WORKER` to derive worker-specific
-resources. Parallelism changes throughput only; it must not reduce the mutant
-set or weaken the zero-survivor requirement. Only one quality loop may run per
-repository at a time because coverage tools commonly share temporary paths.
+For a full mutation run, use `--mutation-workers auto`; a positive integer sets
+an exact worker bound. Vitest repositories automatically use the native
+Stryker adapter in one disposable repository snapshot: semantic operator
+discovery, per-test coverage, bail-on-first-failure, and incremental results
+replace one full-suite process per text match. A content-addressed proof cache
+skips Stryker entirely when production source, tests, tool configuration, and
+dependency manifests are byte-for-byte unchanged. Any relevant change
+invalidates that shortcut and Stryker retests affected mutants; the complete
+cold run establishes the initial proof. Other stacks retain the portable
+snapshot-per-worker fallback. Both engines keep the active worktree unchanged
+and require every in-scope mutant to be assertion-killed; `Survived`,
+`NoCoverage`, `Timeout`, and runner-error results fail the gate. Only one
+quality loop may run per repository because coverage tools commonly share
+temporary paths.
 
 The core writes its HTML and JSON state to a user cache, leaving the target
 worktree unchanged except for repairs the agent intentionally makes. Exit `0`
