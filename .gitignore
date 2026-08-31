@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 .venv/
 .ruff_cache/
+/.agents/skills/code-discipline/
+/.claude/skills/code-discipline
 evals/workspaces/
 evals/results/20*/
 evals/results/latest.txt
