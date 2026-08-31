@@ -58,6 +58,18 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertEqual(payload, b"skill payload")
         self.assertIn("--max-filesize", run.call_args.args[0])
 
+    def test_installer_resolves_mutable_refs_before_downloading_skill(self) -> None:
+        commit = "a" * 40
+        with mock.patch.object(
+            installer,
+            "download_file",
+            return_value=json.dumps({"sha": commit}).encode(),
+        ) as download:
+            resolved = installer.resolve_reference("refs/heads/main")
+
+        self.assertEqual(resolved, commit)
+        self.assertIn("refs%2Fheads%2Fmain", download.call_args.args[0])
+
     def test_skill_package_is_complete_and_runs_without_source_checkout(self) -> None:
         skill_source = ROOT / "skills" / "code-discipline"
         for relative in installer.SKILL_FILES:

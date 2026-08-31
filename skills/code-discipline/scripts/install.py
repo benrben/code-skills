@@ -20,10 +20,11 @@ from urllib.request import Request, urlopen
 import uuid
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
+API_BASE = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
 SKILL_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -101,9 +102,24 @@ def download_file(url: str, maximum_bytes: int = 2_000_000) -> bytes:
     return payload
 
 
+def resolve_reference(reference: str) -> str:
+    url = f"{API_BASE}/commits/{quote(reference, safe='')}"
+    try:
+        metadata = json.loads(download_file(url, 100_000).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"GitHub returned invalid ref metadata for {reference}"
+        ) from error
+    commit = metadata.get("sha") if isinstance(metadata, dict) else None
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError(f"GitHub did not resolve ref {reference} to a commit")
+    return commit
+
+
 def download_skill(reference: str) -> dict[str, bytes]:
+    commit = resolve_reference(reference)
     return {
-        relative: download_file(raw_url(reference, relative))
+        relative: download_file(raw_url(commit, relative))
         for relative in SKILL_FILES
     }
 
