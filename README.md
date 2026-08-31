@@ -122,6 +122,11 @@ python3 .agents/skills/code-discipline/scripts/quality_loop.py --version
 ## Develop this source repository
 
 ```bash
-python3 -m unittest tests.test_repo_quality_gate
-python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" skills/code-discipline
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m unittest tests.test_repo_quality_gate
+python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --no-install --mutation-workers auto
 ```
+
+The full gate uses the pinned tools in `.venv`, writes its HTML and JSON reports
+in the repository root, and enforces the goals in `.quality-thresholds.json`.

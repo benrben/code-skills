@@ -1,0 +1,7 @@
+check-jsonschema==0.33.2
+coverage==7.10.2
+jsonschema==4.25.0
+lizard==1.17.31
+mypy==1.17.1
+ruff==0.12.8
+vulture==2.14

@@ -7,18 +7,17 @@ import argparse
 import ast
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-import uuid
-
 
 VERSION = "1.3.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
@@ -62,42 +61,50 @@ def raw_url(reference: str, relative_path: str) -> str:
     )
 
 
+def download_with_curl(url: str, maximum_bytes: int, python_error: Exception) -> bytes:
+    curl = shutil.which("curl")
+    if curl is None:
+        raise RuntimeError(
+            f"could not download {url}: {python_error}"
+        ) from python_error
+    try:
+        completed = subprocess.run(
+            [
+                curl,
+                "-fsSL",
+                "--max-time",
+                "30",
+                "--max-filesize",
+                str(maximum_bytes),
+                url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=35,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as curl_error:
+        raise RuntimeError(
+            f"could not download {url} with Python HTTPS or curl: {curl_error}"
+        ) from curl_error
+    if completed.returncode != 0:
+        details = completed.stderr.decode(errors="replace").strip()
+        reason = details or f"curl exited {completed.returncode}"
+        raise RuntimeError(
+            f"could not download {url} with Python HTTPS or curl: {reason}"
+        ) from python_error
+    return bytes(completed.stdout)
+
+
 def download_file(url: str, maximum_bytes: int = 2_000_000) -> bytes:
-    request = Request(url, headers={"User-Agent": f"code-discipline-installer/{VERSION}"})
+    request = Request(
+        url, headers={"User-Agent": f"code-discipline-installer/{VERSION}"}
+    )
     try:
         with urlopen(request, timeout=30) as response:
-            payload = response.read(maximum_bytes + 1)
+            payload = bytes(response.read(maximum_bytes + 1))
     except (HTTPError, URLError, TimeoutError, OSError) as error:
-        curl = shutil.which("curl")
-        if curl is None:
-            raise RuntimeError(f"could not download {url}: {error}") from error
-        try:
-            completed = subprocess.run(
-                [
-                    curl,
-                    "-fsSL",
-                    "--max-time",
-                    "30",
-                    "--max-filesize",
-                    str(maximum_bytes),
-                    url,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=35,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as curl_error:
-            raise RuntimeError(
-                f"could not download {url} with Python HTTPS or curl: {curl_error}"
-            ) from curl_error
-        if completed.returncode != 0:
-            details = completed.stderr.decode(errors="replace").strip()
-            raise RuntimeError(
-                f"could not download {url} with Python HTTPS or curl: "
-                f"{details or f'curl exited {completed.returncode}'}"
-            ) from error
-        payload = completed.stdout
+        payload = download_with_curl(url, maximum_bytes, error)
     if len(payload) > maximum_bytes:
         raise RuntimeError(f"download exceeds {maximum_bytes} bytes: {url}")
     return payload
@@ -120,21 +127,24 @@ def resolve_reference(reference: str) -> str:
 def download_skill(reference: str) -> dict[str, bytes]:
     commit = resolve_reference(reference)
     return {
-        relative: download_file(raw_url(commit, relative))
-        for relative in SKILL_FILES
+        relative: download_file(raw_url(commit, relative)) for relative in SKILL_FILES
     }
 
 
-def write_staged_skill(directory: Path, payloads: Mapping[str, bytes]) -> None:
+def validate_skill_payloads(payloads: Mapping[str, bytes]) -> None:
     missing = sorted(set(SKILL_FILES) - set(payloads))
     unknown = sorted(set(payloads) - set(SKILL_FILES))
-    if missing or unknown:
-        details = []
-        if missing:
-            details.append(f"missing: {', '.join(missing)}")
-        if unknown:
-            details.append(f"unknown: {', '.join(unknown)}")
+    details = []
+    if missing:
+        details.append(f"missing: {', '.join(missing)}")
+    if unknown:
+        details.append(f"unknown: {', '.join(unknown)}")
+    if details:
         raise RuntimeError("invalid skill payload (" + "; ".join(details) + ")")
+
+
+def write_staged_skill(directory: Path, payloads: Mapping[str, bytes]) -> None:
+    validate_skill_payloads(payloads)
     for relative, payload in payloads.items():
         destination = directory / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -143,18 +153,30 @@ def write_staged_skill(directory: Path, payloads: Mapping[str, bytes]) -> None:
             destination.chmod(0o755)
 
 
-def validate_staged_skill(directory: Path) -> tuple[str, str]:
+def validate_skill_marker(directory: Path) -> None:
     skill_text = (directory / "SKILL.md").read_text(encoding="utf-8")
-    if not skill_text.startswith("---\n") or "\nname: code-discipline\n" not in skill_text:
+    if (
+        not skill_text.startswith("---\n")
+        or "\nname: code-discipline\n" not in skill_text
+    ):
         raise RuntimeError("downloaded SKILL.md is not code-discipline")
+
+
+def validate_staged_thresholds(directory: Path) -> None:
     thresholds = json.loads(
         (directory / "quality-thresholds.json").read_text(encoding="utf-8")
     )
     if not isinstance(thresholds, dict) or thresholds.get("schema_version") != 1:
         raise RuntimeError("downloaded quality-thresholds.json is invalid")
+
+
+def validate_staged_python(directory: Path) -> None:
     for relative in PYTHON_FILES:
         source = (directory / relative).read_text(encoding="utf-8")
         ast.parse(source, filename=relative)
+
+
+def staged_versions(directory: Path) -> tuple[str, str]:
     versions = []
     for relative in (
         "scripts/repo_quality_gate.py",
@@ -173,6 +195,13 @@ def validate_staged_skill(directory: Path) -> tuple[str, str]:
             raise RuntimeError(f"downloaded {relative} failed validation: {output}")
         versions.append(completed.stdout.strip())
     return versions[0], versions[1]
+
+
+def validate_staged_skill(directory: Path) -> tuple[str, str]:
+    validate_skill_marker(directory)
+    validate_staged_thresholds(directory)
+    validate_staged_python(directory)
+    return staged_versions(directory)
 
 
 def path_exists(path: Path) -> bool:
@@ -194,6 +223,29 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def validate_install_target(target: Path, update: bool) -> bool:
+    exists = path_exists(target)
+    if exists and not update:
+        raise RuntimeError(f"skill already exists; use --update-current: {target}")
+    if exists and not managed_skill(target):
+        raise RuntimeError(f"refusing to replace an unmanaged path: {target}")
+    return exists
+
+
+def backup_existing_target(target: Path, backup: Path, target_exists: bool) -> bool:
+    if target_exists:
+        os.replace(target, backup)
+    return target_exists
+
+
+def restore_install_backup(target: Path, backup: Path, moved_existing: bool) -> None:
+    if not moved_existing:
+        return
+    if path_exists(target):
+        remove_path(target)
+    os.replace(backup, target)
+
+
 def install_skill(
     target: Path,
     payloads: Mapping[str, bytes],
@@ -203,26 +255,19 @@ def install_skill(
     # replace the shared source it points at instead of the requested install.
     target = target.absolute()
     target.parent.mkdir(parents=True, exist_ok=True)
-    exists = path_exists(target)
-    if exists and not update:
-        raise RuntimeError(f"skill already exists; use --update-current: {target}")
-    if exists and not managed_skill(target):
-        raise RuntimeError(f"refusing to replace an unmanaged path: {target}")
-    staging = Path(tempfile.mkdtemp(prefix=".code-discipline-install-", dir=target.parent))
+    target_exists = validate_install_target(target, update)
+    staging = Path(
+        tempfile.mkdtemp(prefix=".code-discipline-install-", dir=target.parent)
+    )
     backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex}")
     moved_existing = False
     try:
         write_staged_skill(staging, payloads)
         versions = validate_staged_skill(staging)
-        if exists:
-            os.replace(target, backup)
-            moved_existing = True
+        moved_existing = backup_existing_target(target, backup, target_exists)
         os.replace(staging, target)
     except Exception:
-        if moved_existing:
-            if path_exists(target):
-                remove_path(target)
-            os.replace(backup, target)
+        restore_install_backup(target, backup, moved_existing)
         raise
     finally:
         if staging.exists():
@@ -280,41 +325,70 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="update the skill containing this script",
     )
     parser.add_argument("--root", default=".", help="repository root for --repo")
-    parser.add_argument("--ref", default=DEFAULT_REF, type=validate_ref, help="Git tag, branch, or commit")
+    parser.add_argument(
+        "--ref",
+        default=DEFAULT_REF,
+        type=validate_ref,
+        help="Git tag, branch, or commit",
+    )
     parser.add_argument("--version", action="version", version=VERSION)
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    try:
-        if args.update_current:
-            target = Path(__file__).resolve().parent.parent
-            update = True
-            link = None
-        elif args.repo:
-            target, scope_root = repo_target(Path(args.root))
-            update = False
-            link = claude_link_for(target, scope_root)
-        else:
-            target, scope_root = global_target()
-            update = False
-            link = claude_link_for(target, scope_root)
-        if link:
-            validate_claude_link(link, target)
-        payloads = download_skill(args.ref)
-        core_version, loop_version = install_skill(target, payloads, update)
-        if link:
-            ensure_claude_link(link, target)
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, SyntaxError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+def install_destination(
+    args: argparse.Namespace,
+) -> tuple[Path, bool, Path | None]:
+    if args.update_current:
+        return Path(__file__).resolve().parent.parent, True, None
+    if args.repo:
+        target, scope_root = repo_target(Path(args.root))
+    else:
+        target, scope_root = global_target()
+    return target, False, claude_link_for(target, scope_root)
+
+
+def install_from_args(
+    args: argparse.Namespace,
+) -> tuple[Path, bool, Path | None, str, str]:
+    target, update, link = install_destination(args)
+    if link:
+        validate_claude_link(link, target)
+    payloads = download_skill(args.ref)
+    core_version, loop_version = install_skill(target, payloads, update)
+    if link:
+        ensure_claude_link(link, target)
+    return target, update, link, core_version, loop_version
+
+
+def print_install_result(
+    target: Path,
+    update: bool,
+    link: Path | None,
+    core_version: str,
+    loop_version: str,
+) -> None:
     action = "Updated" if update else "Installed"
     print(f"{action} code-discipline at {target}")
     print(f"Quality engine {core_version}; quality loop {loop_version}")
     if link:
         print(f"Claude link: {link}")
     print("Repository quality configuration was not overwritten.")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        result = install_from_args(args)
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        json.JSONDecodeError,
+        SyntaxError,
+    ) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print_install_result(*result)
     return 0
 
 

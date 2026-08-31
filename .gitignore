@@ -4,6 +4,11 @@ __pycache__/
 *.pyc
 .venv/
 .ruff_cache/
+.mypy_cache/
+/.coverage
+/.coverage.*
+/.quality-coverage.json
+/htmlcov/
 /.agents/skills/code-discipline/
 /.claude/skills/code-discipline
 /quality-gate-report.html

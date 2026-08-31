@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import ModuleType
-
 
 CORE_PATH = (
     Path(__file__).resolve().parent
@@ -19,7 +18,9 @@ CORE_PATH = (
 
 
 def load_core() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("code_discipline_quality_gate", CORE_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "code_discipline_quality_gate", CORE_PATH
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load code-discipline quality engine: {CORE_PATH}")
     module = importlib.util.module_from_spec(spec)

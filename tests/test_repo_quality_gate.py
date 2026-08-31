@@ -1,33 +1,29 @@
 import contextlib
-import json
+import errno
 import importlib.util
 import io
+import json
 import os
-from pathlib import Path
-import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
-CORE_SCRIPT = (
-    ROOT / "skills" / "code-discipline" / "scripts" / "repo_quality_gate.py"
-)
+CORE_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "repo_quality_gate.py"
 LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py"
 INSTALL_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "install.py"
 
 
 def load_script(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(
-        name, path
-    )
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load script: {path}")
     module = importlib.util.module_from_spec(spec)
@@ -46,13 +42,15 @@ class QualityGateUnitTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=["curl"], returncode=0, stdout=b"skill payload", stderr=b""
         )
-        with mock.patch.object(
-            installer, "urlopen", side_effect=installer.URLError("certificate")
-        ), mock.patch.object(
-            installer.shutil, "which", return_value="/usr/bin/curl"
-        ), mock.patch.object(
-            installer.subprocess, "run", return_value=completed
-        ) as run:
+        with (
+            mock.patch.object(
+                installer, "urlopen", side_effect=installer.URLError("certificate")
+            ),
+            mock.patch.object(installer.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(
+                installer.subprocess, "run", return_value=completed
+            ) as run,
+        ):
             payload = installer.download_file("https://example.test/SKILL.md", 100)
 
         self.assertEqual(payload, b"skill payload")
@@ -252,7 +250,9 @@ class QualityGateUnitTests(unittest.TestCase):
             short = root / "short.py"
             long = root / "long.py"
             short.write_text("first\nsecond\n", encoding="utf-8")
-            long.write_text("\n".join(f"line {index}" for index in range(4)), encoding="utf-8")
+            long.write_text(
+                "\n".join(f"line {index}" for index in range(4)), encoding="utf-8"
+            )
 
             result, files = gate.run_file_loc_gate(
                 root,
@@ -272,7 +272,9 @@ class QualityGateUnitTests(unittest.TestCase):
             root = Path(temporary)
             production = root / "index.js"
             production.write_text("export default 1;\n", encoding="utf-8")
-            (root / "test.js").write_text("test('value', () => {});\n", encoding="utf-8")
+            (root / "test.js").write_text(
+                "test('value', () => {});\n", encoding="utf-8"
+            )
             (root / "test-d.ts").write_text(
                 "expectType<number>(1);\n", encoding="utf-8"
             )
@@ -351,7 +353,9 @@ class QualityGateUnitTests(unittest.TestCase):
                 (root / ".quality-thresholds.json").read_text(encoding="utf-8")
             )
 
-            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual(
+                completed.returncode, 0, completed.stdout + completed.stderr
+            )
             self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
             self.assertNotIn("coverage_limit", config["metrics"])
             self.assertNotIn("runs", config["flaky_tests"])
@@ -1864,6 +1868,675 @@ const helper = require('./helper.js')
             self.assertFalse(scoped_result.passed)
             self.assertEqual(len(scoped_violations), 1)
             self.assertEqual(scoped_violations[0].source, "src/domain/service.py")
+
+    def test_installer_validates_refs_urls_and_download_failures(self) -> None:
+        self.assertEqual(installer.validate_ref("refs/tags/v1.0.0"), "refs/tags/v1.0.0")
+        self.assertIn(
+            "refs/tags/v1.0.0", installer.raw_url("refs/tags/v1.0.0", "SKILL.md")
+        )
+        for invalid in ("", "/main", "refs/../main", "main branch"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(installer.argparse.ArgumentTypeError):
+                    installer.validate_ref(invalid)
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b"ok"
+        with mock.patch.object(installer, "urlopen", return_value=response):
+            self.assertEqual(installer.download_file("https://example.test", 2), b"ok")
+        response.read.assert_called_once_with(3)
+
+        with (
+            mock.patch.object(installer, "urlopen", side_effect=OSError("https")),
+            mock.patch.object(installer.shutil, "which", return_value=None),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not download"):
+                installer.download_file("https://example.test")
+
+        with (
+            mock.patch.object(installer, "urlopen", side_effect=OSError("https")),
+            mock.patch.object(installer.shutil, "which", return_value="curl"),
+            mock.patch.object(installer.subprocess, "run", side_effect=OSError("curl")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Python HTTPS or curl"):
+                installer.download_file("https://example.test")
+
+        failed = subprocess.CompletedProcess(["curl"], 22, b"", b"denied")
+        with (
+            mock.patch.object(installer, "urlopen", side_effect=OSError("https")),
+            mock.patch.object(installer.shutil, "which", return_value="curl"),
+            mock.patch.object(installer.subprocess, "run", return_value=failed),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "denied"):
+                installer.download_file("https://example.test")
+
+        response.read.return_value = b"too large"
+        with mock.patch.object(installer, "urlopen", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "exceeds"):
+                installer.download_file("https://example.test", 2)
+
+    def test_installer_rejects_invalid_metadata_and_payload_sets(self) -> None:
+        with mock.patch.object(installer, "download_file", return_value=b"{"):
+            with self.assertRaisesRegex(RuntimeError, "invalid ref metadata"):
+                installer.resolve_reference("main")
+        with mock.patch.object(
+            installer, "download_file", return_value=b'{"sha":"short"}'
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not resolve"):
+                installer.resolve_reference("main")
+
+        with (
+            mock.patch.object(installer, "resolve_reference", return_value="a" * 40),
+            mock.patch.object(
+                installer, "download_file", return_value=b"payload"
+            ) as download,
+        ):
+            payloads = installer.download_skill("main")
+        self.assertEqual(set(payloads), set(installer.SKILL_FILES))
+        self.assertEqual(download.call_count, len(installer.SKILL_FILES))
+
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            installer.validate_skill_payloads({})
+        unknown_payloads = {relative: b"" for relative in installer.SKILL_FILES}
+        unknown_payloads["unknown"] = b""
+        with self.assertRaisesRegex(RuntimeError, "unknown"):
+            installer.validate_skill_payloads(unknown_payloads)
+        installer.validate_skill_payloads(
+            {relative: b"" for relative in installer.SKILL_FILES}
+        )
+
+    def test_installer_validates_each_staged_component(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "SKILL.md").write_text("invalid", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not code-discipline"):
+                installer.validate_skill_marker(root)
+            (root / "SKILL.md").write_text(
+                "---\nname: code-discipline\n---\n", encoding="utf-8"
+            )
+            installer.validate_skill_marker(root)
+
+            (root / "quality-thresholds.json").write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "thresholds"):
+                installer.validate_staged_thresholds(root)
+            (root / "quality-thresholds.json").write_text(
+                '{"schema_version":1}', encoding="utf-8"
+            )
+            installer.validate_staged_thresholds(root)
+
+            for relative in installer.PYTHON_FILES:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("pass\n", encoding="utf-8")
+            (root / installer.PYTHON_FILES[0]).write_text("if", encoding="utf-8")
+            with self.assertRaises(SyntaxError):
+                installer.validate_staged_python(root)
+            (root / installer.PYTHON_FILES[0]).write_text("pass\n", encoding="utf-8")
+            installer.validate_staged_python(root)
+
+            failed = subprocess.CompletedProcess([], 1, "", "broken")
+            with mock.patch.object(installer.subprocess, "run", return_value=failed):
+                with self.assertRaisesRegex(RuntimeError, "failed validation"):
+                    installer.staged_versions(root)
+            passed = subprocess.CompletedProcess([], 0, "1.0\n", "")
+            with mock.patch.object(installer.subprocess, "run", return_value=passed):
+                self.assertEqual(installer.staged_versions(root), ("1.0", "1.0"))
+
+    def test_installer_restores_backup_after_partial_swap_failure(self) -> None:
+        payloads = {
+            relative: (ROOT / "skills" / "code-discipline" / relative).read_bytes()
+            for relative in installer.SKILL_FILES
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "code-discipline"
+            shutil.copytree(ROOT / "skills" / "code-discipline", target)
+            marker = target / "marker"
+            marker.write_text("original", encoding="utf-8")
+            real_replace = installer.os.replace
+            calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("staged replace failed")
+                return real_replace(source, destination)
+
+            with mock.patch.object(
+                installer.os, "replace", side_effect=fail_second_replace
+            ):
+                with self.assertRaisesRegex(OSError, "staged replace failed"):
+                    installer.install_skill(target, payloads, update=True)
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "original")
+
+    def test_installer_path_link_destination_and_output_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "missing"
+            self.assertFalse(installer.managed_skill(missing))
+            installer.remove_path(missing)
+            directory = root / "directory"
+            directory.mkdir()
+            installer.remove_path(directory)
+            self.assertFalse(directory.exists())
+
+            managed = root / "managed"
+            managed.mkdir()
+            (managed / "SKILL.md").write_text(
+                "---\nname: code-discipline\n---\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                installer.validate_install_target(managed, update=False)
+
+            link = root / "link"
+            installer.ensure_claude_link(link, managed)
+            installer.ensure_claude_link(link, managed)
+            installer.validate_claude_link(link, managed)
+            conflict = root / "conflict"
+            conflict.write_text("occupied", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "refusing"):
+                installer.validate_claude_link(conflict, managed)
+
+            update_args = SimpleNamespace(update_current=True, repo=False, root=".")
+            self.assertTrue(installer.install_destination(update_args)[1])
+            repo_args = SimpleNamespace(update_current=False, repo=True, root=str(root))
+            self.assertEqual(
+                installer.install_destination(repo_args)[0],
+                installer.repo_target(root)[0],
+            )
+            global_args = SimpleNamespace(update_current=False, repo=False, root=".")
+            with mock.patch.object(installer.Path, "home", return_value=root):
+                self.assertEqual(
+                    installer.install_destination(global_args)[0],
+                    installer.global_target()[0],
+                )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                installer.print_install_result(managed, False, link, "4", "3")
+                installer.print_install_result(managed, True, None, "4", "3")
+            self.assertIn("Installed", output.getvalue())
+            self.assertIn("Updated", output.getvalue())
+            self.assertIn("Claude link", output.getvalue())
+
+    def test_installer_main_reports_success_and_failure(self) -> None:
+        result = (Path("target"), False, None, "4", "3")
+        with mock.patch.object(installer, "install_from_args", return_value=result):
+            self.assertEqual(installer.main(["--repo"]), 0)
+        with (
+            mock.patch.object(
+                installer, "install_from_args", side_effect=RuntimeError("broken")
+            ),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(installer.main(["--repo"]), 2)
+        self.assertIn("broken", stderr.getvalue())
+
+    def test_quality_loop_platform_lock_and_owner_paths(self) -> None:
+        with tempfile.TemporaryFile(mode="w+") as handle:
+            locking = mock.Mock()
+            windows_module = SimpleNamespace(locking=locking, LK_NBLCK=1, LK_UNLCK=2)
+            with (
+                mock.patch.object(quality_loop.os, "name", "nt"),
+                mock.patch.dict(sys.modules, {"msvcrt": windows_module}),
+            ):
+                self.assertTrue(quality_loop.try_lock(handle))
+                handle.seek(0, os.SEEK_END)
+                self.assertEqual(handle.tell(), 1)
+                quality_loop.unlock(handle)
+            self.assertEqual(locking.call_count, 2)
+
+            denied = OSError(errno.EACCES, "locked")
+            windows_module.locking = mock.Mock(side_effect=denied)
+            with (
+                mock.patch.object(quality_loop.os, "name", "nt"),
+                mock.patch.dict(sys.modules, {"msvcrt": windows_module}),
+            ):
+                self.assertFalse(quality_loop.try_lock(handle))
+
+            unexpected = OSError(errno.EINVAL, "invalid")
+            windows_module.locking = mock.Mock(side_effect=unexpected)
+            with (
+                mock.patch.object(quality_loop.os, "name", "nt"),
+                mock.patch.dict(sys.modules, {"msvcrt": windows_module}),
+            ):
+                with self.assertRaises(OSError):
+                    quality_loop.try_lock(handle)
+
+            with mock.patch("fcntl.flock", side_effect=BlockingIOError):
+                self.assertFalse(quality_loop.try_lock(handle))
+
+            handle.seek(0)
+            handle.truncate()
+            self.assertEqual(
+                quality_loop.lock_owner(handle), "owner details unavailable"
+            )
+            handle.seek(0)
+            handle.write("not-json")
+            handle.flush()
+            self.assertEqual(quality_loop.lock_owner(handle), "not-json")
+            handle.seek(0)
+            handle.truncate()
+            json.dump({"pid": 7, "started_at": "now"}, handle)
+            handle.flush()
+            self.assertEqual(quality_loop.lock_owner(handle), "PID 7, started now")
+
+    def test_quality_loop_rerun_and_path_helpers_cover_all_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            command = ["python"]
+            quality_loop.append_rerun_configuration(
+                command,
+                root,
+                root / "config.json",
+                True,
+                root / "thresholds.json",
+                True,
+                root / "artifacts",
+                False,
+                root / "report.html",
+                True,
+                root / "gate.py",
+                True,
+            )
+            artifact_command = ["python"]
+            quality_loop.append_rerun_configuration(
+                artifact_command,
+                root,
+                root / "config.json",
+                False,
+                root / "thresholds.json",
+                False,
+                root / "artifacts",
+                True,
+                root / "report.html",
+                False,
+                root / "gate.py",
+                False,
+            )
+            quality_loop.append_rerun_execution(
+                command, ["--commit", "HEAD"], True, True, "auto"
+            )
+            quality_loop.append_rerun_execution(
+                artifact_command, [], False, False, None
+            )
+            self.assertIn("--html", command)
+            self.assertIn("--artifact-dir", artifact_command)
+            self.assertIn("--mutation-workers", command)
+
+            self.assertEqual(
+                quality_loop.resolve_from_root(None, root, root / "default"),
+                root / "default",
+            )
+            self.assertEqual(
+                quality_loop.resolve_from_root("relative", root, root / "default"),
+                root / "relative",
+            )
+            self.assertEqual(
+                quality_loop.resolve_from_root(str(root), root, root / "default"), root
+            )
+            self.assertEqual(quality_loop.display_path(root / "a", root), "a")
+            self.assertEqual(
+                quality_loop.display_path(Path("/outside"), root), "/outside"
+            )
+
+            html_args = SimpleNamespace(html="custom.html", artifact_dir=None)
+            artifact_args = SimpleNamespace(html=None, artifact_dir="out")
+            self.assertEqual(
+                quality_loop.resolve_artifacts(html_args, root)[1],
+                root / "custom.html",
+            )
+            self.assertEqual(
+                quality_loop.resolve_artifacts(artifact_args, root)[0], root / "out"
+            )
+
+    def test_quality_loop_serializes_every_state_variant(self) -> None:
+        command = SimpleNamespace(
+            command=["check"],
+            returncode=1,
+            timed_out=False,
+            duration_seconds=1.2345,
+        )
+        gates = [
+            SimpleNamespace(
+                key="deferred", deferred=True, applicable=True, passed=False
+            ),
+            SimpleNamespace(key="na", deferred=False, applicable=False, passed=True),
+            SimpleNamespace(key="pass", deferred=False, applicable=True, passed=True),
+            SimpleNamespace(
+                key="quality",
+                title="Quality",
+                deferred=False,
+                applicable=True,
+                passed=False,
+                summary="failed",
+                details=["detail"],
+                command_results=[command],
+            ),
+        ]
+        for item in gates[:3]:
+            item.title = item.key
+            item.summary = item.key
+            item.details = []
+            item.command_results = []
+        self.assertEqual(
+            [quality_loop.gate_status(item) for item in gates],
+            ["deferred", "not_applicable", "pass", "fail"],
+        )
+        self.assertEqual(quality_loop.command_state(command)["duration_seconds"], 1.234)
+
+        function = SimpleNamespace(
+            path="a.py",
+            name="f",
+            start_line=1,
+            covered_lines=0,
+            total_lines=1,
+            coverage_percent=0.0,
+            complexity=1,
+            craap_score=2.0,
+            passed=False,
+        )
+        file_metric = SimpleNamespace(path="a.py", lines=2, limit=1, passed=False)
+        mutation = SimpleNamespace(
+            mutant_id="m",
+            path="a.py",
+            line=1,
+            column=1,
+            original="==",
+            replacement="!=",
+            status="",
+            survived=True,
+            static=True,
+        )
+        violation = SimpleNamespace(
+            source="a.py",
+            line=1,
+            source_module="a",
+            target="b.py",
+            target_module="b",
+            rule="deny",
+        )
+        setup = SimpleNamespace(command=["setup"], returncode=1, stdout="x" * 5000)
+        scope = SimpleNamespace(
+            incremental=False, kind="repository", reference=None, paths=()
+        )
+        analysis = SimpleNamespace(
+            functions=[function],
+            files=[file_metric],
+            mutations=[mutation],
+            dependency_violations=[violation],
+            tool_setup=[setup],
+            gates=gates,
+            passed=False,
+            ready_for_full=False,
+            scope=scope,
+            mode="full",
+            root="/repo",
+            generated_at="now",
+            rerun_command="run --fast",
+            thresholds={},
+        )
+        fake_gate = SimpleNamespace(
+            without_fast_flag=lambda value: value.replace(" --fast", ""),
+            master_fix_prompt=lambda value: "fix",
+        )
+        state = quality_loop.analysis_state(
+            fake_gate, analysis, Path("report"), Path("state"), 1
+        )
+        self.assertEqual(state["status"], "fail")
+        self.assertEqual(state["counts"]["checks_executed"], 3)
+        self.assertEqual(state["counts"]["checks_applicable"], 2)
+        self.assertEqual(state["counts"]["mutants_static"], 1)
+        self.assertEqual(state["failures"]["tool_setup"][0]["output"], "x" * 4000)
+        self.assertEqual(state["fix_prompt"], "fix")
+        self.assertEqual(quality_loop.state_status(analysis, "broken"), "error")
+        analysis.passed = True
+        self.assertEqual(quality_loop.state_status(analysis, None), "pass")
+        self.assertIsNone(quality_loop.state_fix_prompt(fake_gate, analysis))
+        analysis.passed = False
+        analysis.ready_for_full = True
+        self.assertEqual(quality_loop.state_status(analysis, None), "ready_for_full")
+
+    def test_quality_loop_scope_loading_execution_and_output_helpers(self) -> None:
+        commit_args = SimpleNamespace(commit="HEAD", local_changes=False)
+        local_args = SimpleNamespace(commit=None, local_changes=True)
+        repo_args = SimpleNamespace(commit=None, local_changes=False)
+        self.assertEqual(
+            quality_loop.scope_cli_arguments(commit_args), ["--commit", "HEAD"]
+        )
+        self.assertEqual(
+            quality_loop.scope_cli_arguments(local_args), ["--local-changes"]
+        )
+        self.assertEqual(quality_loop.scope_cli_arguments(repo_args), [])
+        self.assertEqual(quality_loop.requested_scope(commit_args, gate).kind, "commit")
+        self.assertEqual(
+            quality_loop.requested_scope(local_args, gate).kind, "local_changes"
+        )
+        self.assertEqual(
+            quality_loop.requested_scope(repo_args, gate).kind, "repository"
+        )
+
+        with mock.patch.object(quality_loop, "load_gate", return_value=gate):
+            self.assertIs(quality_loop.load_gate_safely(CORE_SCRIPT), gate)
+        with (
+            mock.patch.object(
+                quality_loop, "load_gate", side_effect=RuntimeError("bad")
+            ),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertIsNone(quality_loop.load_gate_safely(CORE_SCRIPT))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                commit=None,
+                local_changes=False,
+                no_install=True,
+                max_mutants=None,
+                fast=False,
+                mutation_workers="auto",
+            )
+            analysis = SimpleNamespace(passed=True, rerun_command=None)
+            with (
+                mock.patch.object(gate, "load_thresholds", return_value=({}, [])),
+                mock.patch.object(
+                    gate,
+                    "load_config",
+                    return_value=({"tools": {"auto_install": True}}, []),
+                ),
+                mock.patch.object(gate, "run", return_value=analysis),
+            ):
+                result, exit_code, error = quality_loop.execute_analysis(
+                    args,
+                    gate,
+                    root,
+                    root / "config.json",
+                    root / "thresholds.json",
+                    root / "report.html",
+                    "rerun",
+                )
+            self.assertIs(result, analysis)
+            self.assertEqual(exit_code, 0)
+            self.assertIsNone(error)
+            self.assertEqual(analysis.rerun_command, "rerun")
+
+            with mock.patch.object(
+                gate, "load_thresholds", side_effect=ValueError("bad")
+            ):
+                result, exit_code, error = quality_loop.execute_analysis(
+                    args,
+                    gate,
+                    root,
+                    root / "config.json",
+                    root / "thresholds.json",
+                    root / "report.html",
+                    "rerun",
+                )
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(error, "bad")
+            self.assertEqual(result.mode, "full")
+
+        output = io.StringIO()
+        summary_gate = SimpleNamespace(gate_outcome=lambda item: "PASS")
+        summary_analysis = SimpleNamespace(
+            gates=[SimpleNamespace(title="One", summary="ok")]
+        )
+        summary_state = {"status": "pass", "fix_prompt": "fix"}
+        with contextlib.redirect_stdout(output):
+            quality_loop.print_run_summary(
+                summary_gate,
+                summary_analysis,
+                summary_state,
+                Path("state"),
+                Path("report"),
+                True,
+            )
+        self.assertIn("QUALITY_LOOP=PASS", output.getvalue())
+
+    def test_quality_loop_atomic_write_cleanup_and_main_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "state.json"
+            quality_loop.write_json_atomic(path, {"ok": True})
+            self.assertEqual(json.loads(path.read_text()), {"ok": True})
+            with mock.patch.object(
+                quality_loop.os, "replace", side_effect=OSError("replace")
+            ):
+                with self.assertRaisesRegex(OSError, "replace"):
+                    quality_loop.write_json_atomic(path, {"ok": False})
+            self.assertEqual(list(root.glob("*.tmp")), [])
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    quality_loop.main(["--root", str(root / "missing")]), 2
+                )
+            self.assertIn("does not exist", stderr.getvalue())
+
+    def test_installer_remaining_restore_link_and_orchestration_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            backup = root / "backup"
+            installer.restore_install_backup(target, backup, False)
+
+            target.mkdir()
+            backup.mkdir()
+            (backup / "marker").write_text("restored", encoding="utf-8")
+            installer.restore_install_backup(target, backup, True)
+            self.assertEqual(
+                (target / "marker").read_text(encoding="utf-8"), "restored"
+            )
+
+            missing_link = root / "missing-link"
+            installer.validate_claude_link(missing_link, target)
+
+            linked_result = ("4", "3")
+            repo_args = SimpleNamespace(
+                update_current=False, repo=True, root=str(root), ref="main"
+            )
+            with (
+                mock.patch.object(
+                    installer,
+                    "install_destination",
+                    return_value=(target, False, missing_link),
+                ),
+                mock.patch.object(installer, "validate_claude_link") as validate,
+                mock.patch.object(
+                    installer, "download_skill", return_value={}
+                ) as download,
+                mock.patch.object(
+                    installer, "install_skill", return_value=linked_result
+                ) as install,
+                mock.patch.object(installer, "ensure_claude_link") as ensure,
+            ):
+                result = installer.install_from_args(repo_args)
+            self.assertEqual(result, (target, False, missing_link, "4", "3"))
+            validate.assert_called_once_with(missing_link, target)
+            download.assert_called_once_with("main")
+            install.assert_called_once_with(target, {}, False)
+            ensure.assert_called_once_with(missing_link, target)
+
+            update_args = SimpleNamespace(
+                update_current=True, repo=False, root=".", ref="main"
+            )
+            with (
+                mock.patch.object(
+                    installer,
+                    "install_destination",
+                    return_value=(target, True, None),
+                ),
+                mock.patch.object(installer, "download_skill", return_value={}),
+                mock.patch.object(
+                    installer, "install_skill", return_value=linked_result
+                ),
+            ):
+                self.assertEqual(
+                    installer.install_from_args(update_args),
+                    (target, True, None, "4", "3"),
+                )
+
+    def test_quality_loop_remaining_loader_scope_and_runner_paths(self) -> None:
+        with mock.patch.object(
+            quality_loop.importlib.util, "spec_from_file_location", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot load"):
+                quality_loop.load_gate(Path("missing.py"))
+
+        fake_gate = SimpleNamespace(
+            commit_scope=lambda root, reference: ("commit", root, reference),
+            local_changes_scope=lambda root: ("local", root),
+            repository_scope=lambda: ("repository",),
+        )
+        root = Path("/repo")
+        self.assertEqual(
+            quality_loop.selected_scope(
+                SimpleNamespace(commit="HEAD", local_changes=False), fake_gate, root
+            )[0],
+            "commit",
+        )
+        self.assertEqual(
+            quality_loop.selected_scope(
+                SimpleNamespace(commit=None, local_changes=True), fake_gate, root
+            )[0],
+            "local",
+        )
+        self.assertEqual(
+            quality_loop.selected_scope(
+                SimpleNamespace(commit=None, local_changes=False), fake_gate, root
+            )[0],
+            "repository",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary)
+            args = quality_loop.parse_args(["--root", str(run_root)])
+            with mock.patch.object(quality_loop, "load_gate_safely", return_value=None):
+                self.assertEqual(quality_loop.run_locked(args, run_root), 2)
+
+            analysis = SimpleNamespace(gates=[])
+            fake_loaded_gate = SimpleNamespace(
+                bundled_thresholds_path=lambda: run_root / "bundled.json",
+                html_report=lambda value: "<html></html>",
+            )
+            with (
+                mock.patch.object(
+                    quality_loop, "load_gate_safely", return_value=fake_loaded_gate
+                ),
+                mock.patch.object(
+                    quality_loop,
+                    "execute_analysis",
+                    return_value=(analysis, 1, None),
+                ),
+                mock.patch.object(
+                    quality_loop, "analysis_state", return_value={"status": "fail"}
+                ),
+                mock.patch.object(quality_loop, "write_json_atomic"),
+                mock.patch.object(quality_loop, "print_run_summary"),
+            ):
+                self.assertEqual(quality_loop.run_locked(args, run_root), 1)
 
 
 class QualityGateEndToEndTests(unittest.TestCase):

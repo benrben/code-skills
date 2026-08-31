@@ -1,0 +1,56 @@
+{
+  "modules": [
+    {
+      "name": "compatibility-entrypoint",
+      "paths": [
+        "repo_quality_gate.py"
+      ]
+    },
+    {
+      "name": "quality-engine",
+      "paths": [
+        "skills/code-discipline/scripts/repo_quality_gate.py"
+      ]
+    },
+    {
+      "name": "quality-loop",
+      "paths": [
+        "skills/code-discipline/scripts/quality_loop.py"
+      ]
+    },
+    {
+      "name": "installer",
+      "paths": [
+        "skills/code-discipline/scripts/install.py"
+      ]
+    }
+  ],
+  "allow": {
+    "compatibility-entrypoint": [
+      "quality-engine"
+    ],
+    "quality-engine": [],
+    "quality-loop": [
+      "quality-engine"
+    ],
+    "installer": []
+  },
+  "deny": [
+    {
+      "from": "quality-engine",
+      "to": "compatibility-entrypoint"
+    },
+    {
+      "from": "quality-engine",
+      "to": "quality-loop"
+    },
+    {
+      "from": "quality-engine",
+      "to": "installer"
+    },
+    {
+      "from": "installer",
+      "to": "quality-engine"
+    }
+  ]
+}

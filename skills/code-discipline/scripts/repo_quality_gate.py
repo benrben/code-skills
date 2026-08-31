@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import dataclasses
 import fnmatch
@@ -24,23 +23,23 @@ import hashlib
 import html
 import json
 import os
-from pathlib import Path
 import re
-import signal
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tokenize
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
-
 
 VERSION = "4.0.0"
 CONFIG_NAME = ".quality-gate.json"
@@ -478,11 +477,13 @@ def download_update_file(url: str, maximum_bytes: int) -> bytes:
     request = Request(url, headers={"User-Agent": f"repo-quality-gate/{VERSION}"})
     try:
         with urlopen(request, timeout=30) as response:
-            payload = response.read(maximum_bytes + 1)
+            payload = bytes(response.read(maximum_bytes + 1))
     except (HTTPError, URLError, TimeoutError, OSError) as error:
         raise ValueError(f"Could not download {url}: {error}") from error
     if len(payload) > maximum_bytes:
-        raise ValueError(f"Downloaded file exceeds the {maximum_bytes}-byte limit: {url}")
+        raise ValueError(
+            f"Downloaded file exceeds the {maximum_bytes}-byte limit: {url}"
+        )
     return payload
 
 
@@ -492,12 +493,19 @@ def downloaded_runner_version(payload: bytes) -> str:
         tree = ast.parse(source, filename="downloaded repo_quality_gate.py")
         compile(tree, "downloaded repo_quality_gate.py", "exec")
     except (UnicodeDecodeError, SyntaxError, ValueError) as error:
-        raise ValueError(f"The downloaded runner is not valid Python: {error}") from error
+        raise ValueError(
+            f"The downloaded runner is not valid Python: {error}"
+        ) from error
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets):
-            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+        if any(
+            isinstance(target, ast.Name) and target.id == "VERSION"
+            for target in node.targets
+        ):
+            if isinstance(node.value, ast.Constant) and isinstance(
+                node.value.value, str
+            ):
                 return node.value.value
     raise ValueError("The downloaded runner does not declare a string VERSION")
 
@@ -506,7 +514,9 @@ def validate_downloaded_thresholds(payload: bytes) -> None:
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"The downloaded thresholds are not valid JSON: {error}") from error
+        raise ValueError(
+            f"The downloaded thresholds are not valid JSON: {error}"
+        ) from error
     if not isinstance(value, dict) or not isinstance(value.get("schema_version"), int):
         raise ValueError(
             "The downloaded thresholds must be a JSON object with schema_version"
@@ -545,9 +555,7 @@ def install_standalone_release(
         if bundled_thresholds_path.exists()
         else None
     )
-    runner_mode = (
-        runner_path.stat().st_mode & 0o777 if runner_path.exists() else 0o755
-    )
+    runner_mode = runner_path.stat().st_mode & 0o777 if runner_path.exists() else 0o755
     thresholds_mode = (
         bundled_thresholds_path.stat().st_mode & 0o777
         if bundled_thresholds_path.exists()
@@ -568,16 +576,16 @@ def install_standalone_release(
             )
         if original_runner is not None:
             atomic_replace_bytes(runner_path, original_runner, runner_mode)
-        raise ValueError(f"Could not install the downloaded release: {error}") from error
+        raise ValueError(
+            f"Could not install the downloaded release: {error}"
+        ) from error
     return version
 
 
 def normalized_git_remote(value: str) -> str:
     normalized = value.strip().removesuffix(".git").removesuffix("/")
     if normalized.startswith("git@github.com:"):
-        normalized = "https://github.com/" + normalized.removeprefix(
-            "git@github.com:"
-        )
+        normalized = "https://github.com/" + normalized.removeprefix("git@github.com:")
     return normalized.lower()
 
 
@@ -704,13 +712,11 @@ def bundled_thresholds_path() -> Path:
     )
 
 
-def threshold_number(
-    thresholds: dict[str, Any], section: str, key: str
-) -> int | float:
+def threshold_number(thresholds: dict[str, Any], section: str, key: str) -> int | float:
     value = thresholds.get(section, {}).get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"Threshold {section}.{key} must be a number")
-    return value
+    return value if isinstance(value, (int, float)) else 0
 
 
 def validate_thresholds(thresholds: dict[str, Any]) -> None:
@@ -983,7 +989,10 @@ def run_command(
     try:
         process_options: dict[str, Any] = {}
         if os.name == "nt":
-            process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            windows_subprocess: Any = subprocess
+            process_options["creationflags"] = int(
+                windows_subprocess.CREATE_NEW_PROCESS_GROUP
+            )
         else:
             process_options["start_new_session"] = True
         process = subprocess.Popen(
@@ -2239,7 +2248,7 @@ def load_normalized_metrics(
                 path=normalize_report_path(str(row["path"]), root),
                 name=str(row["name"]),
                 start_line=int(row.get("start_line", 1)),
-                end_line=int(row.get("end_line", row.get("start_line", 1))),
+                end_line=int(row.get("end_line") or row.get("start_line") or 1),
                 complexity=complexity,
                 covered_lines=covered,
                 total_lines=total,
@@ -2981,15 +2990,15 @@ def run_metrics_gate(
             command = command_list(raw_command, coverage_substitutions)
             if not command:
                 continue
-            result = run_command(
+            command_result = run_command(
                 command,
                 root,
                 int(metrics.get("timeout_seconds", 600)),
                 tools.python_env,
             )
-            command_results.append(result)
-            if result.returncode != 0:
-                coverage_failures.append(result)
+            command_results.append(command_result)
+            if command_result.returncode != 0:
+                coverage_failures.append(command_result)
         if configured_report_path:
             coverage_report = (
                 configured_report_path,
@@ -3010,15 +3019,15 @@ def run_metrics_gate(
         if inferred:
             commands, format_name = inferred
             for command in commands:
-                result = run_command(
+                command_result = run_command(
                     command,
                     root,
                     int(metrics.get("timeout_seconds", 600)),
                     tools.python_env,
                 )
-                command_results.append(result)
-                if result.returncode != 0:
-                    coverage_failures.append(result)
+                command_results.append(command_result)
+                if command_result.returncode != 0:
+                    coverage_failures.append(command_result)
             if format_name == "lcov" and not inferred_path.exists():
                 discovered = discover_coverage_report(root)
                 coverage_report = discovered
@@ -4579,9 +4588,9 @@ def run_dependency_gate(
         for item in denied
         if isinstance(item, dict)
     }
-    for source, target, line in edges:
-        source_module = module_for_path(source, modules)
-        target_module = module_for_path(target, modules)
+    for edge_source, edge_target, line in edges:
+        source_module = module_for_path(edge_source, modules)
+        target_module = module_for_path(edge_target, modules)
         if not source_module or not target_module or source_module == target_module:
             continue
         allowed_targets = allowed.get(source_module)
@@ -4595,7 +4604,12 @@ def run_dependency_gate(
         if violation_rule:
             violations.append(
                 DependencyViolation(
-                    source, source_module, target, target_module, violation_rule, line
+                    edge_source,
+                    source_module,
+                    edge_target,
+                    target_module,
+                    violation_rule,
+                    line,
                 )
             )
     prompts = [
@@ -4724,9 +4738,7 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     full_command = without_fast_flag(rerun_command)
     thresholds = report.thresholds or default_thresholds()
     coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
-    complexity_limit = threshold_number(
-        thresholds, "metrics", "complexity_limit"
-    )
+    complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
     craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
     file_loc_limit = threshold_number(thresholds, "file_loc", "max_lines")
     if report.mode == "fast" and report.ready_for_full:
@@ -4836,7 +4848,10 @@ def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) ->
 
 
 def optional_gate_setup_prompt(report: AnalysisReport, gate: GateResult) -> str:
-    guidance = "\n".join(gate.details) or "Inspect the repository and choose its native toolchain."
+    guidance = (
+        "\n".join(gate.details)
+        or "Inspect the repository and choose its native toolchain."
+    )
     return f"""Add and configure the optional `{gate.title}` quality check for this repository:
 {report.root}
 
@@ -4872,9 +4887,7 @@ def html_report(report: AnalysisReport) -> str:
         verdict_class = "pass" if report.passed else "fail"
     thresholds = report.thresholds or default_thresholds()
     coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
-    complexity_limit = threshold_number(
-        thresholds, "metrics", "complexity_limit"
-    )
+    complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
     craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
     file_loc_limit = int(threshold_number(thresholds, "file_loc", "max_lines"))
     applicable_gates = sum(
@@ -5106,12 +5119,17 @@ def html_report(report: AnalysisReport) -> str:
             ("na", not_applicable_gates, "Not applicable"),
         )
     )
-    dashboard_files = sorted(report.files, key=lambda item: (-item.lines, item.path))[:4]
-    file_bars = "".join(
-        f"""<div class="file-bar"><div><code>{html.escape(item.path)}</code><span>{item.lines:,} / {item.limit:,}</span></div>
-        <div class="bar-track"><span class="{'pass' if item.passed else 'fail'}" style="width:{min(100.0, 100.0 * item.lines / item.limit):.2f}%"></span></div></div>"""
-        for item in dashboard_files
-    ) or '<div class="empty">No production files selected.</div>'
+    dashboard_files = sorted(report.files, key=lambda item: (-item.lines, item.path))[
+        :4
+    ]
+    file_bars = (
+        "".join(
+            f"""<div class="file-bar"><div><code>{html.escape(item.path)}</code><span>{item.lines:,} / {item.limit:,}</span></div>
+        <div class="bar-track"><span class="{"pass" if item.passed else "fail"}" style="width:{min(100.0, 100.0 * item.lines / item.limit):.2f}%"></span></div></div>"""
+            for item in dashboard_files
+        )
+        or '<div class="empty">No production files selected.</div>'
+    )
     gate_flow_items = []
     for gate in report.gates:
         if gate.deferred:
@@ -5130,9 +5148,7 @@ def html_report(report: AnalysisReport) -> str:
             <strong>{html.escape(short_title)}</strong><small>{state_text}</small></div>"""
         )
     gate_flow = "".join(gate_flow_items)
-    all_commands = [
-        result for gate in report.gates for result in gate.command_results
-    ]
+    all_commands = [result for gate in report.gates for result in gate.command_results]
     evidence_html = commands_html(all_commands)
     thresholds_html = html.escape(json.dumps(thresholds, indent=2))
     repository_name = Path(report.root).name or report.root
@@ -5248,9 +5264,7 @@ def write_initial_config(
 def write_initial_thresholds(path: Path) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite existing thresholds: {path}")
-    path.write_text(
-        json.dumps(default_thresholds(), indent=2) + "\n", encoding="utf-8"
-    )
+    path.write_text(json.dumps(default_thresholds(), indent=2) + "\n", encoding="utf-8")
 
 
 def run(
@@ -5336,7 +5350,7 @@ def run(
                 True,
                 f"No changed production source files were selected from {scope.description}; file metrics were not needed.",
             )
-            functions = []
+            functions: list[FunctionMetric] = []
         else:
             raw_metrics_gate, functions = run_metrics_gate(
                 root, config, source_files, workspace, tools
@@ -5352,7 +5366,7 @@ def run(
                 f"Not applicable: no changed production source files were selected from {scope.description}.",
                 applicable=False,
             )
-            files = []
+            files: list[FileLineMetric] = []
         else:
             file_loc_gate, files = run_file_loc_gate(
                 root, source_files, config["file_loc"]
@@ -5377,7 +5391,7 @@ def run(
                 "Mutation testing",
                 "the exhaustive mutant run is reserved for full certification.",
             )
-            mutations = []
+            mutations: list[Mutation] = []
         elif scope.incremental and not source_files:
             flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
             mutation_gate = GateResult(
@@ -5408,7 +5422,7 @@ def run(
                 f"Not applicable: no changed production source files were selected from {scope.description}.",
                 applicable=False,
             )
-            violations = []
+            violations: list[DependencyViolation] = []
         else:
             dependency_gate, violations = run_dependency_gate(
                 root,
