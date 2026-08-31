@@ -1,0 +1,34 @@
+name: Publish agent skills
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "skills/**"
+      - ".github/workflows/publish-skills.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish changed skills to GHCR
+        uses: andrewhowdencom/skr@15514552d3ea854cc10890b360ac33a4f11ce22e # main
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          namespace: ${{ github.repository_owner }}
+          repository: ${{ github.event.repository.name }}
+          path: ./skills
+          base: ${{ github.event.before }}

@@ -39,12 +39,13 @@ defaults, including `file_loc.max_lines: 1000`. A repository-local thresholds
 file takes precedence; `--thresholds PATH` selects an explicit one. Do not copy
 threshold numbers into `.quality-gate.json`.
 
-When asked to update the shared skill or a standalone runner from GitHub, use
-`python3 <checkout>/repo_quality_gate.py --update-from-github [REF]`. A shared
-checkout updates with `git pull --ff-only`; a standalone copy validates and
-atomically replaces the runner and bundled defaults. Stop if the shared checkout
-is dirty. Never overwrite repository-owned `.quality-gate.json`,
-`.quality-thresholds.json`, or `.quality-dependencies.json` during an update.
+The skill is self-contained: its `scripts` directory holds the quality engine,
+loop, installer, and updater. To update this installed skill from GitHub, use
+`python3 <skill-directory>/scripts/install.py --update-current [--ref REF]`.
+The installer validates a complete staged copy and atomically replaces only the
+managed skill directory. It never overwrites repository-owned
+`.quality-gate.json`, `.quality-thresholds.json`, or
+`.quality-dependencies.json`.
 
 Choose the Git scope before choosing fast or full execution:
 

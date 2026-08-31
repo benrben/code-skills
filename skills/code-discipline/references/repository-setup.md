@@ -17,11 +17,10 @@ versions.
 3. From the repository root, generate the control files:
 
    ```bash
-   python3 <skill-directory>/../../repo_quality_gate.py --root . --init
+   python3 <skill-directory>/scripts/repo_quality_gate.py --root . --init
    ```
 
-   If the canonical engine is elsewhere, call that path instead. `--init`
-   creates `.quality-gate.json` for commands/adapters and
+   `--init` creates `.quality-gate.json` for commands/adapters and
    `.quality-thresholds.json` for every numeric quality goal. Module boundaries
    additionally require a reviewed `.quality-dependencies.json`. Review
    generated detection; do not treat it as architecture intent.

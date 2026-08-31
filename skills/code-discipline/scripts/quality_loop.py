@@ -25,8 +25,8 @@ from types import ModuleType
 from typing import Any, Iterator, Sequence, TextIO
 
 
-VERSION = "2.9.0"
-DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
+VERSION = "3.0.0"
+DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 
 
 class ConcurrentRunError(RuntimeError):

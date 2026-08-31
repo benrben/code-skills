@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,27 +17,136 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CORE_SCRIPT = (
+    ROOT / "skills" / "code-discipline" / "scripts" / "repo_quality_gate.py"
+)
 LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py"
-sys.path.insert(0, str(ROOT))
-
-import repo_quality_gate as gate  # noqa: E402
+INSTALL_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "install.py"
 
 
-def load_quality_loop():
+def load_script(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(
-        "quality_loop_test_module", LOOP_SCRIPT
+        name, path
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load quality loop: {LOOP_SCRIPT}")
+        raise RuntimeError(f"cannot load script: {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-quality_loop = load_quality_loop()
+gate = load_script("quality_gate_test_module", CORE_SCRIPT)
+quality_loop = load_script("quality_loop_test_module", LOOP_SCRIPT)
+installer = load_script("skill_installer_test_module", INSTALL_SCRIPT)
 
 
 class QualityGateUnitTests(unittest.TestCase):
+    def test_skill_package_is_complete_and_runs_without_source_checkout(self) -> None:
+        skill_source = ROOT / "skills" / "code-discipline"
+        for relative in installer.SKILL_FILES:
+            with self.subTest(relative=relative):
+                self.assertTrue((skill_source / relative).is_file())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill_copy = root / "code-discipline"
+            repository = root / "repository"
+            shutil.copytree(skill_source, skill_copy)
+            repository.mkdir()
+
+            for script in ("repo_quality_gate.py", "quality_loop.py", "install.py"):
+                completed = subprocess.run(
+                    [sys.executable, str(skill_copy / "scripts" / script), "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            initialized = subprocess.run(
+                [
+                    sys.executable,
+                    str(skill_copy / "scripts" / "repo_quality_gate.py"),
+                    "--root",
+                    str(repository),
+                    "--init",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            self.assertTrue((repository / ".quality-gate.json").is_file())
+            thresholds = json.loads(
+                (repository / ".quality-thresholds.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
+
+    def test_installer_atomically_installs_the_complete_skill(self) -> None:
+        skill_source = ROOT / "skills" / "code-discipline"
+        payloads = {
+            relative: (skill_source / relative).read_bytes()
+            for relative in installer.SKILL_FILES
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target, scope_root = installer.repo_target(root)
+            repository_config = root / ".quality-gate.json"
+            repository_config.write_text('{"owned": true}\n', encoding="utf-8")
+
+            versions = installer.install_skill(target, payloads, update=False)
+            link = installer.claude_link_for(target, scope_root)
+            installer.ensure_claude_link(link, target)
+
+            self.assertEqual(len(versions), 2)
+            self.assertTrue(installer.managed_skill(target))
+            self.assertEqual(link.resolve(), target.resolve())
+            self.assertEqual(
+                repository_config.read_text(encoding="utf-8"), '{"owned": true}\n'
+            )
+            for relative in installer.SKILL_FILES:
+                with self.subTest(relative=relative):
+                    self.assertEqual(
+                        (target / relative).read_bytes(), payloads[relative]
+                    )
+
+    def test_installer_replaces_a_managed_symlink_not_its_source(self) -> None:
+        skill_source = ROOT / "skills" / "code-discipline"
+        payloads = {
+            relative: (skill_source / relative).read_bytes()
+            for relative in installer.SKILL_FILES
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared-skill"
+            target = root / ".agents" / "skills" / "code-discipline"
+            shutil.copytree(skill_source, shared)
+            marker = shared / "source-marker"
+            marker.write_text("preserve\n", encoding="utf-8")
+            target.parent.mkdir(parents=True)
+            target.symlink_to(shared, target_is_directory=True)
+
+            installer.install_skill(target, payloads, update=True)
+
+            self.assertFalse(target.is_symlink())
+            self.assertTrue(installer.managed_skill(target))
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_installer_refuses_to_replace_an_unmanaged_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "code-discipline"
+            target.mkdir()
+            marker = target / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "unmanaged"):
+                installer.install_skill(target, {}, update=True)
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+
     def test_standalone_update_installs_release_and_preserves_repository_goals(
         self,
     ) -> None:
@@ -50,7 +160,7 @@ class QualityGateUnitTests(unittest.TestCase):
             repository_thresholds.write_text(
                 '{"repository_owned": true}\n', encoding="utf-8"
             )
-            remote_runner = (ROOT / "repo_quality_gate.py").read_bytes()
+            remote_runner = CORE_SCRIPT.read_bytes()
             remote_thresholds = (
                 ROOT / "skills" / "code-discipline" / "quality-thresholds.json"
             ).read_bytes()
@@ -196,7 +306,7 @@ class QualityGateUnitTests(unittest.TestCase):
             completed = subprocess.run(
                 [
                     sys.executable,
-                    str(ROOT / "repo_quality_gate.py"),
+                    str(CORE_SCRIPT),
                     "--root",
                     str(root),
                     "--init",
@@ -408,25 +518,29 @@ class QualityGateUnitTests(unittest.TestCase):
     def test_readme_keeps_the_primary_workflow_short_and_discoverable(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         core_help = subprocess.run(
-            [sys.executable, str(ROOT / "repo_quality_gate.py"), "--help"],
+            [sys.executable, str(CORE_SCRIPT), "--help"],
             capture_output=True,
             text=True,
             timeout=5,
             check=True,
         ).stdout
 
-        self.assertLessEqual(len(readme.splitlines()), 200)
-        for option in ("--init", "--local-changes", "--fast", "--update-from-github"):
+        self.assertLessEqual(len(readme.splitlines()), 150)
+        for option in ("--init", "--local-changes", "--fast", "--html"):
             with self.subTest(option=option):
                 self.assertIn(option, readme)
         for command_fragment in (
-            "git submodule add https://github.com/benrben/code-skills.git .code-skills",
-            'git clone https://github.com/benrben/code-skills.git "$HOME/code-skills"',
-            "python3 .code-skills/repo_quality_gate.py --update-from-github",
-            'python3 "$HOME/code-skills/repo_quality_gate.py" --update-from-github',
+            "scripts/install.py | python3 - --repo --root .",
+            "scripts/install.py | python3 - --global",
+            "scripts/install.py --update-current",
+            '"$HOME/.agents/skills/code-discipline/scripts/install.py" --update-current',
+            ".agents/skills/code-discipline/scripts/quality_loop.py --root . --html",
         ):
             with self.subTest(command_fragment=command_fragment):
                 self.assertIn(command_fragment, readme)
+        self.assertNotIn("git submodule", readme)
+        self.assertNotIn("git clone", readme)
+        self.assertNotIn(".code-skills", readme)
         self.assertIn("repository-setup.md", readme)
         self.assertIn("--update-from-github [REF]", core_help)
 
