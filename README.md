@@ -8,6 +8,19 @@ and HTML reporting.
 Requirements: Python 3.10+ and the target repository's own runtime and
 dependencies.
 
+## What this project is
+
+This project provides a reusable skill for AI coding agents. It helps an agent
+make safe, easy-to-review changes and then check that the repository still
+works. The skill includes rules for readable code, a quality gate that runs
+tests and code checks, and tools to install or update the skill in another
+repository.
+
+Use it when you want Codex or Claude Code to follow the same engineering
+standards on every change. The skill is self-contained: installing it gives the
+target repository the instructions, checking tools, and setup guidance it
+needs.
+
 ## Install from GitHub
 
 In the current repository:
