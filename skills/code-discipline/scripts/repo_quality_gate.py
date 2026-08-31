@@ -4822,6 +4822,251 @@ def gate_outcome(gate: GateResult) -> str:
     return "PASS" if gate.passed else "FAIL"
 
 
+def function_measurement(function: Any) -> dict[str, Any]:
+    return {
+        "path": function.path,
+        "name": function.name,
+        "line": function.start_line,
+        "covered_lines": function.covered_lines,
+        "total_lines": function.total_lines,
+        "coverage_percent": round(function.coverage_percent, 2),
+        "complexity": function.complexity,
+        "craap_score": round(function.craap_score, 2),
+        "passed": function.passed,
+    }
+
+
+def file_measurement(file: Any) -> dict[str, Any]:
+    return {
+        "path": file.path,
+        "lines": file.lines,
+        "limit": file.limit,
+        "passed": file.passed,
+    }
+
+
+def mutation_failure(mutation: Any) -> dict[str, Any]:
+    return {
+        "id": mutation.mutant_id,
+        "path": mutation.path,
+        "line": mutation.line,
+        "column": mutation.column,
+        "change": f"{mutation.original} -> {mutation.replacement}",
+        "status": mutation.status or ("Survived" if mutation.survived else "Killed"),
+        "static": bool(getattr(mutation, "static", False)),
+    }
+
+
+def dependency_failure(violation: Any) -> dict[str, Any]:
+    return {
+        "source": violation.source,
+        "line": violation.line,
+        "source_module": violation.source_module,
+        "target": violation.target,
+        "target_module": violation.target_module,
+        "rule": violation.rule,
+    }
+
+
+def state_status(analysis: Any, error: str | None) -> str:
+    if error:
+        return "error"
+    if analysis.passed:
+        return "pass"
+    return "ready_for_full" if analysis.ready_for_full else "fail"
+
+
+def command_state(command: Any) -> dict[str, Any]:
+    return {
+        "command": command.command,
+        "returncode": command.returncode,
+        "timed_out": command.timed_out,
+        "duration_seconds": round(command.duration_seconds, 3),
+    }
+
+
+def gate_status(result: Any) -> str:
+    if result.deferred:
+        return "deferred"
+    if not result.applicable:
+        return "not_applicable"
+    return "pass" if result.passed else "fail"
+
+
+def gate_state(result: Any) -> dict[str, Any]:
+    return {
+        "key": result.key,
+        "status": gate_status(result),
+        "summary": result.summary,
+        "details": result.details[:100],
+        "commands": [command_state(item) for item in result.command_results],
+    }
+
+
+def quality_gate_for(analysis: Any) -> Any:
+    return next((result for result in analysis.gates if result.key == "quality"), None)
+
+
+def metrics_state(analysis: Any, quality_gate: Any) -> dict[str, Any]:
+    return {
+        "certified": bool(analysis.functions and quality_gate and quality_gate.passed),
+        "functions": [function_measurement(item) for item in analysis.functions],
+        "files": [file_measurement(item) for item in analysis.files],
+    }
+
+
+def count_state(
+    analysis: Any,
+    failing_functions: Sequence[Any],
+    survivors: Sequence[Any],
+    violations: Sequence[Any],
+) -> dict[str, int]:
+    outcomes = [gate_status(item) for item in analysis.gates]
+    return {
+        "checks_total": len(outcomes),
+        "checks_executed": len(outcomes) - outcomes.count("deferred"),
+        "checks_deferred": outcomes.count("deferred"),
+        "checks_applicable": outcomes.count("pass") + outcomes.count("fail"),
+        "checks_passing": outcomes.count("pass"),
+        "functions_total": len(analysis.functions),
+        "functions_failing": len(failing_functions),
+        "files_total": len(analysis.files),
+        "files_failing_loc": sum(not item.passed for item in analysis.files),
+        "mutants_total": len(analysis.mutations),
+        "mutants_surviving": len(survivors),
+        "mutants_static": sum(
+            bool(getattr(item, "static", False)) for item in analysis.mutations
+        ),
+        "dependency_violations": len(violations),
+    }
+
+
+def failed_check_state(gates: Sequence[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "key": item.key,
+            "title": item.title,
+            "summary": item.summary,
+            "details": item.details[:100],
+        }
+        for item in gates
+        if item.applicable and not item.deferred and not item.passed
+    ]
+
+
+def failed_file_state(files: Sequence[Any]) -> list[dict[str, Any]]:
+    return [file_measurement(item) for item in files if not item.passed][:200]
+
+
+def failed_tool_state(failed_setup: Sequence[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "command": item.command,
+            "returncode": item.returncode,
+            "output": item.stdout[-4000:],
+        }
+        for item in failed_setup
+    ]
+
+
+def failure_state(
+    analysis: Any,
+    failing_functions: Sequence[Any],
+    survivors: Sequence[Any],
+    violations: Sequence[Any],
+    failed_setup: Sequence[Any],
+) -> dict[str, Any]:
+    return {
+        "checks": failed_check_state(analysis.gates),
+        "functions": [function_measurement(item) for item in failing_functions[:200]],
+        "files": failed_file_state(analysis.files),
+        "surviving_mutants": [mutation_failure(item) for item in survivors[:200]],
+        "dependencies": [dependency_failure(item) for item in violations[:200]],
+        "tool_setup": failed_tool_state(failed_setup),
+    }
+
+
+def failing_function_items(analysis: Any) -> list[Any]:
+    return sorted(
+        (item for item in analysis.functions if not item.passed),
+        key=lambda item: (-item.craap_score, item.coverage_percent, item.path),
+    )
+
+
+def surviving_mutation_items(analysis: Any) -> list[Any]:
+    return [item for item in analysis.mutations if item.survived]
+
+
+def failed_setup_items(analysis: Any) -> list[Any]:
+    return [item for item in analysis.tool_setup if item.returncode != 0]
+
+
+def repository_certified(analysis: Any) -> bool:
+    return bool(analysis.passed and not analysis.scope.incremental)
+
+
+def state_fix_prompt(gate: Any, analysis: Any) -> str | None:
+    return None if analysis.passed else gate.master_fix_prompt(analysis)
+
+
+def analysis_state(
+    gate: Any,
+    analysis: Any,
+    html_path: Path,
+    state_path: Path,
+    exit_code: int,
+    error: str | None = None,
+) -> dict[str, Any]:
+    failing_functions = failing_function_items(analysis)
+    survivors = surviving_mutation_items(analysis)
+    violations = analysis.dependency_violations
+    failed_setup = failed_setup_items(analysis)
+    quality_gate = quality_gate_for(analysis)
+    return {
+        "schema_version": 1,
+        "status": state_status(analysis, error),
+        "mode": analysis.mode,
+        "certified": repository_certified(analysis),
+        "scope_certified": analysis.passed,
+        "ready_for_full": analysis.ready_for_full,
+        "exit_code": exit_code,
+        "repository": analysis.root,
+        "generated_at": analysis.generated_at,
+        "artifacts": {"html": str(html_path), "state": str(state_path)},
+        "rerun_command": analysis.rerun_command,
+        "full_rerun_command": gate.without_fast_flag(analysis.rerun_command or ""),
+        "scope": {
+            "kind": analysis.scope.kind,
+            "reference": analysis.scope.reference,
+            "changed_files": list(analysis.scope.paths),
+        },
+        "metrics": metrics_state(analysis, quality_gate),
+        "thresholds": analysis.thresholds,
+        "gates": [gate_state(result) for result in analysis.gates],
+        "counts": count_state(analysis, failing_functions, survivors, violations),
+        "failures": failure_state(
+            analysis, failing_functions, survivors, violations, failed_setup
+        ),
+        "fix_prompt": state_fix_prompt(gate, analysis),
+        "error": error,
+    }
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as temporary:
+            json.dump(value, temporary, indent=2)
+            temporary.write("\n")
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
 def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) -> str:
     step, question, kicker, explanation = presentation
     state = (
@@ -5112,17 +5357,34 @@ def html_report(report: AnalysisReport) -> str:
             ("na", not_applicable_gates, "Not applicable"),
         )
     )
-    dashboard_files = sorted(report.files, key=lambda item: (-item.lines, item.path))[
-        :4
-    ]
-    file_bars = (
-        "".join(
-            f"""<div class="file-bar"><div><code>{html.escape(item.path)}</code><span>{item.lines:,} / {item.limit:,}</span></div>
-        <div class="bar-track"><span class="{"pass" if item.passed else "fail"}" style="width:{min(100.0, 100.0 * item.lines / item.limit):.2f}%"></span></div></div>"""
-            for item in dashboard_files
-        )
-        or '<div class="empty">No production files selected.</div>'
+    function_count = len(report.functions)
+    file_count = len(report.files)
+    average_craap = (
+        f"{sum(item.craap_score for item in report.functions) / function_count:.2f}"
+        if function_count
+        else "—"
     )
+    average_complexity = (
+        f"{sum(item.complexity for item in report.functions) / function_count:.2f}"
+        if function_count
+        else "—"
+    )
+    average_coverage = (
+        f"{sum(item.coverage_percent for item in report.functions) / function_count:.1f}%"
+        if function_count
+        else "—"
+    )
+    mean_file_loc = (
+        f"{sum(item.lines for item in report.files) / file_count:.0f}"
+        if file_count
+        else "—"
+    )
+    metric_tiles = f"""<div class="metric-grid">
+      <div class="metric-tile"><strong>{average_craap}</strong><span>Average CRAAP</span><small>Target ≤ {craap_limit:g}</small></div>
+      <div class="metric-tile"><strong>{mean_file_loc}</strong><span>Mean file LOC</span><small>Limit ≤ {file_loc_limit:,}</small></div>
+      <div class="metric-tile"><strong>{average_complexity}</strong><span>Average complexity</span><small>Target ≤ {complexity_limit:g}</small></div>
+      <div class="metric-tile"><strong>{average_coverage}</strong><span>Average coverage</span><small>Target {coverage_limit:g}%</small></div>
+    </div>"""
     gate_flow_items = []
     for gate in report.gates:
         if gate.deferred:
@@ -5156,21 +5418,21 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 .hero{{display:grid;grid-template-columns:1fr auto;align-items:end;gap:24px;padding:28px 4px 18px}} .eyebrow{{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--secondary)}} .verdict{{display:inline-flex;margin-top:8px;padding:5px 9px;border-radius:8px;font-size:12px;font-weight:700}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--deferred);background:var(--deferred-soft)}} .meta{{color:var(--secondary)}}
 .copy{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 13px;border-radius:10px;border:1px solid rgba(8,124,255,.48);background:#fff;color:var(--blue);font-weight:650;cursor:pointer}} .copy.primary{{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 5px 14px rgba(8,124,255,.2)}} .copy:hover{{filter:brightness(.97)}} .copy.copied{{background:var(--good);border-color:var(--good);color:#fff}}
 .dashboard{{display:grid;grid-template-columns:1fr 1fr;gap:14px}} .card{{min-width:0;background:var(--card);border:1px solid rgba(255,255,255,.85);border-radius:18px;padding:16px;box-shadow:0 7px 24px rgba(35,45,70,.07)}} .card h2{{margin-bottom:14px}} .outcome-bar{{display:flex;height:22px;overflow:hidden;border-radius:7px;background:#e8ebef}} .segment.pass,.bar-track .pass,.legend i.pass{{background:var(--good)}} .segment.fail,.bar-track .fail,.legend i.fail{{background:var(--bad)}} .segment.deferred,.legend i.deferred{{background:var(--deferred)}} .segment.na,.legend i.na{{background:var(--na)}} .legend{{display:flex;flex-wrap:wrap;gap:20px;margin-top:14px;color:var(--secondary)}} .legend span{{display:flex;align-items:center;gap:6px}} .legend i{{width:10px;height:10px;border-radius:3px}}
-.file-bar+ .file-bar{{margin-top:13px}} .file-bar>div:first-child{{display:flex;justify-content:space-between;gap:12px;margin-bottom:5px}} .file-bar code{{min-width:0;overflow-wrap:anywhere}} .file-bar span{{flex:none;color:var(--secondary)}} .bar-track{{height:7px;border-radius:99px;background:#e2e5e9;overflow:hidden}} .bar-track span{{display:block;height:100%;border-radius:inherit}} .file-summary{{margin:12px 0 0;color:var(--good);font-weight:650}} .empty{{padding:20px;color:var(--secondary);text-align:center}}
+.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .metric-tile{{display:grid;gap:1px;padding:12px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.62)}} .metric-tile strong{{font-size:25px;line-height:1.05;letter-spacing:-.03em}} .metric-tile span{{font-size:12px;font-weight:700}} .metric-tile small{{color:var(--secondary);font-size:10px}}
 .flow-card{{grid-column:1/-1;overflow:hidden}} .gate-flow{{display:grid;grid-template-columns:repeat({total_gates},minmax(94px,1fr));gap:4px;overflow:auto;padding:4px 0}} .flow-item{{position:relative;display:grid;justify-items:center;gap:3px;text-align:center;color:var(--secondary)}} .flow-item:not(:last-child)::after{{content:"";position:absolute;top:16px;left:64%;width:72%;height:1px;background:var(--line)}} .flow-symbol{{position:relative;z-index:1;display:grid;place-items:center;width:34px;height:34px;border:1.5px solid currentColor;border-radius:50%;background:#fff;font-size:19px}} .flow-item strong{{font-size:12px;color:var(--ink);font-weight:600}} .flow-item small{{font-size:10px;font-weight:700}} .flow-item.pass{{color:var(--good)}} .flow-item.fail{{color:var(--bad)}} .flow-item.deferred{{color:var(--deferred)}} .flow-item.na{{color:var(--na)}}
 .accordion{{margin-top:14px;overflow:hidden;border:1px solid rgba(255,255,255,.82);border-radius:18px;background:var(--glass);backdrop-filter:blur(18px) saturate(135%);box-shadow:0 8px 28px rgba(35,45,70,.08)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
 .issue-row,.optional-row{{display:grid;grid-template-columns:94px 1fr auto;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}} .issue-row:last-child,.optional-row:last-child{{border-bottom:0}} .issue-row p,.optional-row p,.optional-heading p{{margin:2px 0 0;color:var(--secondary);font-size:13px}} .state-label{{font-size:12px;font-weight:750}} .state-label.fail{{color:var(--bad)}} .na-mark{{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--na);border-radius:50%;color:var(--na);font-size:10px}} .optional-heading{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}} .optional-heading p{{margin:0}} .panel{{padding:16px;border-top:1px solid var(--line)}}
 .checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.5)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .check-status{{margin-left:auto;margin-right:8px;font-size:11px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
 @media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card{{grid-column:auto}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
-@media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.file-bar>div:first-child{{align-items:flex-start;flex-direction:column;gap:2px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
+@media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.metric-tile{{padding:10px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
 </style></head><body><main>
 <header class="toolbar"><span class="brand">Code Confidence</span><span class="repo">{html.escape(repository_name)} · {html.escape(report.scope.description)}</span>
 <div class="toolbar-meta"><strong>{report.mode.upper()} RUN</strong><span>{html.escape(report.generated_at)}</span></div></header>
 <section class="hero"><div><div class="eyebrow">Repository health · v{VERSION}</div><h1>{page_heading}</h1>
 <div class="meta">{html.escape(report.root)} · {html.escape(language_text)}</div><span class="verdict {verdict_class}">{status}</span></div>{repair_action_html}</section>
 <section class="dashboard"><article class="card"><h2>Gate outcomes</h2><div class="outcome-bar" aria-label="{passed_gates} passed, {failed_count} failed, {deferred_gates} deferred, {not_applicable_gates} not applicable">{outcome_segments}</div><div class="legend">{outcome_legend}</div></article>
-<article class="card"><h2>File size</h2>{file_bars}<p class="file-summary">{files_passing} of {len(report.files)} pass · limit {file_loc_limit:,} lines</p></article>
+<article class="card"><h2>Code metrics</h2>{metric_tiles}</article>
 <article class="card flow-card"><h2>Quality gates</h2><div class="gate-flow">{gate_flow}</div></article></section>
 <section class="accordion">{fix_section}{optional_section}
 <div class="checks-list">{gate_cards}</div>

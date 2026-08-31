@@ -19,12 +19,6 @@
       ]
     },
     {
-      "name": "quality-state",
-      "paths": [
-        "skills/code-discipline/scripts/quality_state.py"
-      ]
-    },
-    {
       "name": "installer",
       "paths": [
         "skills/code-discipline/scripts/install.py"
@@ -37,10 +31,8 @@
     ],
     "quality-engine": [],
     "quality-loop": [
-      "quality-engine",
-      "quality-state"
+      "quality-engine"
     ],
-    "quality-state": [],
     "installer": []
   },
   "deny": [
@@ -50,10 +42,6 @@
     },
     {
       "from": "quality-engine",
-      "to": "quality-loop"
-    },
-    {
-      "from": "quality-state",
       "to": "quality-loop"
     },
     {

@@ -27,11 +27,11 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
-from quality_state import analysis_state, write_json_atomic  # noqa: E402
-from quality_state import command_state as command_state  # noqa: E402
-from quality_state import gate_status as gate_status  # noqa: E402
-from quality_state import state_fix_prompt as state_fix_prompt  # noqa: E402
-from quality_state import state_status as state_status  # noqa: E402
+from repo_quality_gate import analysis_state, write_json_atomic  # noqa: E402
+from repo_quality_gate import command_state as command_state  # noqa: E402
+from repo_quality_gate import gate_status as gate_status  # noqa: E402
+from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
+from repo_quality_gate import state_status as state_status  # noqa: E402
 
 VERSION = "3.2.0"
 QUALITY_DIRECTORY = ".quality"
