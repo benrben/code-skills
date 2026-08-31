@@ -3076,11 +3076,16 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertIn("<strong>1.00</strong><span>Average CRAAP", rendered)
             self.assertIn("<strong>2</strong><span>Mean file LOC", rendered)
             self.assertNotIn("<h2>File size</h2>", rendered)
+            self.assertEqual(rendered.count("<th>Physical LOC</th>"), 1)
+            self.assertEqual(rendered.count("<th>CRAAP</th>"), 1)
+            self.assertEqual(rendered.count("<th>Static</th>"), 1)
+            self.assertNotIn("Mutations + flaky tests", rendered)
+            self.assertNotIn("<span>Evidence</span>", rendered)
+            self.assertIn("<span>Run details</span>", rendered)
             self.assertEqual(rendered.count("data-copy="), 0)
             self.assertNotIn("Gherkin", rendered)
             self.assertNotIn("Executable UI", rendered)
             self.assertIn("All 1 mutants were killed", rendered)
-            self.assertIn("<th>Static</th>", rendered)
 
 
 if __name__ == "__main__":

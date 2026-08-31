@@ -5067,7 +5067,11 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
             os.unlink(temporary_name)
 
 
-def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) -> str:
+def gate_card_html(
+    gate: GateResult,
+    presentation: tuple[str, str, str, str],
+    metric_details: str = "",
+) -> str:
     step, question, kicker, explanation = presentation
     state = (
         "deferred"
@@ -5081,7 +5085,8 @@ def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) ->
       <div class="check-body"><p class="explain">{html.escape(explanation)}</p>
       <p class="result">{html.escape(gate.summary)}</p>
       {details_html(gate.details)}
-      {commands_html(gate.command_results)}</div>
+      {commands_html(gate.command_results)}
+      {metric_details}</div>
     </details>"""
 
 
@@ -5192,13 +5197,6 @@ def html_report(report: AnalysisReport) -> str:
             "Imports must follow the dependency rules declared by the project.",
         ),
     }
-    gate_cards = "".join(
-        gate_card_html(
-            gate,
-            gate_language.get(gate.key, ("•", gate.title, gate.title, gate.summary)),
-        )
-        for gate in report.gates
-    )
     ordered_functions = sorted(
         report.functions,
         key=lambda function: (
@@ -5273,6 +5271,20 @@ def html_report(report: AnalysisReport) -> str:
     )
     if len(report.dependency_violations) > len(shown_dependencies):
         dependency_rows += f'<tr><td colspan="5">Showing 200 violations out of {len(report.dependency_violations)}.</td></tr>'
+    metric_details_by_gate = {
+        "quality": f"""<div class="check-detail"><h4>Function metrics</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div>""",
+        "file_loc": f"""<div class="check-detail"><h4>Measured files</h4><div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div></div>""",
+        "mutation": f"""<div class="check-detail"><h4>Mutation evidence</h4><div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></div>""",
+        "dependencies": f"""<div class="check-detail"><h4>Architecture boundaries</h4><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div></div>""",
+    }
+    gate_cards = "".join(
+        gate_card_html(
+            gate,
+            gate_language.get(gate.key, ("•", gate.title, gate.title, gate.summary)),
+            metric_details_by_gate.get(gate.key, ""),
+        )
+        for gate in report.gates
+    )
     failed_gates = [
         gate
         for gate in report.gates
@@ -5333,9 +5345,6 @@ def html_report(report: AnalysisReport) -> str:
     else:
         setup_summary = "No install was needed. Built-in tools and existing project tools were enough."
         setup_evidence = ""
-    functions_passing = sum(function.passed for function in report.functions)
-    files_passing = sum(file.passed for file in report.files)
-    mutants_killed = sum(not mutation.survived for mutation in report.mutations)
     total_gates = max(1, len(report.gates))
     failed_count = len(failed_gates)
     outcome_segments = "".join(
@@ -5403,8 +5412,6 @@ def html_report(report: AnalysisReport) -> str:
             <strong>{html.escape(short_title)}</strong><small>{state_text}</small></div>"""
         )
     gate_flow = "".join(gate_flow_items)
-    all_commands = [result for gate in report.gates for result in gate.command_results]
-    evidence_html = commands_html(all_commands)
     thresholds_html = html.escape(json.dumps(thresholds, indent=2))
     repository_name = Path(report.root).name or report.root
     return f"""<!doctype html>
@@ -5422,7 +5429,7 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 .flow-card{{grid-column:1/-1;overflow:hidden}} .gate-flow{{display:grid;grid-template-columns:repeat({total_gates},minmax(94px,1fr));gap:4px;overflow:auto;padding:4px 0}} .flow-item{{position:relative;display:grid;justify-items:center;gap:3px;text-align:center;color:var(--secondary)}} .flow-item:not(:last-child)::after{{content:"";position:absolute;top:16px;left:64%;width:72%;height:1px;background:var(--line)}} .flow-symbol{{position:relative;z-index:1;display:grid;place-items:center;width:34px;height:34px;border:1.5px solid currentColor;border-radius:50%;background:#fff;font-size:19px}} .flow-item strong{{font-size:12px;color:var(--ink);font-weight:600}} .flow-item small{{font-size:10px;font-weight:700}} .flow-item.pass{{color:var(--good)}} .flow-item.fail{{color:var(--bad)}} .flow-item.deferred{{color:var(--deferred)}} .flow-item.na{{color:var(--na)}}
 .accordion{{margin-top:14px;overflow:hidden;border:1px solid rgba(255,255,255,.82);border-radius:18px;background:var(--glass);backdrop-filter:blur(18px) saturate(135%);box-shadow:0 8px 28px rgba(35,45,70,.08)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
 .issue-row,.optional-row{{display:grid;grid-template-columns:94px 1fr auto;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}} .issue-row:last-child,.optional-row:last-child{{border-bottom:0}} .issue-row p,.optional-row p,.optional-heading p{{margin:2px 0 0;color:var(--secondary);font-size:13px}} .state-label{{font-size:12px;font-weight:750}} .state-label.fail{{color:var(--bad)}} .na-mark{{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--na);border-radius:50%;color:var(--na);font-size:10px}} .optional-heading{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}} .optional-heading p{{margin:0}} .panel{{padding:16px;border-top:1px solid var(--line)}}
-.checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.5)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .check-status{{margin-left:auto;margin-right:8px;font-size:11px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
+.checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.5)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .check-status{{margin-left:auto;margin-right:8px;font-size:11px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .check-detail{{margin-top:16px}} .check-detail h4{{margin:0 0 8px;font-size:13px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
 @media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card{{grid-column:auto}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
 @media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.metric-tile{{padding:10px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
@@ -5436,11 +5443,7 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 <article class="card flow-card"><h2>Quality gates</h2><div class="gate-flow">{gate_flow}</div></article></section>
 <section class="accordion">{fix_section}{optional_section}
 <div class="checks-list">{gate_cards}</div>
-<details class="data-section"><summary><span>Functions + coverage</span><span>{functions_passing}/{len(report.functions)} pass · target {coverage_limit:g}% · complexity ≤ {complexity_limit:g} · CRAAP ≤ {craap_limit:g}</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div></details>
-<details class="data-section"><summary><span>Files</span><span>{len(report.files)} measured · {files_passing} pass · limit {file_loc_limit:,}</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div></div></details>
-<details class="data-section"><summary><span>Mutations + flaky tests</span><span>{mutants_killed}/{len(report.mutations)} mutations caught · {deferred_gates} deferred gates</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></div></details>
-<details class="data-section"><summary><span>Evidence</span><span>{len(all_commands)} commands · {len(report.dependency_violations)} architecture violations</span></summary><div class="panel">{evidence_html}<h3>Architecture boundaries</h3><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div></div></details>
-<details class="data-section"><summary><span>Thresholds + run details</span><span>{report.mode} mode · {html.escape(report.scope.description)} · {html.escape(language_text)}</span></summary><div class="panel"><h3>Thresholds</h3><pre>{thresholds_html}</pre><h3>Automatic tool setup</h3><p>{html.escape(setup_summary)}</p>{setup_evidence}<h3>Notes</h3><ul>{notes_html}</ul></div></details>
+<details class="data-section"><summary><span>Run details</span><span>{report.mode} mode · {html.escape(report.scope.description)} · {html.escape(language_text)}</span></summary><div class="panel"><h3>Thresholds</h3><pre>{thresholds_html}</pre><h3>Automatic tool setup</h3><p>{html.escape(setup_summary)}</p>{setup_evidence}<h3>Notes</h3><ul>{notes_html}</ul></div></details>
 </section><footer>{applicable_gates} applicable · {deferred_gates} deferred · generated {html.escape(report.generated_at)}</footer>
 </main><script>
 document.querySelectorAll('[data-copy]').forEach(button=>button.addEventListener('click',async()=>{{
