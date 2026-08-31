@@ -20,9 +20,9 @@ from urllib.request import Request, urlopen
 import uuid
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
-DEFAULT_REF = "main"
+DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
 SKILL_FILES = (
     "SKILL.md",
