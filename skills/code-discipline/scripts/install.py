@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 import uuid
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -29,6 +29,7 @@ SKILL_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
     "quality-thresholds.json",
+    "references/quality-loop.md",
     "references/repository-setup.md",
     "scripts/install.py",
     "scripts/quality_loop.py",

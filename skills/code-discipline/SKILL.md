@@ -1,6 +1,6 @@
 ---
 name: code-discipline
-description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, YAGNI-restrained design, and an executable repository-quality loop when strict formatting, lint, types, contracts, coverage, complexity, file LOC, mutation, dead-code, flaky-test, or module-boundary gates are requested.
+description: Engineering discipline for any programming language. Use whenever code is written, reviewed, refactored, debugged, tested, or designed. Enforces behavior-preserving changes, regression tests, explicit failure behavior, readable design, and the bundled incremental quality loop when a repository has configured it.
 ---
 
 # The Zen of Modern Development
@@ -13,127 +13,25 @@ and record why — practicality beats purity.
 
 ## Repository quality loop
 
-Use the loop only when the user asks for strict repository hardening, the
-quality gate, formatting/lint enforcement, static types, contract validation,
-mutation testing, CRAAP enforcement, dead-code detection, flaky-test detection,
-architecture enforcement, or continued repair until all checks pass. Ordinary
-coding work does not authorize this full-repository run.
+When `.quality-gate.json` exists, run the bundled loop for every coding task:
 
-The deterministic entrypoint is `scripts/quality_loop.py` beside this file. In
-Claude Code plugins it is available at
-`${CLAUDE_PLUGIN_ROOT}/skills/code-discipline/scripts/quality_loop.py`; in
-Codex, use the absolute path beside the loaded `SKILL.md`. Run it from the
-target repository root:
+- During implementation: `--local-changes --fast`.
+- Before handoff: `--local-changes` without `--fast`; repair and rerun until it
+  exits `0`.
+- For a requested commit: use `--commit [REF]`.
+- Use whole-repository scope only for requested hardening, audit, or release
+  certification.
 
-```bash
-python3 <skill-directory>/scripts/quality_loop.py --root .
-```
+Audit or certification alone is read-only; repair failures only when asked.
 
-When asked to set up a repository for these gates, read
-[references/repository-setup.md](references/repository-setup.md) completely and
-follow its detection-first bootstrap. The repository's commands and adapters
-belong in `.quality-gate.json`; all numeric goals belong in
-`.quality-thresholds.json`. `repo_quality_gate.py --init` creates both files.
-The bundled [quality-thresholds.json](quality-thresholds.json) is the source of
-defaults, including `file_loc.max_lines: 1000`. A repository-local thresholds
-file takes precedence; `--thresholds PATH` selects an explicit one. Do not copy
-threshold numbers into `.quality-gate.json`.
+Before running the loop, read
+[references/quality-loop.md](references/quality-loop.md) completely. If the
+gate is not configured, run the repository's existing focused checks; set it up
+only when asked, following
+[references/repository-setup.md](references/repository-setup.md).
 
-The skill is self-contained: its `scripts` directory holds the quality engine,
-loop, installer, and updater. To update this installed skill from GitHub, use
-`python3 <skill-directory>/scripts/install.py --update-current [--ref REF]`.
-The installer validates a complete staged copy and atomically replaces only the
-managed skill directory. It never overwrites repository-owned
-`.quality-gate.json`, `.quality-thresholds.json`, or
-`.quality-dependencies.json`.
-
-Choose the Git scope before choosing fast or full execution:
-
-- While implementing or reviewing uncommitted work, run
-  `--local-changes --fast`. It selects staged, unstaged, and untracked
-  production files. Before
-  handing off those changes, rerun `--local-changes` without `--fast` when the
-  user asked for a complete incremental gate.
-- When the user asks to check a commit, a committed diff, or a per-commit CI
-  gate, run `--commit [REF]`; omitting `REF` selects `HEAD`. Use `--fast` only
-  for diagnosis, then preserve `--commit` in the full rerun.
-- When the user asks whether the repository is ready to ship, requests release
-  certification or whole-repository hardening, or no trustworthy Git scope is
-  available, omit both incremental flags and run the repository scope.
-
-`--commit` and `--local-changes` are mutually exclusive. Incremental scopes
-limit function metrics, complexity, mutation, dependency analysis, and inferred
-file-aware formatter/linter commands to selected production files. Complete
-tests and configured project commands retain their declared repository scope so
-changed code is still checked against unchanged callers. An incremental pass
-certifies only its selected scope; never report it as whole-repository release
-certification.
-
-During repair iterations, add `--fast`. Fast mode executes every static gate
-and one complete tests/coverage/CRAAP pass, but defers flaky-test repetitions
-and mutation testing. It is diagnostic only and never exits `0`. Read
-`ready_for_full` in the JSON state: when true, immediately run the provided
-`full_rerun_command` without `--fast`. Only that full command can certify the
-repository. Use `--html PATH` for an explicit report file or `--artifact-dir
-DIR` for the default HTML and JSON filenames in a dedicated directory.
-
-For a full mutation run, use `--mutation-workers auto`; native Vitest/Stryker
-uses Stryker's CPU-based worker default, while a positive integer sets an exact
-bound. Vitest repositories automatically use the native Stryker adapter in one
-disposable repository snapshot: semantic operator discovery, per-test coverage,
-related-test selection, bail-on-first-failure, and incremental results replace
-one full-suite process per text match. Repositories with a large integration
-suite may configure `mutation.test_files`, `mutation.vitest_config`, and
-`mutation.vitest_dir` for a dedicated fast unit-test project; this narrows only
-the tests Stryker repeats, never the separate complete baseline suite, and any
-uncovered mutant still fails. A `vitest.mutation.config.*` file is detected
-automatically. A content-addressed proof cache skips Stryker entirely when
-production source, tests, tool configuration, and dependency manifests are
-byte-for-byte unchanged. Any relevant change invalidates that shortcut and
-Stryker retests affected mutants; the complete cold run establishes the initial
-proof. The report names static mutants and native phase time so expensive
-module-load mutations are visible rather than silently ignored. Other stacks
-retain the conservative portable snapshot-per-worker fallback. Both engines
-keep the active worktree unchanged and require every in-scope mutant to be
-assertion-killed; `Survived`, `NoCoverage`, `Timeout`, and runner-error results
-fail the gate. Only one quality loop may run per repository because coverage
-tools commonly share temporary paths.
-
-The core writes its HTML and JSON state to a user cache, leaving the target
-worktree unchanged except for repairs the agent intentionally makes. Exit `0`
-means every applicable gate passed. Exit `1` means measured failures remain: read
-`fix_prompt` and `failures` in the printed state JSON path, repair one coherent
-batch, run focused tests, and rerun; in fast mode it can instead mean the
-executed checks are green and full certification is ready. Exit `2` means
-configuration, an adapter, or the runner failed; repair that blocker before
-changing production behavior.
-
-Coverage and CRAAP analysis always run when their adapters are available. If
-the baseline test suite is red, preserve those measurements as diagnostic
-evidence and repair the tests; do not claim the metrics are certified. Flaky
-and mutation results require a green unmodified baseline and remain blocked
-until it passes. Agent runs expose every available function measurement in
-`quality-gate-state.json` under `metrics.functions`; check `metrics.certified`
-before treating those values as certification evidence.
-
-Before the first run, inspect and preserve existing worktree changes. Do not
-run mutation analysis concurrently with another process writing source files.
-If `.quality-dependencies.json` is missing, derive its modules and permitted
-directions from the intended architecture after reading the repository; never
-bless accidental imports as the specification.
-
-For repository scope, the finish conditions are zero formatter/linter/type/contract/dead-code
-violations where those checks apply; a passing and repeatable full test suite;
-the configured coverage, complexity, and CRAAP goals for every production
-function; every production file at or below the configured File LOC maximum;
-zero surviving operator mutants; and zero module ownership or direction
-violations. For an incremental scope, apply the file-based conditions to every
-selected production file and still require every executed repository command to
-pass. Never lower thresholds, disable a gate, cap the final mutation run,
-skip tests, weaken assertions, add suppressions or exclusions, broaden an
-allow-list merely to pass, or replace a command with a no-op. Continue until
-the core exits `0`, then report every applicable summary and the state/report
-paths. Do not commit or push unless the user asked.
+Never weaken thresholds or checks merely to pass. Do not commit or push unless
+the user asked.
 
 ## Readability counts.
 

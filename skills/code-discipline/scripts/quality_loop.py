@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Iterator, Sequence, TextIO
 
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 
 
@@ -442,7 +442,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     output.add_argument(
         "--html",
-        help="explicit HTML report path; JSON state is written beside it",
+        help="override the automatic HTML report path; JSON state is written beside it",
     )
     parser.add_argument(
         "--gate-script",

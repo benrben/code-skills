@@ -69,11 +69,14 @@ Run a fast diagnostic on local changes:
 python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --local-changes --fast
 ```
 
-Run complete repository certification and export an HTML report:
+Run complete repository certification:
 
 ```bash
-python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --html quality-gate-report.html
+python3 .agents/skills/code-discipline/scripts/quality_loop.py --root .
 ```
+
+Every run generates an HTML report and prints its path. Add
+`--html quality-gate-report.html` only when you want a specific location.
 
 For a global installation, replace `.agents/skills/code-discipline` in those
 commands with `$HOME/.agents/skills/code-discipline`.

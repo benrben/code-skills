@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import importlib.util
 import io
@@ -563,7 +564,8 @@ class QualityGateUnitTests(unittest.TestCase):
             "| python3 - --global",
             "scripts/install.py --update-current",
             '"$HOME/.agents/skills/code-discipline/scripts/install.py" --update-current',
-            ".agents/skills/code-discipline/scripts/quality_loop.py --root . --html",
+            ".agents/skills/code-discipline/scripts/quality_loop.py --root .",
+            "Every run generates an HTML report",
         ):
             with self.subTest(command_fragment=command_fragment):
                 self.assertIn(command_fragment, readme)
@@ -2235,6 +2237,43 @@ class QualityGateEndToEndTests(unittest.TestCase):
                     encoding="utf-8"
                 ),
             )
+
+    def test_agent_loop_writes_html_by_default_without_a_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            root = workspace / "repository"
+            cache = workspace / "cache"
+            root.mkdir()
+            environment = os.environ.copy()
+            environment["XDG_CACHE_HOME"] = str(cache)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(LOOP_SCRIPT),
+                    "--root",
+                    str(root),
+                    "--fast",
+                    "--no-install",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                env=environment,
+            )
+            digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:12]
+            artifacts = cache / "repo-quality-loop" / f"{root.name}-{digest}"
+            html = artifacts / "quality-gate-report.html"
+            state = artifacts / "quality-gate-state.json"
+
+            self.assertIn(
+                completed.returncode, (1, 2), completed.stdout + completed.stderr
+            )
+            self.assertTrue(html.is_file())
+            self.assertTrue(state.is_file())
+            self.assertIn(f"HTML={html}", completed.stdout)
+            self.assertFalse((root / "quality-gate-report.html").exists())
 
     def test_complete_generic_adapter_run_passes_and_writes_html(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
