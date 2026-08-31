@@ -1,5 +1,7 @@
+import contextlib
 import json
 import importlib.util
+import io
 import os
 from pathlib import Path
 import re
@@ -35,41 +37,390 @@ quality_loop = load_quality_loop()
 
 
 class QualityGateUnitTests(unittest.TestCase):
-    def test_readme_documents_every_cli_option_and_auto_install(self) -> None:
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        help_commands = (
-            [sys.executable, str(ROOT / "repo_quality_gate.py"), "--help"],
-            [sys.executable, str(LOOP_SCRIPT), "--help"],
+    def test_standalone_update_installs_release_and_preserves_repository_goals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "repo_quality_gate.py"
+            bundled_thresholds = root / "quality-thresholds.json"
+            repository_thresholds = root / ".quality-thresholds.json"
+            runner.write_text("old runner\n", encoding="utf-8")
+            bundled_thresholds.write_text("{}\n", encoding="utf-8")
+            repository_thresholds.write_text(
+                '{"repository_owned": true}\n', encoding="utf-8"
+            )
+            remote_runner = (ROOT / "repo_quality_gate.py").read_bytes()
+            remote_thresholds = (
+                ROOT / "skills" / "code-discipline" / "quality-thresholds.json"
+            ).read_bytes()
+
+            version = gate.install_standalone_release(
+                runner,
+                bundled_thresholds,
+                remote_runner,
+                remote_thresholds,
+            )
+
+            self.assertEqual(version, gate.VERSION)
+            self.assertEqual(runner.read_bytes(), remote_runner)
+            self.assertEqual(bundled_thresholds.read_bytes(), remote_thresholds)
+            self.assertEqual(
+                repository_thresholds.read_text(encoding="utf-8"),
+                '{"repository_owned": true}\n',
+            )
+
+    def test_invalid_standalone_update_does_not_replace_existing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "repo_quality_gate.py"
+            bundled_thresholds = root / "quality-thresholds.json"
+            runner.write_text("old runner\n", encoding="utf-8")
+            bundled_thresholds.write_text("old thresholds\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "downloaded runner"):
+                gate.install_standalone_release(
+                    runner,
+                    bundled_thresholds,
+                    b"this is not valid Python\n",
+                    b"{}\n",
+                )
+
+            self.assertEqual(runner.read_text(encoding="utf-8"), "old runner\n")
+            self.assertEqual(
+                bundled_thresholds.read_text(encoding="utf-8"),
+                "old thresholds\n",
+            )
+
+    def test_bundled_thresholds_are_the_runtime_defaults(self) -> None:
+        thresholds_path = (
+            ROOT / "skills" / "code-discipline" / "quality-thresholds.json"
         )
-        documented_options: set[str] = set()
-        for command in help_commands:
+
+        thresholds, notes = gate.load_thresholds(thresholds_path)
+        config = gate.default_config(thresholds)
+
+        self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
+        self.assertEqual(config["file_loc"]["max_lines"], 1000)
+        self.assertEqual(config["metrics"]["coverage_limit"], 100)
+        self.assertEqual(config["metrics"]["complexity_limit"], 6)
+        self.assertEqual(config["metrics"]["craap_limit"], 6)
+        self.assertEqual(config["flaky_tests"]["runs"], 3)
+        self.assertIn(str(thresholds_path), notes[0])
+
+    def test_file_loc_gate_enforces_configured_physical_line_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            short = root / "short.py"
+            long = root / "long.py"
+            short.write_text("first\nsecond\n", encoding="utf-8")
+            long.write_text("\n".join(f"line {index}" for index in range(4)), encoding="utf-8")
+
+            result, files = gate.run_file_loc_gate(
+                root,
+                [short, long],
+                {"max_lines": 3},
+            )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(
+                [(item.path, item.lines, item.limit, item.passed) for item in files],
+                [("long.py", 4, 3, False), ("short.py", 2, 3, True)],
+            )
+            self.assertIn("long.py: 4 lines", result.details)
+
+    def test_root_level_javascript_test_files_are_not_production_loc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            production = root / "index.js"
+            production.write_text("export default 1;\n", encoding="utf-8")
+            (root / "test.js").write_text("test('value', () => {});\n", encoding="utf-8")
+            (root / "test-d.ts").write_text(
+                "expectType<number>(1);\n", encoding="utf-8"
+            )
+            (root / "index.test-d.ts").write_text(
+                "expectType<number>(1);\n", encoding="utf-8"
+            )
+
+            discovered = gate.discover_source_files(
+                root, gate.default_config()["source"]
+            )
+
+            self.assertEqual(discovered, [production])
+
+    def test_custom_threshold_file_controls_complexity_and_file_loc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            thresholds_path = root / ".quality-thresholds.json"
+            custom = gate.default_thresholds()
+            custom["metrics"]["complexity_limit"] = 2
+            custom["file_loc"]["max_lines"] = 25
+            thresholds_path.write_text(json.dumps(custom), encoding="utf-8")
+            config_path = root / ".quality-gate.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "metrics": {"coverage_limit": 1},
+                        "file_loc": {"max_lines": 9999},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            thresholds, _ = gate.load_thresholds(thresholds_path)
+            config, _ = gate.load_config(config_path, thresholds)
+            function = gate.FunctionMetric(
+                path="app.py",
+                name="branchy",
+                start_line=1,
+                end_line=5,
+                complexity=3,
+                covered_lines=5,
+                total_lines=5,
+                coverage_percent=100,
+                craap_score=3,
+                parser="python-ast",
+                coverage_limit=config["metrics"]["coverage_limit"],
+                complexity_limit=config["metrics"]["complexity_limit"],
+                craap_limit=config["metrics"]["craap_limit"],
+            )
+
+            self.assertEqual(config["file_loc"]["max_lines"], 25)
+            self.assertEqual(config["metrics"]["coverage_limit"], 100)
+            self.assertFalse(function.passed)
+
+    def test_init_writes_separate_gate_and_threshold_json_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
             completed = subprocess.run(
-                command,
+                [
+                    sys.executable,
+                    str(ROOT / "repo_quality_gate.py"),
+                    "--root",
+                    str(root),
+                    "--init",
+                ],
                 capture_output=True,
                 text=True,
-                timeout=5,
-                check=True,
+                timeout=10,
+                check=False,
             )
-            documented_options.update(re.findall(r"--[a-z][a-z-]*", completed.stdout))
+            config = json.loads(
+                (root / ".quality-gate.json").read_text(encoding="utf-8")
+            )
+            thresholds = json.loads(
+                (root / ".quality-thresholds.json").read_text(encoding="utf-8")
+            )
 
-        missing_options = sorted(
-            option for option in documented_options if f"`{option}" not in readme
-        )
-        self.assertEqual(missing_options, [])
-        for package in (
-            "lizard",
-            "coverage",
-            "ruff",
-            "mypy",
-            "vulture",
-            "jsonschema",
-            "openapi-spec-validator",
-            "@vitest/coverage-v8",
-            "@stryker-mutator/core@9.6.1",
-            "cargo-llvm-cov",
-        ):
-            with self.subTest(package=package):
-                self.assertIn(package, readme)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
+            self.assertNotIn("coverage_limit", config["metrics"])
+            self.assertNotIn("runs", config["flaky_tests"])
+            self.assertNotIn("file_loc", config)
+
+    def test_git_scopes_select_commit_and_local_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    ["git", *arguments],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+            git("init", "-q")
+            git("config", "user.name", "Quality Gate Test")
+            git("config", "user.email", "quality-gate@example.test")
+            committed = root / "src" / "committed.py"
+            staged = root / "src" / "staged.py"
+            unstaged = root / "src" / "unstaged.py"
+            committed.write_text("def committed():\n    return 1\n", encoding="utf-8")
+            staged.write_text("def staged():\n    return 1\n", encoding="utf-8")
+            unstaged.write_text("def unstaged():\n    return 1\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-qm", "base")
+
+            committed.write_text("def committed():\n    return 2\n", encoding="utf-8")
+            git("add", str(committed.relative_to(root)))
+            git("commit", "-qm", "change committed source")
+            staged.write_text("def staged():\n    return 2\n", encoding="utf-8")
+            git("add", str(staged.relative_to(root)))
+            unstaged.write_text("def unstaged():\n    return 2\n", encoding="utf-8")
+            untracked = root / "src" / "untracked.py"
+            untracked.write_text("def untracked():\n    return 3\n", encoding="utf-8")
+
+            commit_scope = gate.commit_scope(root, "HEAD")
+            root_commit_scope = gate.commit_scope(root, "HEAD~1")
+            local_scope = gate.local_changes_scope(root)
+            source_config = gate.default_config()["source"]
+
+            self.assertEqual(commit_scope.kind, "commit")
+            self.assertEqual(commit_scope.reference, "HEAD")
+            self.assertEqual(commit_scope.paths, ("src/committed.py",))
+            self.assertEqual(
+                gate.discover_source_files(root, source_config, commit_scope),
+                [committed],
+            )
+            self.assertEqual(
+                root_commit_scope.paths,
+                ("src/committed.py", "src/staged.py", "src/unstaged.py"),
+            )
+            self.assertEqual(local_scope.kind, "local_changes")
+            self.assertEqual(
+                local_scope.paths,
+                ("src/staged.py", "src/unstaged.py", "src/untracked.py"),
+            )
+            self.assertEqual(
+                gate.discover_source_files(root, source_config, local_scope),
+                [staged, unstaged, untracked],
+            )
+
+    def test_incremental_run_filters_metrics_to_changed_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            changed = root / "changed.py"
+            unchanged = root / "unchanged.py"
+            changed.write_text("def changed():\n    return 1\n", encoding="utf-8")
+            unchanged.write_text("def unchanged():\n    return 2\n", encoding="utf-8")
+            (root / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "changed.py",
+                                "name": "changed",
+                                "start_line": 1,
+                                "end_line": 2,
+                                "complexity": 1,
+                                "covered_lines": 2,
+                                "total_lines": 2,
+                                "coverage_percent": 100,
+                            },
+                            {
+                                "path": "unchanged.py",
+                                "name": "unchanged",
+                                "start_line": 1,
+                                "end_line": 2,
+                                "complexity": 1,
+                                "covered_lines": 2,
+                                "total_lines": 2,
+                                "coverage_percent": 100,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["test"]["command"] = [sys.executable, "-c", "pass"]
+            config["metrics"]["report"] = "metrics.json"
+            scope = gate.GateScope("local_changes", ("changed.py",))
+
+            report = gate.run(
+                root,
+                config,
+                root / "report.html",
+                cli_max_mutants=None,
+                notes=[],
+                fast=True,
+                scope=scope,
+            )
+
+            self.assertEqual([item.path for item in report.functions], ["changed.py"])
+            self.assertEqual(report.scope, scope)
+            self.assertIn("local changes", " ".join(report.notes).lower())
+
+    def test_empty_incremental_source_scope_skips_file_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "metrics-ran"
+            config = gate.default_config()
+            config["test"]["command"] = [sys.executable, "-c", "pass"]
+            config["metrics"]["command"] = [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ]
+            config["metrics"]["report"] = "metrics.json"
+
+            report = gate.run(
+                root,
+                config,
+                root / "report.html",
+                cli_max_mutants=None,
+                notes=[],
+                fast=True,
+                scope=gate.GateScope("local_changes"),
+            )
+            quality = next(item for item in report.gates if item.key == "quality")
+
+            self.assertFalse(marker.exists())
+            self.assertTrue(quality.passed)
+            self.assertIn("No changed production source files", quality.summary)
+            self.assertEqual(report.functions, [])
+
+    def test_incremental_mutation_scope_allows_no_supported_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text("def value():\n    return 1\n", encoding="utf-8")
+            config = gate.default_config()
+            config["test"]["command"] = [sys.executable, "-c", "pass"]
+
+            result, mutations = gate.run_mutation_gate(
+                root,
+                config,
+                [source],
+                cli_max_mutants=None,
+                scope=gate.GateScope("local_changes", ("app.py",)),
+            )
+
+            self.assertTrue(result.passed)
+            self.assertFalse(result.applicable)
+            self.assertIn("selected local changes", result.summary)
+            self.assertEqual(mutations, [])
+
+    def test_incremental_scope_cli_modes_are_mutually_exclusive(self) -> None:
+        core_commit = gate.parse_args(["--commit"])
+        core_local = gate.parse_args(["--local-changes"])
+        wrapper_commit = quality_loop.parse_args(["--commit", "HEAD~1"])
+        wrapper_local = quality_loop.parse_args(["--local-changes"])
+
+        self.assertEqual(core_commit.commit, "HEAD")
+        self.assertFalse(core_commit.local_changes)
+        self.assertIsNone(core_local.commit)
+        self.assertTrue(core_local.local_changes)
+        self.assertEqual(wrapper_commit.commit, "HEAD~1")
+        self.assertFalse(wrapper_commit.local_changes)
+        self.assertIsNone(wrapper_local.commit)
+        self.assertTrue(wrapper_local.local_changes)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                gate.parse_args(["--commit", "--local-changes"])
+            with self.assertRaises(SystemExit):
+                quality_loop.parse_args(["--commit", "--local-changes"])
+
+    def test_readme_keeps_the_primary_workflow_short_and_discoverable(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        core_help = subprocess.run(
+            [sys.executable, str(ROOT / "repo_quality_gate.py"), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout
+
+        self.assertLessEqual(len(readme.splitlines()), 200)
+        for option in ("--init", "--local-changes", "--fast", "--update-from-github"):
+            with self.subTest(option=option):
+                self.assertIn(option, readme)
+        self.assertIn("repository-setup.md", readme)
+        self.assertIn("--update-from-github [REF]", core_help)
 
     def test_bootstrap_auto_installs_json_schema_validator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -271,24 +622,21 @@ class QualityGateUnitTests(unittest.TestCase):
             root = Path(temporary)
             source = root / "app.py"
             source.write_text("def value():\n    return 1\n", encoding="utf-8")
-            (root / "metrics.json").write_text(
-                json.dumps(
-                    {
-                        "functions": [
-                            {
-                                "path": "app.py",
-                                "name": "value",
-                                "start_line": 1,
-                                "end_line": 2,
-                                "complexity": 1,
-                                "covered_lines": 2,
-                                "total_lines": 2,
-                                "coverage_percent": 100,
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
+            metrics_payload = json.dumps(
+                {
+                    "functions": [
+                        {
+                            "path": "app.py",
+                            "name": "value",
+                            "start_line": 1,
+                            "end_line": 2,
+                            "complexity": 1,
+                            "covered_lines": 2,
+                            "total_lines": 2,
+                            "coverage_percent": 100,
+                        }
+                    ]
+                }
             )
             config = gate.default_config()
             config["test"]["command"] = [
@@ -296,7 +644,18 @@ class QualityGateUnitTests(unittest.TestCase):
                 "-c",
                 "raise SystemExit(1)",
             ]
-            config["metrics"]["report"] = "metrics.json"
+            config["metrics"]["command"] = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, sys; "
+                    "pathlib.Path(sys.argv[1]).write_text(sys.argv[2]); "
+                    "raise SystemExit(1)"
+                ),
+                "{report}",
+                metrics_payload,
+            ]
+            config["metrics"]["report"] = "{report}"
 
             report = gate.run(
                 root,
@@ -309,10 +668,108 @@ class QualityGateUnitTests(unittest.TestCase):
             quality = next(item for item in report.gates if item.key == "quality")
 
             self.assertFalse(quality.passed)
-            self.assertIn("ran diagnostically", quality.summary)
+            self.assertIn("report was parsed diagnostically", quality.summary)
             self.assertEqual(len(report.functions), 1)
             self.assertEqual(report.functions[0].coverage_percent, 100)
             self.assertEqual(quality.command_results[0].returncode, 1)
+
+    def test_failed_coverage_command_preserves_its_diagnostic_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text("def value():\n    return 1\n", encoding="utf-8")
+            coverage_payload = json.dumps(
+                {
+                    "files": {
+                        str(source): {
+                            "executed_lines": [1, 2],
+                            "missing_lines": [],
+                        }
+                    }
+                }
+            )
+            config = gate.default_config()
+            config["test"]["command"] = [
+                sys.executable,
+                "-c",
+                "raise SystemExit(1)",
+            ]
+            config["metrics"]["coverage_commands"] = [
+                [sys.executable, "-c", "raise SystemExit(1)"],
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib, sys; "
+                        "pathlib.Path(sys.argv[1]).write_text(sys.argv[2])"
+                    ),
+                    "{report}",
+                    coverage_payload,
+                ],
+            ]
+            config["metrics"]["coverage_report"] = "{report}"
+            config["metrics"]["coverage_format"] = "coverage-json"
+
+            report = gate.run(
+                root,
+                config,
+                root / "report.html",
+                cli_max_mutants=None,
+                notes=[],
+                fast=True,
+            )
+            quality = next(item for item in report.gates if item.key == "quality")
+
+            self.assertFalse(quality.passed)
+            self.assertIn("report was parsed diagnostically", quality.summary)
+            self.assertEqual(len(report.functions), 1)
+            self.assertEqual(report.functions[0].coverage_percent, 100)
+            self.assertIn(1, [result.returncode for result in quality.command_results])
+
+    def test_failed_coverage_command_rejects_a_stale_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text("def value():\n    return 1\n", encoding="utf-8")
+            coverage_path = root / "coverage.json"
+            coverage_path.write_text(
+                json.dumps(
+                    {
+                        "files": {
+                            str(source): {
+                                "executed_lines": [1, 2],
+                                "missing_lines": [],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["test"]["command"] = [
+                sys.executable,
+                "-c",
+                "raise SystemExit(1)",
+            ]
+            config["metrics"]["coverage_commands"] = [
+                [sys.executable, "-c", "raise SystemExit(1)"]
+            ]
+            config["metrics"]["coverage_report"] = str(coverage_path)
+            config["metrics"]["coverage_format"] = "coverage-json"
+
+            report = gate.run(
+                root,
+                config,
+                root / "report.html",
+                cli_max_mutants=None,
+                notes=[],
+                fast=True,
+            )
+            quality = next(item for item in report.gates if item.key == "quality")
+
+            self.assertFalse(quality.passed)
+            self.assertIn("did not produce a fresh report", quality.summary)
+            self.assertEqual(report.functions, [])
 
     def test_output_sensitive_formatter_command_fails_on_listed_files(self) -> None:
         command_result = gate.CommandResult(
@@ -1218,11 +1675,20 @@ const helper = require('./helper.js')
             result, violations = gate.run_dependency_gate(
                 root, config, [source, target]
             )
+            scoped_result, scoped_violations = gate.run_dependency_gate(
+                root,
+                config,
+                [source],
+                resolution_files=[source, target],
+            )
 
             self.assertFalse(result.passed)
             self.assertEqual(len(violations), 1)
             self.assertEqual(violations[0].source_module, "domain")
             self.assertEqual(violations[0].target_module, "infrastructure")
+            self.assertFalse(scoped_result.passed)
+            self.assertEqual(len(scoped_violations), 1)
+            self.assertEqual(scoped_violations[0].source, "src/domain/service.py")
 
 
 class QualityGateEndToEndTests(unittest.TestCase):
@@ -1328,10 +1794,33 @@ class QualityGateEndToEndTests(unittest.TestCase):
 
             self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
             self.assertEqual(passing_state["status"], "pass")
-            self.assertEqual(len(passing_state["gates"]), 8)
-            self.assertEqual(passing_state["counts"]["checks_applicable"], 8)
-            self.assertEqual(passing_state["counts"]["checks_passing"], 8)
+            self.assertEqual(len(passing_state["gates"]), 9)
+            self.assertEqual(passing_state["counts"]["checks_applicable"], 9)
+            self.assertEqual(passing_state["counts"]["checks_passing"], 9)
             self.assertEqual(passing_state["counts"]["mutants_static"], 0)
+            self.assertEqual(passing_state["counts"]["files_total"], 1)
+            self.assertEqual(passing_state["counts"]["files_failing_loc"], 0)
+            self.assertEqual(passing_state["thresholds"]["file_loc"]["max_lines"], 1000)
+            self.assertEqual(
+                passing_state["metrics"]["files"],
+                [
+                    {
+                        "path": "src/app.py",
+                        "lines": 2,
+                        "limit": 1000,
+                        "passed": True,
+                    }
+                ],
+            )
+            self.assertTrue(passing_state["metrics"]["certified"])
+            self.assertEqual(
+                passing_state["scope"],
+                {
+                    "kind": "repository",
+                    "reference": None,
+                    "changed_files": [],
+                },
+            )
             self.assertIsNone(passing_state["fix_prompt"])
             self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
 
@@ -1397,6 +1886,38 @@ class QualityGateEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(dependency_gate["status"], "fail")
 
+            (root / "check.py").write_text(
+                "raise AssertionError('intentional baseline failure')\n",
+                encoding="utf-8",
+            )
+            red_tests = subprocess.run(
+                command, capture_output=True, text=True, timeout=30, check=False
+            )
+            red_tests_state = json.loads(
+                (artifacts / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                red_tests.returncode, 1, red_tests.stdout + red_tests.stderr
+            )
+            self.assertFalse(red_tests_state["metrics"]["certified"])
+            self.assertEqual(
+                red_tests_state["metrics"]["functions"],
+                [
+                    {
+                        "path": "src/app.py",
+                        "name": "is_one",
+                        "line": 1,
+                        "covered_lines": 2,
+                        "total_lines": 2,
+                        "coverage_percent": 100.0,
+                        "complexity": 1,
+                        "craap_score": 1.0,
+                        "passed": True,
+                    }
+                ],
+            )
+
             config_path.write_text("{invalid", encoding="utf-8")
             broken = subprocess.run(
                 command, capture_output=True, text=True, timeout=30, check=False
@@ -1408,6 +1929,161 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(broken.returncode, 2, broken.stdout + broken.stderr)
             self.assertEqual(broken_state["status"], "error")
             self.assertTrue(broken_state["error"])
+
+    def test_agent_loop_local_changes_scope_is_persisted_and_rerunnable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            root = workspace / "repository"
+            root.mkdir()
+            (root / "src").mkdir()
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    ["git", *arguments],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+            git("init", "-q")
+            git("config", "user.name", "Quality Gate Test")
+            git("config", "user.email", "quality-gate@example.test")
+            changed = root / "src" / "changed.py"
+            unchanged = root / "src" / "unchanged.py"
+            changed.write_text("def changed():\n    return 1\n", encoding="utf-8")
+            unchanged.write_text("def unchanged():\n    return 2\n", encoding="utf-8")
+            (root / "check.py").write_text("pass\n", encoding="utf-8")
+            (root / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "src/changed.py",
+                                "name": "changed",
+                                "start_line": 1,
+                                "end_line": 2,
+                                "complexity": 1,
+                                "covered_lines": 2,
+                                "total_lines": 2,
+                                "coverage_percent": 100,
+                            },
+                            {
+                                "path": "src/unchanged.py",
+                                "name": "unchanged",
+                                "start_line": 1,
+                                "end_line": 2,
+                                "complexity": 1,
+                                "covered_lines": 2,
+                                "total_lines": 2,
+                                "coverage_percent": 100,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / ".quality-dependencies.json").write_text(
+                json.dumps(
+                    {
+                        "modules": [{"name": "core", "paths": ["src/**"]}],
+                        "allow": {"core": []},
+                        "deny": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / ".quality-gate.json").write_text(
+                json.dumps(
+                    {
+                        "source": {"include": ["src/**"], "exclude": []},
+                        "test": {"command": [sys.executable, "check.py"]},
+                        "metrics": {"report": "metrics.json"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            git("add", ".")
+            git("commit", "-qm", "base")
+            changed.write_text("def changed():\n    return 3\n", encoding="utf-8")
+            artifacts = workspace / "artifacts"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(LOOP_SCRIPT),
+                    "--root",
+                    str(root),
+                    "--artifact-dir",
+                    str(artifacts),
+                    "--local-changes",
+                    "--fast",
+                    "--no-install",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            state = json.loads(
+                (artifacts / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                completed.returncode, 1, completed.stdout + completed.stderr
+            )
+            self.assertEqual(
+                state["scope"],
+                {
+                    "kind": "local_changes",
+                    "reference": None,
+                    "changed_files": ["src/changed.py"],
+                },
+            )
+            self.assertEqual(
+                [item["path"] for item in state["metrics"]["functions"]],
+                ["src/changed.py"],
+            )
+            self.assertIn("--local-changes", state["rerun_command"])
+            self.assertIn("--local-changes", state["full_rerun_command"])
+            self.assertFalse(state["certified"])
+            self.assertFalse(state["scope_certified"])
+            self.assertIn(
+                "Fast quality check for local changes",
+                (artifacts / "quality-gate-report.html").read_text(encoding="utf-8"),
+            )
+
+            full_artifacts = workspace / "full-artifacts"
+            full = subprocess.run(
+                [
+                    sys.executable,
+                    str(LOOP_SCRIPT),
+                    "--root",
+                    str(root),
+                    "--artifact-dir",
+                    str(full_artifacts),
+                    "--local-changes",
+                    "--no-install",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            full_state = json.loads(
+                (full_artifacts / "quality-gate-state.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+            self.assertEqual(full_state["status"], "pass")
+            self.assertFalse(full_state["certified"])
+            self.assertTrue(full_state["scope_certified"])
+            self.assertIn(
+                "LOCAL CHANGES PASSED",
+                (full_artifacts / "quality-gate-report.html").read_text(
+                    encoding="utf-8"
+                ),
+            )
 
     def test_complete_generic_adapter_run_passes_and_writes_html(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1479,7 +2155,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             rendered = report_path.read_text(encoding="utf-8")
             self.assertIn("Can I ship this?", rendered)
             self.assertIn("READY TO SHIP", rendered)
-            self.assertEqual(rendered.count('<article class="gate '), 8)
+            self.assertEqual(rendered.count('<article class="gate '), 9)
             self.assertEqual(rendered.count("NOT NEEDED"), 0)
             self.assertEqual(rendered.count("data-copy="), 0)
             self.assertNotIn("Gherkin", rendered)

@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Iterator, Sequence, TextIO
 
 
-VERSION = "2.6.0"
+VERSION = "2.9.0"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().parents[3] / "repo_quality_gate.py"
 
 
@@ -161,12 +161,15 @@ def build_rerun_command(
     root: Path,
     config_path: Path,
     explicit_config: bool,
+    thresholds_path: Path,
+    explicit_thresholds: bool,
     artifact_dir: Path,
     explicit_artifacts: bool,
     html_path: Path,
     explicit_html: bool,
     gate_script: Path,
     explicit_gate_script: bool,
+    scope_arguments: Sequence[str],
     no_install: bool,
     fast: bool,
     mutation_workers: str | None,
@@ -174,12 +177,15 @@ def build_rerun_command(
     command = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
     if explicit_config:
         command.extend(["--config", display_path(config_path, root)])
+    if explicit_thresholds:
+        command.extend(["--thresholds", display_path(thresholds_path, root)])
     if explicit_html:
         command.extend(["--html", display_path(html_path, root)])
     elif explicit_artifacts:
         command.extend(["--artifact-dir", display_path(artifact_dir, root)])
     if explicit_gate_script:
         command.extend(["--gate-script", str(gate_script)])
+    command.extend(scope_arguments)
     if no_install:
         command.append("--no-install")
     if mutation_workers:
@@ -189,14 +195,26 @@ def build_rerun_command(
     return shlex.join(command)
 
 
-def function_failure(function: Any) -> dict[str, Any]:
+def function_measurement(function: Any) -> dict[str, Any]:
     return {
         "path": function.path,
         "name": function.name,
         "line": function.start_line,
+        "covered_lines": function.covered_lines,
+        "total_lines": function.total_lines,
         "coverage_percent": round(function.coverage_percent, 2),
         "complexity": function.complexity,
         "craap_score": round(function.craap_score, 2),
+        "passed": function.passed,
+    }
+
+
+def file_measurement(file: Any) -> dict[str, Any]:
+    return {
+        "path": file.path,
+        "lines": file.lines,
+        "limit": file.limit,
+        "passed": file.passed,
     }
 
 
@@ -238,6 +256,9 @@ def analysis_state(
     survivors = [item for item in analysis.mutations if item.survived]
     violations = analysis.dependency_violations
     failed_setup = [item for item in analysis.tool_setup if item.returncode != 0]
+    quality_gate = next(
+        (result for result in analysis.gates if result.key == "quality"), None
+    )
     status = (
         "error"
         if error
@@ -251,7 +272,8 @@ def analysis_state(
         "schema_version": 1,
         "status": status,
         "mode": analysis.mode,
-        "certified": analysis.passed,
+        "certified": analysis.passed and not analysis.scope.incremental,
+        "scope_certified": analysis.passed,
         "ready_for_full": analysis.ready_for_full,
         "exit_code": exit_code,
         "repository": analysis.root,
@@ -259,6 +281,19 @@ def analysis_state(
         "artifacts": {"html": str(html_path), "state": str(state_path)},
         "rerun_command": analysis.rerun_command,
         "full_rerun_command": gate.without_fast_flag(analysis.rerun_command or ""),
+        "scope": {
+            "kind": analysis.scope.kind,
+            "reference": analysis.scope.reference,
+            "changed_files": list(analysis.scope.paths),
+        },
+        "metrics": {
+            "certified": bool(
+                analysis.functions and quality_gate and quality_gate.passed
+            ),
+            "functions": [function_measurement(item) for item in analysis.functions],
+            "files": [file_measurement(item) for item in analysis.files],
+        },
+        "thresholds": analysis.thresholds,
         "gates": [
             {
                 "key": result.key,
@@ -298,6 +333,8 @@ def analysis_state(
             ),
             "functions_total": len(analysis.functions),
             "functions_failing": len(failing_functions),
+            "files_total": len(analysis.files),
+            "files_failing_loc": sum(not item.passed for item in analysis.files),
             "mutants_total": len(analysis.mutations),
             "mutants_surviving": len(survivors),
             "mutants_static": sum(
@@ -316,7 +353,14 @@ def analysis_state(
                 for item in analysis.gates
                 if item.applicable and not item.deferred and not item.passed
             ],
-            "functions": [function_failure(item) for item in failing_functions[:200]],
+            "functions": [
+                function_measurement(item) for item in failing_functions[:200]
+            ],
+            "files": [
+                file_measurement(item)
+                for item in analysis.files
+                if not item.passed
+            ][:200],
             "surviving_mutants": [mutation_failure(item) for item in survivors[:200]],
             "dependencies": [dependency_failure(item) for item in violations[:200]],
             "tool_setup": [
@@ -349,7 +393,12 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 def error_report(
-    gate: ModuleType, root: Path, message: str, command: str, fast: bool
+    gate: ModuleType,
+    root: Path,
+    message: str,
+    command: str,
+    fast: bool,
+    scope: Any,
 ) -> Any:
     return gate.AnalysisReport(
         root=str(root),
@@ -377,6 +426,7 @@ def error_report(
         notes=["The run stopped before all gates could be evaluated."],
         rerun_command=command,
         mode="fast" if fast else "full",
+        scope=scope,
     )
 
 
@@ -384,6 +434,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root")
     parser.add_argument("--config", help="quality-gate JSON configuration")
+    parser.add_argument("--thresholds", help="quality-threshold JSON configuration")
     output = parser.add_mutually_exclusive_group()
     output.add_argument(
         "--artifact-dir",
@@ -396,6 +447,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gate-script",
         help="alternate repo_quality_gate.py engine (for development)",
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--commit",
+        nargs="?",
+        const="HEAD",
+        metavar="REF",
+        help="gate production files changed by one commit (default REF: HEAD)",
+    )
+    scope.add_argument(
+        "--local-changes",
+        action="store_true",
+        help="gate production files in staged, unstaged, and untracked changes",
     )
     parser.add_argument(
         "--max-mutants",
@@ -429,6 +493,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run_locked(args: argparse.Namespace, root: Path) -> int:
     explicit_config = args.config is not None
     config_path = resolve_from_root(args.config, root, root / ".quality-gate.json")
+    explicit_thresholds = args.thresholds is not None
+    thresholds_path = resolve_from_root(
+        args.thresholds, root, root / ".quality-thresholds.json"
+    )
     explicit_artifacts = args.artifact_dir is not None
     explicit_html = args.html is not None
     if explicit_html:
@@ -444,6 +512,11 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
     explicit_gate_script = args.gate_script is not None
     gate_script = resolve_from_root(args.gate_script, root, DEFAULT_GATE_SCRIPT)
     state_path = artifact_dir / "quality-gate-state.json"
+    scope_arguments = (
+        ["--commit", args.commit]
+        if args.commit
+        else (["--local-changes"] if args.local_changes else [])
+    )
 
     try:
         gate = load_gate(gate_script)
@@ -451,23 +524,45 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
+    if not explicit_thresholds and not thresholds_path.exists():
+        thresholds_path = gate.bundled_thresholds_path()
+
     command = build_rerun_command(
         root,
         config_path,
         explicit_config,
+        thresholds_path,
+        explicit_thresholds,
         artifact_dir,
         explicit_artifacts,
         html_path,
         explicit_html,
         gate_script,
         explicit_gate_script,
+        scope_arguments,
         args.no_install,
         args.fast,
         args.mutation_workers,
     )
     run_error: str | None = None
+    if args.commit:
+        scope = gate.GateScope("commit", reference=args.commit)
+    elif args.local_changes:
+        scope = gate.GateScope("local_changes")
+    else:
+        scope = gate.repository_scope()
     try:
-        config, notes = gate.load_config(config_path if config_path.exists() else None)
+        if args.commit:
+            scope = gate.commit_scope(root, args.commit)
+        elif args.local_changes:
+            scope = gate.local_changes_scope(root)
+        else:
+            scope = gate.repository_scope()
+        thresholds, threshold_notes = gate.load_thresholds(thresholds_path)
+        config, notes = gate.load_config(
+            config_path if config_path.exists() else None, thresholds
+        )
+        notes = [*threshold_notes, *notes]
         if args.no_install:
             config["tools"]["auto_install"] = False
         analysis = gate.run(
@@ -478,12 +573,14 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
             notes,
             fast=args.fast,
             cli_mutation_workers=args.mutation_workers,
+            scope=scope,
+            thresholds=thresholds,
         )
         analysis.rerun_command = command
         exit_code = 0 if analysis.passed else 1
     except (OSError, ValueError, KeyError, TypeError) as error:
         run_error = str(error)
-        analysis = error_report(gate, root, run_error, command, args.fast)
+        analysis = error_report(gate, root, run_error, command, args.fast, scope)
         exit_code = 2
 
     artifact_dir.mkdir(parents=True, exist_ok=True)

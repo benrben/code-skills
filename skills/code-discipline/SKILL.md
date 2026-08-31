@@ -1,6 +1,6 @@
 ---
 name: code-discipline
-description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, YAGNI-restrained design, and an executable repository-quality loop when strict formatting, lint, types, contracts, coverage, mutation, dead-code, flaky-test, or dependency gates are requested.
+description: Engineering discipline for any programming language. Use whenever code is being written, reviewed, refactored, debugged, tested, or designed — even when the user never says "clean code". It enforces behavior-preserving refactors (error paths included), minimal fixes that cover their own edge cases, regression tests proven to fail on unfixed code, decided failure behavior for every new I/O path, severity-ordered reviews that cite the principle behind each finding, YAGNI-restrained design, and an executable repository-quality loop when strict formatting, lint, types, contracts, coverage, complexity, file LOC, mutation, dead-code, flaky-test, or module-boundary gates are requested.
 ---
 
 # The Zen of Modern Development
@@ -28,6 +28,45 @@ target repository root:
 ```bash
 python3 <skill-directory>/scripts/quality_loop.py --root .
 ```
+
+When asked to set up a repository for these gates, read
+[references/repository-setup.md](references/repository-setup.md) completely and
+follow its detection-first bootstrap. The repository's commands and adapters
+belong in `.quality-gate.json`; all numeric goals belong in
+`.quality-thresholds.json`. `repo_quality_gate.py --init` creates both files.
+The bundled [quality-thresholds.json](quality-thresholds.json) is the source of
+defaults, including `file_loc.max_lines: 1000`. A repository-local thresholds
+file takes precedence; `--thresholds PATH` selects an explicit one. Do not copy
+threshold numbers into `.quality-gate.json`.
+
+When asked to update the shared skill or a standalone runner from GitHub, use
+`python3 <checkout>/repo_quality_gate.py --update-from-github [REF]`. A shared
+checkout updates with `git pull --ff-only`; a standalone copy validates and
+atomically replaces the runner and bundled defaults. Stop if the shared checkout
+is dirty. Never overwrite repository-owned `.quality-gate.json`,
+`.quality-thresholds.json`, or `.quality-dependencies.json` during an update.
+
+Choose the Git scope before choosing fast or full execution:
+
+- While implementing or reviewing uncommitted work, run
+  `--local-changes --fast`. It selects staged, unstaged, and untracked
+  production files. Before
+  handing off those changes, rerun `--local-changes` without `--fast` when the
+  user asked for a complete incremental gate.
+- When the user asks to check a commit, a committed diff, or a per-commit CI
+  gate, run `--commit [REF]`; omitting `REF` selects `HEAD`. Use `--fast` only
+  for diagnosis, then preserve `--commit` in the full rerun.
+- When the user asks whether the repository is ready to ship, requests release
+  certification or whole-repository hardening, or no trustworthy Git scope is
+  available, omit both incremental flags and run the repository scope.
+
+`--commit` and `--local-changes` are mutually exclusive. Incremental scopes
+limit function metrics, complexity, mutation, dependency analysis, and inferred
+file-aware formatter/linter commands to selected production files. Complete
+tests and configured project commands retain their declared repository scope so
+changed code is still checked against unchanged callers. An incremental pass
+certifies only its selected scope; never report it as whole-repository release
+certification.
 
 During repair iterations, add `--fast`. Fast mode executes every static gate
 and one complete tests/coverage/CRAAP pass, but defers flaky-test repetitions
@@ -72,7 +111,9 @@ Coverage and CRAAP analysis always run when their adapters are available. If
 the baseline test suite is red, preserve those measurements as diagnostic
 evidence and repair the tests; do not claim the metrics are certified. Flaky
 and mutation results require a green unmodified baseline and remain blocked
-until it passes.
+until it passes. Agent runs expose every available function measurement in
+`quality-gate-state.json` under `metrics.functions`; check `metrics.certified`
+before treating those values as certification evidence.
 
 Before the first run, inspect and preserve existing worktree changes. Do not
 run mutation analysis concurrently with another process writing source files.
@@ -80,11 +121,14 @@ If `.quality-dependencies.json` is missing, derive its modules and permitted
 directions from the intended architecture after reading the repository; never
 bless accidental imports as the specification.
 
-The finish conditions are zero formatter/linter/type/contract/dead-code
+For repository scope, the finish conditions are zero formatter/linter/type/contract/dead-code
 violations where those checks apply; a passing and repeatable full test suite;
-100% executable-line coverage and CRAAP ≤ 6 for every production function;
+the configured coverage, complexity, and CRAAP goals for every production
+function; every production file at or below the configured File LOC maximum;
 zero surviving operator mutants; and zero module ownership or direction
-violations. Never lower thresholds, disable a gate, cap the final mutation run,
+violations. For an incremental scope, apply the file-based conditions to every
+selected production file and still require every executed repository command to
+pass. Never lower thresholds, disable a gate, cap the final mutation run,
 skip tests, weaken assertions, add suppressions or exclusions, broaden an
 allow-list merely to pass, or replace a command with a no-op. Continue until
 the core exits `0`, then report every applicable summary and the state/report

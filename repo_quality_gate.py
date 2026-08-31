@@ -36,13 +36,20 @@ import threading
 import time
 import tokenize
 from typing import Any, Iterable, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 
-VERSION = "3.6.0"
+VERSION = "3.10.0"
 CONFIG_NAME = ".quality-gate.json"
+THRESHOLDS_NAME = ".quality-thresholds.json"
 DEFAULT_REPORT = "quality-gate-report.html"
 STRYKER_VERSION = "9.6.1"
+GITHUB_REPOSITORY = "benrben/code-skills"
+GITHUB_DEFAULT_REF = "main"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
 JAVASCRIPT_MUTATION_EXTENSIONS = {
     ".js",
     ".jsx",
@@ -66,6 +73,23 @@ STRYKER_EXCLUDED_MUTATORS = [
     "UnaryOperator",
     "UpdateOperator",
 ]
+
+THRESHOLD_KEYS = {
+    "format_lint": {"max_violations"},
+    "types": {"max_errors"},
+    "contracts": {"max_violations"},
+    "metrics": {
+        "max_test_failures",
+        "coverage_limit",
+        "complexity_limit",
+        "craap_limit",
+    },
+    "file_loc": {"max_lines"},
+    "dead_code": {"max_findings"},
+    "flaky_tests": {"runs", "max_failures"},
+    "mutation": {"max_surviving_mutants"},
+    "dependencies": {"max_violations"},
+}
 
 SOURCE_EXTENSIONS = {
     ".py",
@@ -169,6 +193,11 @@ DEFAULT_TEST_PATTERNS = (
     "**/__tests__/**",
     "**/*_test.*",
     "**/test_*.*",
+    "test.*",
+    "**/test.*",
+    "test-d.*",
+    "**/test-d.*",
+    "**/*.test-d.*",
     "**/*.test.*",
     "**/*.spec.*",
 )
@@ -264,14 +293,27 @@ class FunctionMetric:
     craap_score: float
     parser: str
     coverage_limit: float = 100.0
+    complexity_limit: float = 6.0
     craap_limit: float = 6.0
 
     @property
     def passed(self) -> bool:
         return (
             self.coverage_percent >= self.coverage_limit
+            and self.complexity <= self.complexity_limit
             and self.craap_score <= self.craap_limit
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class FileLineMetric:
+    path: str
+    lines: int
+    limit: int
+
+    @property
+    def passed(self) -> bool:
+        return self.lines <= self.limit
 
 
 @dataclasses.dataclass
@@ -342,6 +384,32 @@ class ToolContext:
         return {"PYTHONPATH": value}
 
 
+@dataclasses.dataclass(frozen=True)
+class GateScope:
+    kind: str
+    paths: tuple[str, ...] = ()
+    reference: str | None = None
+
+    @property
+    def incremental(self) -> bool:
+        return self.kind != "repository"
+
+    def includes(self, relative_path: str) -> bool:
+        return not self.incremental or relative_path in self.paths
+
+    @property
+    def description(self) -> str:
+        if self.kind == "commit":
+            return f"commit {self.reference or 'HEAD'}"
+        if self.kind == "local_changes":
+            return "local changes"
+        return "the entire repository"
+
+
+def repository_scope() -> GateScope:
+    return GateScope("repository")
+
+
 @dataclasses.dataclass
 class AnalysisReport:
     root: str
@@ -353,8 +421,11 @@ class AnalysisReport:
     dependency_violations: list[DependencyViolation]
     tool_setup: list[CommandResult]
     notes: list[str]
+    files: list[FileLineMetric] = dataclasses.field(default_factory=list)
+    thresholds: dict[str, Any] = dataclasses.field(default_factory=dict)
     rerun_command: str | None = None
     mode: str = "full"
+    scope: GateScope = dataclasses.field(default_factory=repository_scope)
 
     @property
     def passed(self) -> bool:
@@ -384,8 +455,348 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return result
 
 
-def default_config() -> dict[str, Any]:
-    return {
+def validate_update_ref(reference: str) -> str:
+    if (
+        not reference
+        or reference.startswith("/")
+        or ".." in reference.split("/")
+        or not re.fullmatch(r"[A-Za-z0-9._/-]+", reference)
+    ):
+        raise ValueError(
+            "GitHub update ref may contain only letters, digits, '.', '_', '-', and '/'"
+        )
+    return reference
+
+
+def github_raw_url(reference: str, relative_path: str) -> str:
+    safe_reference = quote(validate_update_ref(reference), safe="/")
+    safe_path = quote(relative_path, safe="/")
+    return f"{GITHUB_RAW_BASE}/{safe_reference}/{safe_path}"
+
+
+def download_update_file(url: str, maximum_bytes: int) -> bytes:
+    request = Request(url, headers={"User-Agent": f"repo-quality-gate/{VERSION}"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = response.read(maximum_bytes + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        raise ValueError(f"Could not download {url}: {error}") from error
+    if len(payload) > maximum_bytes:
+        raise ValueError(f"Downloaded file exceeds the {maximum_bytes}-byte limit: {url}")
+    return payload
+
+
+def downloaded_runner_version(payload: bytes) -> str:
+    try:
+        source = payload.decode("utf-8")
+        tree = ast.parse(source, filename="downloaded repo_quality_gate.py")
+        compile(tree, "downloaded repo_quality_gate.py", "exec")
+    except (UnicodeDecodeError, SyntaxError, ValueError) as error:
+        raise ValueError(f"The downloaded runner is not valid Python: {error}") from error
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                return node.value.value
+    raise ValueError("The downloaded runner does not declare a string VERSION")
+
+
+def validate_downloaded_thresholds(payload: bytes) -> None:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"The downloaded thresholds are not valid JSON: {error}") from error
+    if not isinstance(value, dict) or not isinstance(value.get("schema_version"), int):
+        raise ValueError(
+            "The downloaded thresholds must be a JSON object with schema_version"
+        )
+
+
+def atomic_replace_bytes(path: Path, payload: bytes, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".update"
+    )
+    try:
+        with os.fdopen(handle, "wb") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if mode is not None:
+            os.chmod(temporary_name, mode)
+        os.replace(temporary_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+
+
+def install_standalone_release(
+    runner_path: Path,
+    bundled_thresholds_path: Path,
+    runner_payload: bytes,
+    thresholds_payload: bytes,
+) -> str:
+    version = downloaded_runner_version(runner_payload)
+    validate_downloaded_thresholds(thresholds_payload)
+    original_runner = runner_path.read_bytes() if runner_path.exists() else None
+    original_thresholds = (
+        bundled_thresholds_path.read_bytes()
+        if bundled_thresholds_path.exists()
+        else None
+    )
+    runner_mode = (
+        runner_path.stat().st_mode & 0o777 if runner_path.exists() else 0o755
+    )
+    thresholds_mode = (
+        bundled_thresholds_path.stat().st_mode & 0o777
+        if bundled_thresholds_path.exists()
+        else 0o644
+    )
+    try:
+        atomic_replace_bytes(
+            bundled_thresholds_path, thresholds_payload, thresholds_mode
+        )
+        atomic_replace_bytes(runner_path, runner_payload, runner_mode)
+    except OSError as error:
+        if original_thresholds is None:
+            with contextlib.suppress(FileNotFoundError):
+                bundled_thresholds_path.unlink()
+        else:
+            atomic_replace_bytes(
+                bundled_thresholds_path, original_thresholds, thresholds_mode
+            )
+        if original_runner is not None:
+            atomic_replace_bytes(runner_path, original_runner, runner_mode)
+        raise ValueError(f"Could not install the downloaded release: {error}") from error
+    return version
+
+
+def normalized_git_remote(value: str) -> str:
+    normalized = value.strip().removesuffix(".git").removesuffix("/")
+    if normalized.startswith("git@github.com:"):
+        normalized = "https://github.com/" + normalized.removeprefix(
+            "git@github.com:"
+        )
+    return normalized.lower()
+
+
+def shared_checkout_root(runner_path: Path) -> Path | None:
+    if not shutil.which("git"):
+        return None
+    root_result = subprocess.run(
+        ["git", "-C", str(runner_path.parent), "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if root_result.returncode != 0:
+        return None
+    root = Path(root_result.stdout.strip()).resolve()
+    if runner_path.resolve() != root / "repo_quality_gate.py":
+        return None
+    remote_result = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    expected = normalized_git_remote(f"https://github.com/{GITHUB_REPOSITORY}")
+    if (
+        remote_result.returncode != 0
+        or normalized_git_remote(remote_result.stdout) != expected
+    ):
+        return None
+    return root
+
+
+def update_from_github(runner_path: Path, reference: str) -> int:
+    reference = validate_update_ref(reference)
+    checkout = shared_checkout_root(runner_path)
+    if checkout:
+        dirty = subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if dirty.returncode != 0:
+            print(dirty.stderr.strip() or "error: git status failed", file=sys.stderr)
+            return 2
+        if dirty.stdout.strip():
+            print(
+                "error: shared code-skills checkout has local changes; commit or stash them before updating",
+                file=sys.stderr,
+            )
+            return 2
+        completed = subprocess.run(
+            ["git", "-C", str(checkout), "pull", "--ff-only", "origin", reference],
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return 2
+        print(f"Updated shared code-skills checkout from GitHub ref {reference}.")
+        print("All repositories symlinked to this checkout now use the update.")
+        return 0
+
+    runner_url = github_raw_url(reference, "repo_quality_gate.py")
+    thresholds_url = github_raw_url(
+        reference, "skills/code-discipline/quality-thresholds.json"
+    )
+    try:
+        runner_payload = download_update_file(runner_url, 2_000_000)
+        thresholds_payload = download_update_file(thresholds_url, 100_000)
+        version = install_standalone_release(
+            runner_path,
+            runner_path.parent / "quality-thresholds.json",
+            runner_payload,
+            thresholds_payload,
+        )
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(f"Updated standalone repository quality gate to {version} from {reference}.")
+    print(
+        f"Preserved repository-owned {CONFIG_NAME}, {THRESHOLDS_NAME}, and .quality-dependencies.json files."
+    )
+    return 0
+
+
+def bundled_thresholds_path() -> Path:
+    directory = Path(__file__).resolve().parent
+    candidates = (
+        directory / "skills" / "code-discipline" / "quality-thresholds.json",
+        directory / "quality-thresholds.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise ValueError(
+        "Bundled quality thresholds were not found. Copy quality-thresholds.json "
+        "beside repo_quality_gate.py or pass --thresholds PATH."
+    )
+
+
+def threshold_number(
+    thresholds: dict[str, Any], section: str, key: str
+) -> int | float:
+    value = thresholds.get(section, {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Threshold {section}.{key} must be a number")
+    return value
+
+
+def validate_thresholds(thresholds: dict[str, Any]) -> None:
+    expected_root = {"schema_version", *THRESHOLD_KEYS}
+    unknown_root = sorted(set(thresholds) - expected_root)
+    missing_root = sorted(expected_root - set(thresholds))
+    if unknown_root or missing_root:
+        problems = []
+        if missing_root:
+            problems.append(f"missing keys: {', '.join(missing_root)}")
+        if unknown_root:
+            problems.append(f"unknown keys: {', '.join(unknown_root)}")
+        raise ValueError("Invalid threshold file (" + "; ".join(problems) + ")")
+    if thresholds["schema_version"] != 1:
+        raise ValueError("Threshold schema_version must be 1")
+    for section, keys in THRESHOLD_KEYS.items():
+        value = thresholds.get(section)
+        if not isinstance(value, dict):
+            raise ValueError(f"Threshold section {section} must be a JSON object")
+        unknown = sorted(set(value) - keys)
+        missing = sorted(keys - set(value))
+        if unknown or missing:
+            problems = []
+            if missing:
+                problems.append(f"missing keys: {', '.join(missing)}")
+            if unknown:
+                problems.append(f"unknown keys: {', '.join(unknown)}")
+            raise ValueError(
+                f"Invalid threshold section {section} (" + "; ".join(problems) + ")"
+            )
+        for key in keys:
+            number = threshold_number(thresholds, section, key)
+            if number < 0:
+                raise ValueError(f"Threshold {section}.{key} cannot be negative")
+    coverage = threshold_number(thresholds, "metrics", "coverage_limit")
+    if coverage > 100:
+        raise ValueError("Threshold metrics.coverage_limit cannot exceed 100")
+    if threshold_number(thresholds, "file_loc", "max_lines") < 1:
+        raise ValueError("Threshold file_loc.max_lines must be at least 1")
+    if threshold_number(thresholds, "flaky_tests", "runs") < 2:
+        raise ValueError("Threshold flaky_tests.runs must be at least 2")
+    integer_paths = (
+        ("format_lint", "max_violations"),
+        ("types", "max_errors"),
+        ("contracts", "max_violations"),
+        ("metrics", "max_test_failures"),
+        ("file_loc", "max_lines"),
+        ("dead_code", "max_findings"),
+        ("flaky_tests", "runs"),
+        ("flaky_tests", "max_failures"),
+        ("mutation", "max_surviving_mutants"),
+        ("dependencies", "max_violations"),
+    )
+    for section, key in integer_paths:
+        if not isinstance(thresholds[section][key], int):
+            raise ValueError(f"Threshold {section}.{key} must be an integer")
+    zero_only_paths = (
+        ("format_lint", "max_violations"),
+        ("types", "max_errors"),
+        ("contracts", "max_violations"),
+        ("metrics", "max_test_failures"),
+        ("dead_code", "max_findings"),
+        ("flaky_tests", "max_failures"),
+        ("mutation", "max_surviving_mutants"),
+        ("dependencies", "max_violations"),
+    )
+    for section, key in zero_only_paths:
+        if thresholds[section][key] != 0:
+            raise ValueError(
+                f"Threshold {section}.{key} must remain 0 for certification"
+            )
+
+
+def load_thresholds(path: Path) -> tuple[dict[str, Any], list[str]]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read thresholds {path}: {error}") from error
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Threshold file {path} must contain a JSON object")
+    validate_thresholds(loaded)
+    return loaded, [f"Loaded quality thresholds from {path}"]
+
+
+def default_thresholds() -> dict[str, Any]:
+    thresholds, _ = load_thresholds(bundled_thresholds_path())
+    return thresholds
+
+
+def threshold_config(thresholds: dict[str, Any]) -> dict[str, Any]:
+    validate_thresholds(thresholds)
+    return {key: value for key, value in thresholds.items() if key != "schema_version"}
+
+
+def without_threshold_values(config: dict[str, Any]) -> dict[str, Any]:
+    result = deep_merge({}, config)
+    for section, keys in THRESHOLD_KEYS.items():
+        values = result.get(section)
+        if not isinstance(values, dict):
+            continue
+        for key in keys:
+            values.pop(key, None)
+        if not values:
+            result.pop(section, None)
+    return result
+
+
+def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = {
         "source": {
             "include": [],
             "exclude": list(DEFAULT_TEST_PATTERNS),
@@ -423,8 +834,6 @@ def default_config() -> dict[str, Any]:
             "coverage_commands": [],
             "coverage_report": None,
             "coverage_format": "auto",
-            "craap_limit": 6,
-            "coverage_limit": 100,
         },
         "mutation": {
             "enabled": True,
@@ -449,7 +858,6 @@ def default_config() -> dict[str, Any]:
         },
         "flaky_tests": {
             "enabled": True,
-            "runs": 3,
             "timeout_seconds": 600,
         },
         "dependencies": {
@@ -460,6 +868,7 @@ def default_config() -> dict[str, Any]:
         },
         "tools": {"auto_install": True, "cache_dir": None},
     }
+    return deep_merge(base, threshold_config(thresholds or default_thresholds()))
 
 
 def normalize_path(path: Path, root: Path) -> str:
@@ -469,9 +878,12 @@ def normalize_path(path: Path, root: Path) -> str:
         return path.resolve().as_posix()
 
 
-def load_config(path: Path | None) -> tuple[dict[str, Any], list[str]]:
+def load_config(
+    path: Path | None, thresholds: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], list[str]]:
     notes: list[str] = []
-    config = default_config()
+    active_thresholds = thresholds or default_thresholds()
+    config = default_config(active_thresholds)
     if path and path.exists():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -480,6 +892,7 @@ def load_config(path: Path | None) -> tuple[dict[str, Any], list[str]]:
         if not isinstance(loaded, dict):
             raise ValueError(f"Configuration {path} must contain a JSON object")
         config = deep_merge(config, loaded)
+        config = deep_merge(config, threshold_config(active_thresholds))
         notes.append(f"Loaded configuration from {path}")
     else:
         notes.append("No configuration file found; using runtime auto-detection")
@@ -681,6 +1094,74 @@ def is_file_within(path: Path, root: Path) -> bool:
         return False
 
 
+def git_changed_paths(root: Path, arguments: Sequence[str]) -> tuple[str, ...]:
+    if not shutil.which("git"):
+        raise ValueError("Git is required for an incremental quality-gate scope.")
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments, "-z"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        output = result.stderr.decode(errors="replace").strip()
+        raise ValueError(output or "Git could not determine the changed files.")
+    paths: set[str] = set()
+    for raw_path in result.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = Path(os.fsdecode(raw_path))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Git returned a path outside the repository: {relative}")
+        paths.add(relative.as_posix())
+    return tuple(sorted(paths))
+
+
+def git_revision(root: Path, reference: str) -> str:
+    if not shutil.which("git"):
+        raise ValueError("Git is required for an incremental quality-gate scope.")
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{reference}^{{commit}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        output = result.stderr.strip()
+        raise ValueError(output or f"Git commit does not exist: {reference}")
+    return result.stdout.strip()
+
+
+def commit_scope(root: Path, reference: str = "HEAD") -> GateScope:
+    revision = git_revision(root, reference)
+    parent = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{revision}^1"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if parent.returncode == 0:
+        paths = git_changed_paths(
+            root,
+            ["diff", "--name-only", parent.stdout.strip(), revision],
+        )
+    else:
+        paths = git_changed_paths(
+            root,
+            ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", revision],
+        )
+    return GateScope("commit", paths, reference)
+
+
+def local_changes_scope(root: Path) -> GateScope:
+    unstaged = git_changed_paths(root, ["diff", "--name-only"])
+    staged = git_changed_paths(root, ["diff", "--cached", "--name-only"])
+    untracked = git_changed_paths(root, ["ls-files", "--others", "--exclude-standard"])
+    return GateScope("local_changes", tuple(sorted({*unstaged, *staged, *untracked})))
+
+
 def matches_any(relative: str, patterns: Sequence[str]) -> bool:
     path = Path(relative)
     lowered = relative.lower()
@@ -701,7 +1182,12 @@ def matches_any(relative: str, patterns: Sequence[str]) -> bool:
     )
 
 
-def discover_source_files(root: Path, source_config: dict[str, Any]) -> list[Path]:
+def discover_source_files(
+    root: Path,
+    source_config: dict[str, Any],
+    scope: GateScope | None = None,
+) -> list[Path]:
+    scope = scope or repository_scope()
     includes = [str(pattern) for pattern in source_config.get("include", [])]
     excludes = [str(pattern) for pattern in source_config.get("exclude", [])]
     extensions = {
@@ -711,6 +1197,8 @@ def discover_source_files(root: Path, source_config: dict[str, Any]) -> list[Pat
     result: list[Path] = []
     for path in walk_files(root):
         relative = normalize_path(path, root)
+        if not scope.includes(relative):
+            continue
         if path.name in {Path(__file__).name, DEFAULT_REPORT}:
             continue
         if includes:
@@ -722,6 +1210,50 @@ def discover_source_files(root: Path, source_config: dict[str, Any]) -> list[Pat
             continue
         result.append(path)
     return sorted(result)
+
+
+def physical_line_count(path: Path) -> int:
+    with path.open("r", encoding="utf-8", errors="replace", newline=None) as source:
+        return sum(1 for _ in source)
+
+
+def file_loc_prompt(metric: FileLineMetric) -> str:
+    return f"""Split the oversized production file `{metric.path}` ({metric.lines} physical lines; required maximum: {metric.limit}).
+
+Read the file, its callers, tests, and module-boundary rules before editing. Extract cohesive responsibilities behind honest names while preserving public behavior, signatures, imports, initialization order, and error paths. Keep dependency direction inward and avoid creating a generic dumping-ground module. Run focused tests after each extraction, then the complete repository quality gate. Do not change the File LOC threshold, exclude the file, or compress multiple statements onto fewer lines."""
+
+
+def run_file_loc_gate(
+    root: Path,
+    source_files: Sequence[Path],
+    config: dict[str, Any],
+) -> tuple[GateResult, list[FileLineMetric]]:
+    limit = int(config["max_lines"])
+    files = sorted(
+        (
+            FileLineMetric(normalize_path(path, root), physical_line_count(path), limit)
+            for path in source_files
+        ),
+        key=lambda item: (-item.lines, item.path),
+    )
+    failures = [item for item in files if not item.passed]
+    if failures:
+        return GateResult(
+            "file_loc",
+            "File LOC",
+            False,
+            f"{len(failures)} of {len(files)} production files exceed {limit} physical lines.",
+            [f"{item.path}: {item.lines} lines" for item in failures],
+            prompts=[
+                (f"Split {item.path}", file_loc_prompt(item)) for item in failures
+            ],
+        ), files
+    return GateResult(
+        "file_loc",
+        "File LOC",
+        True,
+        f"All {len(files)} production files are at or below {limit} physical lines.",
+    ), files
 
 
 def read_package_json(root: Path) -> dict[str, Any]:
@@ -1063,8 +1595,12 @@ def project_config_contains(root: Path, text: str) -> bool:
 
 
 def infer_format_lint_commands(
-    root: Path, source_files: Sequence[Path], tools: ToolContext
+    root: Path,
+    source_files: Sequence[Path],
+    tools: ToolContext,
+    scope: GateScope | None = None,
 ) -> list[CheckCommand]:
+    scope = scope or repository_scope()
     commands: list[CheckCommand] = []
     lint = first_package_script(root, ("lint:check", "check:lint", "lint"))
     formatting = first_package_script(
@@ -1085,8 +1621,20 @@ def infer_format_lint_commands(
         "eslint.config.cjs",
     )
     eslint = executable(root, "eslint")
-    if not lint and eslint and any((root / name).exists() for name in eslint_configs):
-        commands.append(CheckCommand([eslint, "."]))
+    javascript_files = [
+        normalize_path(path, root)
+        for path in source_files
+        if path.suffix.lower() in JAVASCRIPT_MUTATION_EXTENSIONS
+    ]
+    if (
+        not lint
+        and eslint
+        and javascript_files
+        and any((root / name).exists() for name in eslint_configs)
+    ):
+        commands.append(
+            CheckCommand([eslint, *(javascript_files if scope.incremental else ["."])])
+        )
     prettier = executable(root, "prettier")
     prettier_configs = (
         ".prettierrc",
@@ -1098,9 +1646,15 @@ def infer_format_lint_commands(
     if (
         not formatting
         and prettier
+        and source_files
         and any((root / name).exists() for name in prettier_configs)
     ):
-        commands.append(CheckCommand([prettier, "--check", "."]))
+        prettier_targets = (
+            [normalize_path(path, root) for path in source_files]
+            if scope.incremental
+            else ["."]
+        )
+        commands.append(CheckCommand([prettier, "--check", *prettier_targets]))
 
     has_python = any(path.suffix.lower() in {".py", ".pyi"} for path in source_files)
     has_ruff_config = any(
@@ -1111,10 +1665,28 @@ def infer_format_lint_commands(
         and has_ruff_config
         and _python_module_available(tools.python, "ruff", root, tools.python_env)
     ):
+        python_targets = (
+            [
+                normalize_path(path, root)
+                for path in source_files
+                if path.suffix.lower() in {".py", ".pyi"}
+            ]
+            if scope.incremental
+            else ["."]
+        )
         commands.extend(
             [
-                CheckCommand([tools.python, "-m", "ruff", "check", "."]),
-                CheckCommand([tools.python, "-m", "ruff", "format", "--check", "."]),
+                CheckCommand([tools.python, "-m", "ruff", "check", *python_targets]),
+                CheckCommand(
+                    [
+                        tools.python,
+                        "-m",
+                        "ruff",
+                        "format",
+                        "--check",
+                        *python_targets,
+                    ]
+                ),
             ]
         )
     go_files = [path for path in source_files if path.suffix.lower() == ".go"]
@@ -1621,6 +2193,7 @@ def load_normalized_metrics(
     path: Path,
     root: Path,
     coverage_limit: float = 100.0,
+    complexity_limit: float = 6.0,
     craap_limit: float = 6.0,
 ) -> list[FunctionMetric]:
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -1651,6 +2224,7 @@ def load_normalized_metrics(
                 craap_score=score,
                 parser=str(row.get("parser", "adapter")),
                 coverage_limit=coverage_limit,
+                complexity_limit=complexity_limit,
                 craap_limit=craap_limit,
             )
         )
@@ -2060,6 +2634,7 @@ def build_function_metrics(
     root: Path,
     coverage: dict[str, dict[int, int]],
     coverage_limit: float = 100.0,
+    complexity_limit: float = 6.0,
     craap_limit: float = 6.0,
     external_functions: dict[str, list[tuple[str, int, int, int, str]]] | None = None,
 ) -> list[FunctionMetric]:
@@ -2091,6 +2666,7 @@ def build_function_metrics(
                     craap_score=craap_score(complexity, percent),
                     parser=parser,
                     coverage_limit=coverage_limit,
+                    complexity_limit=complexity_limit,
                     craap_limit=craap_limit,
                 )
             )
@@ -2191,9 +2767,76 @@ Current evidence:
 - line coverage: {function.coverage_percent:.2f}% ({function.covered_lines}/{function.total_lines})
 - cyclomatic complexity: {function.complexity}
 - CRAAP score: {function.craap_score:.2f}
-- required: {function.coverage_limit:g}% coverage and CRAAP <= {function.craap_limit:g}
+- required: {function.coverage_limit:g}% coverage, complexity <= {function.complexity_limit:g}, and CRAAP <= {function.craap_limit:g}
 
 Read the function, its callers, and neighboring tests. Add behavior-focused tests for every uncovered path, then simplify control flow without changing behavior until complexity and CRAAP satisfy the threshold. Preserve error paths and public contracts. Run the repository's real coverage command and report the exact before/after metrics; do not exclude lines, weaken assertions, or mock the function under test."""
+
+
+def report_fingerprint(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def report_was_refreshed(
+    path: Path, previous_fingerprint: tuple[int, int, int] | None
+) -> bool:
+    current_fingerprint = report_fingerprint(path)
+    return (
+        current_fingerprint is not None and current_fingerprint != previous_fingerprint
+    )
+
+
+def failed_metrics_command_gate(
+    summary: str,
+    commands: Sequence[CommandResult],
+    failures: Sequence[CommandResult],
+    repair_kind: str,
+) -> GateResult:
+    return GateResult(
+        "craap",
+        "CRAAP: coverage + complexity",
+        False,
+        summary,
+        [result.stdout for result in failures if result.stdout],
+        list(commands),
+        [
+            (
+                f"Repair {repair_kind}",
+                generic_adapter_prompt(repair_kind, result),
+            )
+            for result in failures
+        ],
+    )
+
+
+def mark_metrics_report_diagnostic(
+    result: GateResult,
+    failures: Sequence[CommandResult],
+    repair_kind: str,
+) -> GateResult:
+    count = len(failures)
+    noun = "command" if count == 1 else "commands"
+    result.passed = False
+    result.summary = (
+        f"{count} {repair_kind} {noun} exited non-zero, but the valid report was "
+        f"parsed diagnostically. {result.summary}"
+    )
+    result.details = [
+        f"Diagnostic report retained after exit {failure.returncode}: "
+        f"{shlex.join(failure.command)}"
+        for failure in failures
+    ] + result.details
+    result.prompts = [
+        (
+            f"Repair {repair_kind}",
+            generic_adapter_prompt(repair_kind, failure),
+        )
+        for failure in failures
+    ] + result.prompts
+    return result
 
 
 def run_metrics_gate(
@@ -2205,11 +2848,19 @@ def run_metrics_gate(
 ) -> tuple[GateResult, list[FunctionMetric]]:
     metrics = config["metrics"]
     coverage_limit = float(metrics.get("coverage_limit", 100))
+    complexity_limit = float(metrics.get("complexity_limit", 6))
     craap_limit = float(metrics.get("craap_limit", metrics.get("complexity_limit", 6)))
     command_results: list[CommandResult] = []
     substitutions = {"root": str(root), "report": str(workspace / "metrics.json")}
     adapter_command = command_list(metrics.get("command"), substitutions)
     report_value = metrics.get("report")
+    metrics_path = (
+        resolve_config_path(substitute_text(str(report_value), substitutions), root)
+        if report_value
+        else None
+    )
+    metrics_report_before = report_fingerprint(metrics_path) if metrics_path else None
+    adapter_failures: list[CommandResult] = []
     if adapter_command:
         command_results.append(
             run_command(
@@ -2220,30 +2871,39 @@ def run_metrics_gate(
             )
         )
         if command_results[-1].returncode != 0:
-            return GateResult(
-                "craap",
-                "CRAAP: coverage + complexity",
-                False,
-                "The metrics adapter failed.",
-                [command_results[-1].stdout],
-                command_results,
-                [
-                    (
-                        "Repair the metrics adapter",
-                        generic_adapter_prompt("metrics", command_results[-1]),
-                    )
-                ],
-            ), []
+            adapter_failures.append(command_results[-1])
+            if not metrics_path or not report_was_refreshed(
+                metrics_path, metrics_report_before
+            ):
+                return failed_metrics_command_gate(
+                    "The metrics adapter failed and did not produce a fresh report.",
+                    command_results,
+                    adapter_failures,
+                    "metrics adapter",
+                ), []
     if report_value:
-        metrics_path = resolve_config_path(
-            substitute_text(str(report_value), substitutions), root
-        )
+        assert metrics_path is not None
         if metrics_path.exists():
             try:
                 functions = load_normalized_metrics(
-                    metrics_path, root, coverage_limit, craap_limit
+                    metrics_path,
+                    root,
+                    coverage_limit,
+                    complexity_limit,
+                    craap_limit,
                 )
-                return finish_metrics_gate(functions, command_results), functions
+                selected_paths = {normalize_path(path, root) for path in source_files}
+                functions = [
+                    function
+                    for function in functions
+                    if function.path in selected_paths
+                ]
+                result = finish_metrics_gate(functions, command_results)
+                if adapter_failures:
+                    result = mark_metrics_report_diagnostic(
+                        result, adapter_failures, "metrics adapter"
+                    )
+                return result, functions
             except (
                 OSError,
                 ValueError,
@@ -2278,12 +2938,24 @@ def run_metrics_gate(
     coverage_report: tuple[Path, str] | None = None
     configured_commands = metrics.get("coverage_commands", [])
     configured_report = metrics.get("coverage_report")
+    coverage_substitutions = {
+        "root": str(root),
+        "report": str(workspace / "coverage.data"),
+    }
+    configured_report_path = (
+        resolve_config_path(
+            substitute_text(str(configured_report), coverage_substitutions), root
+        )
+        if configured_report
+        else None
+    )
+    coverage_report_before = (
+        report_fingerprint(configured_report_path) if configured_report_path else None
+    )
+    coverage_failures: list[CommandResult] = []
     if configured_commands:
         for raw_command in configured_commands:
-            command = command_list(
-                raw_command,
-                {"root": str(root), "report": str(workspace / "coverage.data")},
-            )
+            command = command_list(raw_command, coverage_substitutions)
             if not command:
                 continue
             result = run_command(
@@ -2294,36 +2966,23 @@ def run_metrics_gate(
             )
             command_results.append(result)
             if result.returncode != 0:
-                return GateResult(
-                    "craap",
-                    "CRAAP: coverage + complexity",
-                    False,
-                    "A configured coverage command failed.",
-                    [result.stdout],
-                    command_results,
-                    [("Repair coverage", generic_adapter_prompt("coverage", result))],
-                ), []
-        if configured_report:
+                coverage_failures.append(result)
+        if configured_report_path:
             coverage_report = (
-                resolve_config_path(
-                    substitute_text(
-                        str(configured_report),
-                        {
-                            "root": str(root),
-                            "report": str(workspace / "coverage.data"),
-                        },
-                    ),
-                    root,
-                ),
+                configured_report_path,
                 str(metrics.get("coverage_format", "auto")),
             )
-    elif configured_report:
+    elif configured_report_path:
         coverage_report = (
-            resolve_config_path(str(configured_report), root),
+            configured_report_path,
             str(metrics.get("coverage_format", "auto")),
         )
     else:
         inferred_path = workspace / "coverage.data"
+        discovered_before = discover_coverage_report(root)
+        discovered_before_fingerprint = (
+            report_fingerprint(discovered_before[0]) if discovered_before else None
+        )
         inferred = infer_coverage_commands(root, inferred_path, tools)
         if inferred:
             commands, format_name = inferred
@@ -2336,27 +2995,31 @@ def run_metrics_gate(
                 )
                 command_results.append(result)
                 if result.returncode != 0:
-                    return GateResult(
-                        "craap",
-                        "CRAAP: coverage + complexity",
-                        False,
-                        "The auto-detected coverage command failed.",
-                        [result.stdout],
-                        command_results,
-                        [
-                            (
-                                "Repair coverage",
-                                generic_adapter_prompt("coverage", result),
-                            )
-                        ],
-                    ), []
+                    coverage_failures.append(result)
             if format_name == "lcov" and not inferred_path.exists():
                 discovered = discover_coverage_report(root)
                 coverage_report = discovered
+                if (
+                    discovered_before
+                    and discovered
+                    and discovered_before[0] == discovered[0]
+                ):
+                    coverage_report_before = discovered_before_fingerprint
             else:
                 coverage_report = (inferred_path, format_name)
         else:
             coverage_report = discover_coverage_report(root)
+
+    if coverage_failures and (
+        not coverage_report
+        or not report_was_refreshed(coverage_report[0], coverage_report_before)
+    ):
+        return failed_metrics_command_gate(
+            "Coverage commands failed and did not produce a fresh report.",
+            command_results,
+            coverage_failures,
+            "coverage",
+        ), []
 
     if not coverage_report or not coverage_report[0].exists():
         return GateResult(
@@ -2404,6 +3067,7 @@ def run_metrics_gate(
         root,
         coverage,
         coverage_limit,
+        complexity_limit,
         craap_limit,
         lizard_functions,
     )
@@ -2413,10 +3077,10 @@ def run_metrics_gate(
         if path.suffix.lower() not in {".py", ".pyi"}
         and normalize_path(path, root) not in lizard_functions
     )
-    return (
-        finish_metrics_gate(functions, command_results, heuristic_files),
-        functions,
-    )
+    result = finish_metrics_gate(functions, command_results, heuristic_files)
+    if coverage_failures:
+        result = mark_metrics_report_diagnostic(result, coverage_failures, "coverage")
+    return result, functions
 
 
 def finish_metrics_gate(
@@ -2442,6 +3106,7 @@ def finish_metrics_gate(
             ],
         )
     coverage_limit = functions[0].coverage_limit
+    complexity_limit = functions[0].complexity_limit
     craap_limit = functions[0].craap_limit
     failures = sorted(
         (function for function in functions if not function.passed),
@@ -2491,7 +3156,7 @@ def finish_metrics_gate(
             "craap",
             "CRAAP: coverage + complexity",
             False,
-            f"{len(failures)} of {len(functions)} functions fail {coverage_limit:g}% coverage and CRAAP <= {craap_limit:g}.",
+            f"{len(failures)} of {len(functions)} functions fail {coverage_limit:g}% coverage, complexity <= {complexity_limit:g}, or CRAAP <= {craap_limit:g}.",
             details,
             commands,
             prompts,
@@ -2500,7 +3165,7 @@ def finish_metrics_gate(
         "craap",
         "CRAAP: coverage + complexity",
         True,
-        f"All {len(functions)} functions have {coverage_limit:g}% coverage and CRAAP <= {craap_limit:g}.",
+        f"All {len(functions)} functions have {coverage_limit:g}% coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.",
         [],
         commands,
     )
@@ -3447,7 +4112,9 @@ def run_mutation_gate(
     test_baseline: CommandResult | None = None,
     cli_mutation_workers: str | int | None = None,
     tools: ToolContext | None = None,
+    scope: GateScope | None = None,
 ) -> tuple[GateResult, list[Mutation]]:
+    scope = scope or repository_scope()
     mutation_config = config["mutation"]
     if not mutation_config.get("enabled", True):
         return GateResult(
@@ -3554,6 +4221,14 @@ def run_mutation_gate(
     if max_mutants and len(candidates) > max_mutants:
         candidates = candidates[:max_mutants]
     if not candidates:
+        if scope.incremental:
+            return GateResult(
+                "mutation",
+                "Mutation testing",
+                True,
+                f"Not applicable: no supported mutation candidates were found in the selected {scope.description} production files.",
+                applicable=False,
+            ), []
         return GateResult(
             "mutation",
             "Mutation testing",
@@ -3735,6 +4410,7 @@ def run_dependency_gate(
     config: dict[str, Any],
     source_files: Sequence[Path],
     workspace: Path | None = None,
+    resolution_files: Sequence[Path] | None = None,
 ) -> tuple[GateResult, list[DependencyViolation]]:
     dependency = config["dependencies"]
     rules_path = resolve_config_path(
@@ -3825,6 +4501,8 @@ def run_dependency_gate(
             prompts=[("Fix architecture rules", dependency_spec_prompt(str(error)))],
         ), []
     edges_path_value = dependency.get("edges_report")
+    selected_paths = {normalize_path(path, root) for path in source_files}
+    resolvable_files = resolution_files or source_files
     try:
         if edges_path_value:
             edges = load_dependency_edges(
@@ -3833,11 +4511,12 @@ def run_dependency_gate(
                 ),
                 root,
             )
+            edges = [edge for edge in edges if edge[0] in selected_paths]
         else:
             edges = []
             for source in source_files:
                 for specifier, line in import_specs(source):
-                    target = resolve_import(source, specifier, root, source_files)
+                    target = resolve_import(source, specifier, root, resolvable_files)
                     if target:
                         edges.append((normalize_path(source, root), target, line))
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
@@ -3966,6 +4645,7 @@ def master_fix_prompt(report: AnalysisReport) -> str:
         ),
     )
     survivors = [mutation for mutation in report.mutations if mutation.survived]
+    oversized_files = [file for file in report.files if not file.passed]
     failed_installs = [result for result in report.tool_setup if result.returncode != 0]
     gate_summary = "\n".join(
         f"- {gate.title}: {gate_outcome(gate)} — {gate.summary}"
@@ -3987,6 +4667,13 @@ def master_fix_prompt(report: AnalysisReport) -> str:
         "\n".join(
             f"- {function.path}:{function.start_line} `{function.name}` — coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {function.craap_score:.2f}"
             for function in failing_functions[:50]
+        )
+        or "- None in the current report."
+    )
+    file_summary = (
+        "\n".join(
+            f"- {file.path} — {file.lines} physical lines (maximum {file.limit})"
+            for file in oversized_files[:50]
         )
         or "- None in the current report."
     )
@@ -4012,6 +4699,13 @@ def master_fix_prompt(report: AnalysisReport) -> str:
         f"python3 {shlex.quote(str(Path(__file__).resolve()))} --root ."
     )
     full_command = without_fast_flag(rerun_command)
+    thresholds = report.thresholds or default_thresholds()
+    coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
+    complexity_limit = threshold_number(
+        thresholds, "metrics", "complexity_limit"
+    )
+    craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
+    file_loc_limit = threshold_number(thresholds, "file_loc", "max_lines")
     if report.mode == "fast" and report.ready_for_full:
         objective = """The fast diagnostic checks are green. Do not claim the repository is ready to ship yet. Run the full certification command now; it executes the deferred flaky-test repetitions and exhaustive mutation gate."""
         run_instructions = f"""Run from the repository root:
@@ -4033,6 +4727,8 @@ Required full certification command:
     return f"""You are the lead quality-repair agent for this repository:
 {report.root}
 
+Active gate scope: {report.scope.description}. Incremental scope results apply only to the selected changed production files; repository-wide commands still retain their configured scope.
+
 {objective}
 
 {run_instructions}
@@ -4041,17 +4737,21 @@ Non-negotiable finish conditions:
 1. Every applicable formatter and linter command passes with zero violations.
 2. Every applicable static type checker passes with zero errors.
 3. Every detected or configured contract/schema check passes.
-4. The complete test suite passes; every production function has 100% executable-line coverage and CRAAP <= 6.
-5. Every applicable dead-code detector reports zero findings.
-6. The complete test suite passes consistently across every configured flaky-test run.
-7. The complete test suite kills every generated operator mutant; zero survive.
-8. The dependency checker reports zero ownership or direction-rule violations.
+4. The complete test suite passes; every production function has {coverage_limit:g}% executable-line coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.
+5. Every production file has at most {file_loc_limit:g} physical lines.
+6. Every applicable dead-code detector reports zero findings.
+7. The complete test suite passes consistently across every configured flaky-test run.
+8. The complete test suite kills every generated operator mutant; zero survive.
+9. The dependency checker reports zero ownership or direction-rule violations.
 
 Current gate status:
 {gate_summary}
 
 Highest-priority CRAAP failures ({len(failing_functions)} total; first 50 shown):
 {function_summary}
+
+Oversized production files ({len(oversized_files)} total; first 50 shown):
+{file_summary}
 
 Surviving mutants ({len(survivors)} total; first 50 shown):
 {mutation_summary}
@@ -4069,6 +4769,7 @@ Repair rules:
 - Read neighboring production code and tests before editing.
 - For uncovered behavior or a surviving mutant, add a behavior-focused test through the production API and prove it fails against the unfixed or mutated code.
 - Simplify control flow without changing behavior until each function meets the CRAAP limit. Preserve public contracts and error paths.
+- Split oversized files along cohesive responsibilities without changing public behavior or hiding code through formatting tricks.
 - Fix formatter, lint, type, contract, and dead-code findings in production code; do not hide them with ignore comments, generated baselines, exclusions, or weakened configuration.
 - Eliminate test nondeterminism at its source. Do not use retries or quarantine to conceal flaky behavior.
 - Fix architecture violations by moving responsibility, splitting a mixed module, or inverting the dependency behind an owned interface. Do not broaden rules merely to make the checker green.
@@ -4116,14 +4817,32 @@ def html_report(report: AnalysisReport) -> str:
         status = (
             "READY FOR FULL RUN" if report.ready_for_full else "FAST CHECKS NEED WORK"
         )
-        page_heading = "Fast quality check"
+        page_heading = (
+            "Fast quality check"
+            if not report.scope.incremental
+            else f"Fast quality check for {report.scope.description}"
+        )
         verdict_class = "diagnostic"
     else:
-        status = "READY TO SHIP" if report.passed else "NOT READY YET"
-        page_heading = "Can I ship this?"
+        if report.scope.kind == "commit":
+            status = "COMMIT SCOPE PASSED" if report.passed else "COMMIT NEEDS WORK"
+            page_heading = f"Is {report.scope.description} ready?"
+        elif report.scope.kind == "local_changes":
+            status = (
+                "LOCAL CHANGES PASSED" if report.passed else "LOCAL CHANGES NEED WORK"
+            )
+            page_heading = "Are local changes ready?"
+        else:
+            status = "READY TO SHIP" if report.passed else "NOT READY YET"
+            page_heading = "Can I ship this?"
         verdict_class = "pass" if report.passed else "fail"
-    coverage_limit = report.functions[0].coverage_limit if report.functions else 100
-    craap_limit = report.functions[0].craap_limit if report.functions else 6
+    thresholds = report.thresholds or default_thresholds()
+    coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
+    complexity_limit = threshold_number(
+        thresholds, "metrics", "complexity_limit"
+    )
+    craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
+    file_loc_limit = int(threshold_number(thresholds, "file_loc", "max_lines"))
     applicable_gates = sum(
         gate.applicable and not gate.deferred for gate in report.gates
     )
@@ -4155,28 +4874,34 @@ def html_report(report: AnalysisReport) -> str:
             "4",
             "Are all code paths tested?",
             "Tests + coverage + complexity",
-            f"The complete suite must pass, with {coverage_limit:g}% function coverage and CRAAP {craap_limit:g} or lower.",
+            f"The complete suite must pass, with {coverage_limit:g}% function coverage, complexity {complexity_limit:g} or lower, and CRAAP {craap_limit:g} or lower.",
+        ),
+        "file_loc": (
+            "5",
+            "Are files small enough to understand?",
+            "File LOC",
+            f"Every production file must contain at most {file_loc_limit} physical lines.",
         ),
         "dead_code": (
-            "5",
+            "6",
             "Is unused code gone?",
             "Dead code",
             "Configured high-confidence unused-code detectors must report zero findings.",
         ),
         "flaky": (
-            "6",
+            "7",
             "Are the tests repeatable?",
             "Flaky-test detection",
             "Repeated complete-suite runs must produce consistent passing results.",
         ),
         "mutation": (
-            "7",
+            "8",
             "Would tests catch wrong code?",
             "Mutation testing",
             "The gate makes tiny wrong changes. Your tests must catch every one.",
         ),
         "dependencies": (
-            "8",
+            "9",
             "Does the architecture stay clean?",
             "Module boundaries",
             "Imports must follow the dependency rules declared by the project.",
@@ -4213,6 +4938,22 @@ def html_report(report: AnalysisReport) -> str:
     )
     if len(ordered_functions) > len(shown_functions):
         function_rows += f'<tr><td colspan="7">Showing the 200 highest-priority functions out of {len(ordered_functions)}. Fix and rerun to refresh this list.</td></tr>'
+    ordered_files = sorted(
+        report.files, key=lambda file: (file.passed, -file.lines, file.path)
+    )
+    shown_files = ordered_files[:200]
+    file_rows = (
+        "".join(
+            f"""<tr class="{"ok" if file.passed else "bad"}">
+          <td><code>{html.escape(file.path)}</code></td><td>{file.lines}</td>
+          <td>{file.limit}</td><td>{"PASS" if file.passed else "FAIL"}</td>
+        </tr>"""
+            for file in shown_files
+        )
+        or '<tr><td colspan="4">No production files selected.</td></tr>'
+    )
+    if len(ordered_files) > len(shown_files):
+        file_rows += f'<tr><td colspan="4">Showing 200 largest files out of {len(ordered_files)}.</td></tr>'
     ordered_mutations = sorted(
         report.mutations,
         key=lambda mutation: (
@@ -4305,6 +5046,7 @@ def html_report(report: AnalysisReport) -> str:
     else:
         quick_guide = """<div><strong>Green means go</strong>No action needed.</div><div><strong>Red means pause</strong>Fix it before shipping.</div><div><strong>Gray means not applicable</strong>No supported project check was detected.</div><div><strong>Need help?</strong>Copy an AI repair prompt below.</div>"""
     functions_passing = sum(function.passed for function in report.functions)
+    files_passing = sum(file.passed for file in report.files)
     mutants_killed = sum(not mutation.survived for mutation in report.mutations)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -4319,7 +5061,7 @@ main{{max-width:1220px;margin:auto;padding:42px 28px 72px}} h1,h2,h3{{line-heigh
 .progress{{margin-top:16px;color:var(--muted);font-weight:700}} .progress strong{{color:var(--ink)}} .quick-guide{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .quick-guide div{{padding:14px 16px;background:rgba(255,255,255,.7);border:1px solid var(--line);border-radius:14px}} .quick-guide strong{{display:block}}
 .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}} .gate,.prompt,.setup{{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:0 10px 35px rgba(67,47,140,.06)}}
 .gate.pass{{border-top:6px solid var(--good)}} .gate.fail{{border-top:6px solid var(--bad)}} .gate.na{{border-top:6px solid var(--na)}} .gate.deferred{{border-top:6px solid var(--diagnostic)}} .gate-top,.prompt-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .step{{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--purple-soft);color:var(--purple);font-weight:950}} .badge{{font-size:12px;font-weight:950;padding:6px 9px;border-radius:99px}} .pass .badge{{background:var(--good-soft);color:var(--good)}} .fail .badge{{background:var(--bad-soft);color:var(--bad)}} .na .badge{{background:var(--na-soft);color:var(--na)}} .deferred .badge{{background:var(--diagnostic-soft);color:var(--diagnostic)}}
-.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .na .result{{background:var(--na-soft);color:var(--na)}} .deferred .result{{background:var(--diagnostic-soft);color:var(--diagnostic)}} .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
+.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .na .result{{background:var(--na-soft);color:var(--na)}} .deferred .result{{background:var(--diagnostic-soft);color:var(--diagnostic)}} .stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:var(--card)}} table{{width:100%;border-collapse:collapse}} th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{background:#f0edfa;font-size:13px;text-transform:uppercase;letter-spacing:.05em}} tr.bad{{background:#fff8f9}} tr.bad td:last-child{{color:var(--bad);font-weight:900}} tr.ok td:last-child{{color:var(--good);font-weight:800}}
 code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f4f1ff;padding:15px;border-radius:12px;max-height:420px;overflow:auto}} details{{margin-top:12px}} summary{{cursor:pointer;font-weight:800;color:var(--purple)}} button{{background:var(--purple);color:#fff;border:0;border-radius:10px;padding:9px 13px;font-weight:900;cursor:pointer}} button.copied{{background:var(--good)}}
 .prompt{{border-left:5px solid var(--purple)}} .prompt h3{{font-size:18px;letter-spacing:0}} .master-prompt{{grid-column:1/-1;border:2px solid var(--purple);background:linear-gradient(135deg,#fff 0,#f5f1ff 100%)}} .master-prompt h3{{font-size:28px;margin-top:5px}} .master-prompt p{{color:var(--muted)}} .prompt-group-heading{{grid-column:1/-1;margin-top:12px}} .prompt-group-heading h3{{margin-bottom:4px}} .prompt-group-heading p{{margin:0;color:var(--muted)}} .all-clear{{grid-column:1/-1;padding:24px;background:var(--good-soft);color:var(--good);font-weight:850;border-radius:16px}} .setup{{padding:18px 22px}} ul{{padding-left:20px}}
@@ -4331,11 +5073,13 @@ code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white
 <div class="verdict {verdict_class}">{status}</div></section>
 <section class="quick-guide">{quick_guide}</section>
 <h2>Your quality checks</h2><p class="section-note">Start here. Technical proof is lower down when you need it.</p><section class="grid">{gate_cards}</section>
-<section class="stats"><div class="stat"><strong>{functions_passing}/{len(report.functions)}</strong><span>functions meet coverage + CRAAP</span></div><div class="stat"><strong>{mutants_killed}/{len(report.mutations)}</strong><span>wrong-code mutations caught</span></div><div class="stat"><strong>{len(report.dependency_violations)}</strong><span>architecture violations</span></div></section>
+<section class="stats"><div class="stat"><strong>{functions_passing}/{len(report.functions)}</strong><span>functions meet coverage + complexity + CRAAP</span></div><div class="stat"><strong>{files_passing}/{len(report.files)}</strong><span>files meet the {file_loc_limit}-line limit</span></div><div class="stat"><strong>{mutants_killed}/{len(report.mutations)}</strong><span>wrong-code mutations caught</span></div><div class="stat"><strong>{len(report.dependency_violations)}</strong><span>architecture violations</span></div></section>
 <h2>Fix with your coding agent</h2><p class="section-note">Choose the complete all-in-one prompt or a focused prompt for one issue.</p><section class="grid">{prompt_html}</section>
 <h2>Automatic tool setup</h2><section class="setup"><strong>{html.escape(setup_summary)}</strong>{setup_evidence}</section>
-<h2>Function health</h2><p class="section-note">Lower CRAAP is better. Required: {coverage_limit:g}% executable-line coverage and CRAAP ≤ {craap_limit:g}.</p>
+<h2>Function health</h2><p class="section-note">Lower complexity and CRAAP are better. Required: {coverage_limit:g}% executable-line coverage, complexity ≤ {complexity_limit:g}, and CRAAP ≤ {craap_limit:g}.</p>
 <div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div>
+<h2>File size</h2><p class="section-note">Physical lines include code, comments, and blank lines. Required: at most {file_loc_limit} lines per production file.</p>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div>
 <h2>Test strength</h2><p class="section-note">A “survived” mutant is a tiny wrong-code change your tests failed to catch. Required: zero survivors.</p>
 <div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div>
 <h2>Architecture boundaries</h2><p class="section-note">These imports cross a boundary your project says should stay closed.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div>
@@ -4367,11 +5111,13 @@ def commands_html(results: Sequence[CommandResult]) -> str:
     return f"<details><summary>Command evidence ({len(results)})</summary><pre>{html.escape(content)}</pre></details>"
 
 
-def config_template(root: Path) -> dict[str, Any]:
+def config_template(
+    root: Path, thresholds: dict[str, Any] | None = None
+) -> dict[str, Any]:
     test = infer_test_command(root)
     package = read_package_json(root)
-    return deep_merge(
-        default_config(),
+    config = deep_merge(
+        default_config(thresholds),
         {
             "test": {"command": test},
             "mutation": {"test_command": test},
@@ -4398,13 +5144,25 @@ def config_template(root: Path) -> dict[str, Any]:
             "_detected_package": package.get("name") if package else None,
         },
     )
+    return without_threshold_values(config)
 
 
-def write_initial_config(root: Path, path: Path) -> None:
+def write_initial_config(
+    root: Path, path: Path, thresholds: dict[str, Any] | None = None
+) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite existing configuration: {path}")
     path.write_text(
-        json.dumps(config_template(root), indent=2) + "\n", encoding="utf-8"
+        json.dumps(config_template(root, thresholds), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_initial_thresholds(path: Path) -> None:
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing thresholds: {path}")
+    path.write_text(
+        json.dumps(default_thresholds(), indent=2) + "\n", encoding="utf-8"
     )
 
 
@@ -4416,11 +5174,17 @@ def run(
     notes: list[str],
     fast: bool = False,
     cli_mutation_workers: str | int | None = None,
+    scope: GateScope | None = None,
+    thresholds: dict[str, Any] | None = None,
 ) -> AnalysisReport:
+    scope = scope or repository_scope()
     languages = detect_languages(root)
-    source_files = discover_source_files(root, config["source"])
+    all_source_files = discover_source_files(root, config["source"])
+    source_files = discover_source_files(root, config["source"], scope)
     notes.append(f"Detected languages: {', '.join(languages)}")
-    notes.append(f"Selected {len(source_files)} production source files")
+    notes.append(
+        f"Selected {len(source_files)} production source files from {scope.description}"
+    )
     if fast:
         notes.append(
             "Fast diagnostic mode: flaky-test repetitions and mutation testing are deferred; this run cannot certify the repository."
@@ -4463,7 +5227,7 @@ def run(
             "format_lint",
             "Formatter & lint",
             config["format_lint"],
-            infer_format_lint_commands(root, source_files, tools),
+            infer_format_lint_commands(root, source_files, tools, scope),
             "Configure format_lint.commands with non-mutating check-mode formatter and linter commands.",
             tools.python_env,
         )
@@ -4478,12 +5242,34 @@ def run(
         )
         contracts_gate = run_contract_gate(root, config, tools)
         test_command, test_baseline = run_test_baseline(root, config)
-        raw_metrics_gate, functions = run_metrics_gate(
-            root, config, source_files, workspace, tools
-        )
+        if scope.incremental and not source_files:
+            raw_metrics_gate = GateResult(
+                "craap",
+                "CRAAP: coverage + complexity",
+                True,
+                f"No changed production source files were selected from {scope.description}; file metrics were not needed.",
+            )
+            functions = []
+        else:
+            raw_metrics_gate, functions = run_metrics_gate(
+                root, config, source_files, workspace, tools
+            )
         quality_gate = combine_test_and_metrics_gate(
             raw_metrics_gate, test_command, test_baseline
         )
+        if scope.incremental and not source_files:
+            file_loc_gate = GateResult(
+                "file_loc",
+                "File LOC",
+                True,
+                f"Not applicable: no changed production source files were selected from {scope.description}.",
+                applicable=False,
+            )
+            files = []
+        else:
+            file_loc_gate, files = run_file_loc_gate(
+                root, source_files, config["file_loc"]
+            )
         dead_code_gate = run_command_check_gate(
             root,
             "dead_code",
@@ -4505,6 +5291,16 @@ def run(
                 "the exhaustive mutant run is reserved for full certification.",
             )
             mutations = []
+        elif scope.incremental and not source_files:
+            flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
+            mutation_gate = GateResult(
+                "mutation",
+                "Mutation testing",
+                True,
+                f"Not applicable: no changed production source files were selected from {scope.description}.",
+                applicable=False,
+            )
+            mutations = []
         else:
             flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
             mutation_gate, mutations = run_mutation_gate(
@@ -4515,10 +5311,25 @@ def run(
                 test_baseline,
                 cli_mutation_workers,
                 tools,
+                scope,
             )
-        dependency_gate, violations = run_dependency_gate(
-            root, config, source_files, workspace
-        )
+        if scope.incremental and not source_files:
+            dependency_gate = GateResult(
+                "dependencies",
+                "Module dependencies",
+                True,
+                f"Not applicable: no changed production source files were selected from {scope.description}.",
+                applicable=False,
+            )
+            violations = []
+        else:
+            dependency_gate, violations = run_dependency_gate(
+                root,
+                config,
+                source_files,
+                workspace,
+                resolution_files=all_source_files,
+            )
     analysis = AnalysisReport(
         root=str(root),
         generated_at=time.strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -4528,6 +5339,7 @@ def run(
             types_gate,
             contracts_gate,
             quality_gate,
+            file_loc_gate,
             dead_code_gate,
             flaky_gate,
             mutation_gate,
@@ -4538,7 +5350,10 @@ def run(
         dependency_violations=violations,
         tool_setup=tools.setup_results,
         notes=notes,
+        files=files,
+        thresholds=thresholds or default_thresholds(),
         mode="fast" if fast else "full",
+        scope=scope,
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(html_report(analysis), encoding="utf-8")
@@ -4557,12 +5372,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"JSON configuration (default: ROOT/{CONFIG_NAME} when present)",
     )
     parser.add_argument(
+        "--thresholds",
+        help=f"quality-threshold JSON (default: ROOT/{THRESHOLDS_NAME}, then bundled defaults)",
+    )
+    parser.add_argument(
+        "--update-from-github",
+        nargs="?",
+        const=GITHUB_DEFAULT_REF,
+        type=validate_update_ref,
+        metavar="REF",
+        help=f"update from {GITHUB_REPOSITORY} (default REF: {GITHUB_DEFAULT_REF}) and exit",
+    )
+    parser.add_argument(
         "--html",
         default=DEFAULT_REPORT,
         help=f"HTML report path (default: {DEFAULT_REPORT})",
     )
     parser.add_argument(
         "--init", action="store_true", help=f"write a detected {CONFIG_NAME} and exit"
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--commit",
+        nargs="?",
+        const="HEAD",
+        metavar="REF",
+        help="gate production files changed by one commit (default REF: HEAD)",
+    )
+    scope.add_argument(
+        "--local-changes",
+        action="store_true",
+        help="gate production files in staged, unstaged, and untracked changes",
     )
     parser.add_argument(
         "--max-mutants", type=int, help="diagnostic cap; a capped run can never pass"
@@ -4588,18 +5428,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.update_from_github:
+        return update_from_github(Path(__file__).resolve(), args.update_from_github)
     root = Path(args.root).resolve()
     if not root.is_dir():
         print(f"error: repository root does not exist: {root}", file=sys.stderr)
         return 2
     config_path = Path(args.config).resolve() if args.config else root / CONFIG_NAME
+    local_thresholds_path = root / THRESHOLDS_NAME
+    thresholds_path = (
+        Path(args.thresholds).resolve()
+        if args.thresholds
+        else (
+            local_thresholds_path
+            if local_thresholds_path.exists() or args.init
+            else bundled_thresholds_path()
+        )
+    )
     if args.init:
         try:
-            write_initial_config(root, config_path)
+            if config_path.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite existing configuration: {config_path}"
+                )
+            if thresholds_path.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite existing thresholds: {thresholds_path}"
+                )
+            thresholds = default_thresholds()
+            write_initial_thresholds(thresholds_path)
+            write_initial_config(root, config_path, thresholds)
         except (OSError, ValueError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 2
         print(f"Wrote {config_path}")
+        print(f"Wrote {thresholds_path}")
         print(
             "Review source, format/lint, types, contracts, tests, metrics, dead-code, flaky-test, mutation, and dependency settings before the first enforcing run."
         )
@@ -4607,8 +5470,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_path = Path(args.html)
     if not report_path.is_absolute():
         report_path = root / report_path
+    if args.commit:
+        scope = GateScope("commit", reference=args.commit)
+    elif args.local_changes:
+        scope = GateScope("local_changes")
+    else:
+        scope = repository_scope()
     try:
-        config, notes = load_config(config_path if config_path.exists() else None)
+        if args.commit:
+            scope = commit_scope(root, args.commit)
+        elif args.local_changes:
+            scope = local_changes_scope(root)
+        thresholds, threshold_notes = load_thresholds(thresholds_path)
+        config, notes = load_config(
+            config_path if config_path.exists() else None, thresholds
+        )
+        notes = [*threshold_notes, *notes]
         if args.no_install:
             config["tools"]["auto_install"] = False
         analysis = run(
@@ -4619,15 +5496,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             notes,
             fast=args.fast,
             cli_mutation_workers=args.mutation_workers,
+            scope=scope,
+            thresholds=thresholds,
         )
         rerun = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
         if args.config:
             rerun.extend(["--config", str(config_path)])
+        if args.thresholds:
+            rerun.extend(["--thresholds", str(thresholds_path)])
         rerun.extend(["--html", str(report_path)])
         if args.no_install:
             rerun.append("--no-install")
         if args.mutation_workers:
             rerun.extend(["--mutation-workers", args.mutation_workers])
+        if args.commit:
+            rerun.extend(["--commit", args.commit])
+        elif args.local_changes:
+            rerun.append("--local-changes")
         if args.fast:
             rerun.append("--fast")
         analysis.rerun_command = shlex.join(rerun)
@@ -4656,7 +5541,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             dependency_violations=[],
             tool_setup=[],
             notes=["The run stopped before all gates could be evaluated."],
+            thresholds={},
             mode="fast" if args.fast else "full",
+            scope=scope,
         )
         with contextlib.suppress(OSError):
             report_path.parent.mkdir(parents=True, exist_ok=True)
