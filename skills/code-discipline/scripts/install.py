@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -32,11 +32,13 @@ SKILL_FILES = (
     "references/repository-setup.md",
     "scripts/install.py",
     "scripts/quality_loop.py",
+    "scripts/quality_state.py",
     "scripts/repo_quality_gate.py",
 )
 PYTHON_FILES = (
     "scripts/install.py",
     "scripts/quality_loop.py",
+    "scripts/quality_state.py",
     "scripts/repo_quality_gate.py",
 )
 
@@ -61,7 +63,32 @@ def raw_url(reference: str, relative_path: str) -> str:
     )
 
 
-def download_with_curl(url: str, maximum_bytes: int, python_error: Exception) -> bytes:
+def curl_command(
+    executable: str, url: str, maximum_bytes: int, headers: Mapping[str, str]
+) -> list[str]:
+    header_arguments = [
+        argument
+        for name, value in headers.items()
+        for argument in ("--header", f"{name}: {value}")
+    ]
+    return [
+        executable,
+        "-fsSL",
+        "--max-time",
+        "30",
+        "--max-filesize",
+        str(maximum_bytes),
+        *header_arguments,
+        url,
+    ]
+
+
+def download_with_curl(
+    url: str,
+    maximum_bytes: int,
+    python_error: Exception,
+    headers: Mapping[str, str],
+) -> bytes:
     curl = shutil.which("curl")
     if curl is None:
         raise RuntimeError(
@@ -69,15 +96,7 @@ def download_with_curl(url: str, maximum_bytes: int, python_error: Exception) ->
         ) from python_error
     try:
         completed = subprocess.run(
-            [
-                curl,
-                "-fsSL",
-                "--max-time",
-                "30",
-                "--max-filesize",
-                str(maximum_bytes),
-                url,
-            ],
+            curl_command(curl, url, maximum_bytes, headers),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=35,
@@ -96,15 +115,19 @@ def download_with_curl(url: str, maximum_bytes: int, python_error: Exception) ->
     return bytes(completed.stdout)
 
 
-def download_file(url: str, maximum_bytes: int = 2_000_000) -> bytes:
-    request = Request(
-        url, headers={"User-Agent": f"code-discipline-installer/{VERSION}"}
-    )
+def download_file(
+    url: str,
+    maximum_bytes: int = 2_000_000,
+    headers: Mapping[str, str] | None = None,
+) -> bytes:
+    request_headers = {"User-Agent": f"code-discipline-installer/{VERSION}"}
+    request_headers.update(headers or {})
+    request = Request(url, headers=request_headers)
     try:
         with urlopen(request, timeout=30) as response:
             payload = bytes(response.read(maximum_bytes + 1))
     except (HTTPError, URLError, TimeoutError, OSError) as error:
-        payload = download_with_curl(url, maximum_bytes, error)
+        payload = download_with_curl(url, maximum_bytes, error, request_headers)
     if len(payload) > maximum_bytes:
         raise RuntimeError(f"download exceeds {maximum_bytes} bytes: {url}")
     return payload
@@ -113,12 +136,14 @@ def download_file(url: str, maximum_bytes: int = 2_000_000) -> bytes:
 def resolve_reference(reference: str) -> str:
     url = f"{API_BASE}/commits/{quote(reference, safe='')}"
     try:
-        metadata = json.loads(download_file(url, 100_000).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        commit = download_file(
+            url, 100_000, {"Accept": "application/vnd.github.sha"}
+        ).decode("ascii")
+    except UnicodeDecodeError as error:
         raise RuntimeError(
             f"GitHub returned invalid ref metadata for {reference}"
         ) from error
-    commit = metadata.get("sha") if isinstance(metadata, dict) else None
+    commit = commit.strip()
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError(f"GitHub did not resolve ref {reference} to a commit")
     return commit

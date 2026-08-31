@@ -75,16 +75,17 @@ Run complete repository certification:
 python3 .agents/skills/code-discipline/scripts/quality_loop.py --root .
 ```
 
-Every run generates an HTML report named `quality-gate-report.html` and a
-`quality-gate-state.json` state file in the repository root, then prints both
-paths. Use `--html PATH` only when you want a different location.
+Every run writes `.quality/quality-gate-report.html` and
+`.quality/quality-gate-state.json`, then prints both paths. Use `--html PATH`
+only when you want a different location.
 
 For a global installation, replace `.agents/skills/code-discipline` in those
 commands with `$HOME/.agents/skills/code-discipline`.
 
-`--init` creates `.quality-gate.json` for commands and adapters, plus
-`.quality-thresholds.json` for every numeric goal. Defaults include File LOC at
-1,000 lines, coverage at 100%, and per-function complexity and CRAAP at 6. The
+`--init` creates `.quality/quality-gate.json` for commands and adapters, plus
+`.quality/quality-thresholds.json` for every numeric goal. Module rules belong
+in `.quality/quality-dependencies.json`. Defaults include File LOC at 600 lines,
+coverage at 100%, and per-function complexity and CRAAP at 6. The
 skill's [repository setup guide](skills/code-discipline/references/repository-setup.md)
 explains how to configure formatter/lint, static types, contracts and schemas,
 tests, coverage, complexity, dead code, flaky-test detection, mutation testing,
@@ -128,5 +129,5 @@ python3 -m venv .venv
 python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --no-install --mutation-workers auto
 ```
 
-The full gate uses the pinned tools in `.venv`, writes its HTML and JSON reports
-in the repository root, and enforces the goals in `.quality-thresholds.json`.
+The full gate uses the pinned tools in `.venv`, writes configs and generated
+artifacts under `.quality/`, and enforces `.quality/quality-thresholds.json`.

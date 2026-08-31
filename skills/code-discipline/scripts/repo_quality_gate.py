@@ -41,10 +41,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "4.0.0"
-CONFIG_NAME = ".quality-gate.json"
-THRESHOLDS_NAME = ".quality-thresholds.json"
-DEFAULT_REPORT = "quality-gate-report.html"
+VERSION = "4.1.0"
+QUALITY_DIRECTORY = ".quality"
+CONFIG_NAME = f"{QUALITY_DIRECTORY}/quality-gate.json"
+THRESHOLDS_NAME = f"{QUALITY_DIRECTORY}/quality-thresholds.json"
+DEPENDENCIES_NAME = f"{QUALITY_DIRECTORY}/quality-dependencies.json"
+DEFAULT_REPORT = f"{QUALITY_DIRECTORY}/quality-gate-report.html"
 STRYKER_VERSION = "9.6.1"
 GITHUB_REPOSITORY = "benrben/code-skills"
 GITHUB_DEFAULT_REF = "main"
@@ -691,7 +693,7 @@ def update_from_github(runner_path: Path, reference: str) -> int:
         return 2
     print(f"Updated standalone repository quality gate to {version} from {reference}.")
     print(
-        f"Preserved repository-owned {CONFIG_NAME}, {THRESHOLDS_NAME}, and .quality-dependencies.json files."
+        f"Preserved repository-owned {CONFIG_NAME}, {THRESHOLDS_NAME}, and {DEPENDENCIES_NAME} files."
     )
     return 0
 
@@ -892,7 +894,7 @@ def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
         "dependencies": {
             "command": None,
             "edges_report": None,
-            "rules": ".quality-dependencies.json",
+            "rules": DEPENDENCIES_NAME,
             "timeout_seconds": 300,
         },
         "tools": {"auto_install": True, "cache_dir": None},
@@ -4446,7 +4448,7 @@ def run_dependency_gate(
 ) -> tuple[GateResult, list[DependencyViolation]]:
     dependency = config["dependencies"]
     rules_path = resolve_config_path(
-        str(dependency.get("rules", ".quality-dependencies.json")), root
+        str(dependency.get("rules", DEPENDENCIES_NAME)), root
     )
     command_results: list[CommandResult] = []
     adapter_report = (workspace or root) / "dependency-edges.json"
@@ -4639,7 +4641,7 @@ def run_dependency_gate(
 
 
 def dependency_spec_prompt(reason: str = "no specification exists") -> str:
-    return f"""Define the repository's enforceable module dependency contract ({reason}). Create `.quality-dependencies.json`:
+    return f"""Define the repository's enforceable module dependency contract ({reason}). Create `{DEPENDENCIES_NAME}`:
 
 {{
   "modules": [
@@ -4827,24 +4829,15 @@ def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) ->
         if gate.deferred
         else ("na" if not gate.applicable else ("pass" if gate.passed else "fail"))
     )
-    badge = (
-        "FULL RUN ONLY"
-        if gate.deferred
-        else (
-            "NOT NEEDED"
-            if not gate.applicable
-            else ("LOOKS GOOD" if gate.passed else "FIX THIS")
-        )
-    )
-    return f"""<article class="gate {state}">
-      <div class="gate-top"><span class="step">{html.escape(step)}</span><span class="badge">{badge}</span></div>
-      <div class="kicker">{html.escape(kicker)}</div>
-      <h3>{html.escape(question)}</h3>
-      <p class="explain">{html.escape(explanation)}</p>
+    return f"""<details class="check-row {state}">
+      <summary><span class="check-title"><span class="step">{html.escape(step)}</span>
+      <span><strong>{html.escape(kicker)}</strong><small>{html.escape(question)}</small></span></span>
+      <span class="check-status">{gate_outcome(gate)}</span></summary>
+      <div class="check-body"><p class="explain">{html.escape(explanation)}</p>
       <p class="result">{html.escape(gate.summary)}</p>
       {details_html(gate.details)}
-      {commands_html(gate.command_results)}
-    </article>"""
+      {commands_html(gate.command_results)}</div>
+    </details>"""
 
 
 def optional_gate_setup_prompt(report: AnalysisReport, gate: GateResult) -> str:
@@ -4858,7 +4851,7 @@ def optional_gate_setup_prompt(report: AnalysisReport, gate: GateResult) -> str:
 Current state: {gate.summary}
 Guidance: {guidance}
 
-Inspect the repository's languages, package managers, existing scripts, and CI before choosing a tool. Install the smallest maintained dependency that fits the existing toolchain, configure a deterministic non-interactive check command, and add it to `.quality-gate.json`. Do not disable another gate, weaken thresholds, add broad ignores, or replace the check with a no-op. Run the new check directly, then rerun the repository quality gate and report the exact command and result."""
+Inspect the repository's languages, package managers, existing scripts, and CI before choosing a tool. Install the smallest maintained dependency that fits the existing toolchain, configure a deterministic non-interactive check command, and add it to `{CONFIG_NAME}`. Do not disable another gate, weaken thresholds, add broad ignores, or replace the check with a no-op. Run the new check directly, then rerun the repository quality gate and report the exact command and result."""
 
 
 def html_report(report: AnalysisReport) -> str:
@@ -5167,10 +5160,10 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 .flow-card{{grid-column:1/-1;overflow:hidden}} .gate-flow{{display:grid;grid-template-columns:repeat({total_gates},minmax(94px,1fr));gap:4px;overflow:auto;padding:4px 0}} .flow-item{{position:relative;display:grid;justify-items:center;gap:3px;text-align:center;color:var(--secondary)}} .flow-item:not(:last-child)::after{{content:"";position:absolute;top:16px;left:64%;width:72%;height:1px;background:var(--line)}} .flow-symbol{{position:relative;z-index:1;display:grid;place-items:center;width:34px;height:34px;border:1.5px solid currentColor;border-radius:50%;background:#fff;font-size:19px}} .flow-item strong{{font-size:12px;color:var(--ink);font-weight:600}} .flow-item small{{font-size:10px;font-weight:700}} .flow-item.pass{{color:var(--good)}} .flow-item.fail{{color:var(--bad)}} .flow-item.deferred{{color:var(--deferred)}} .flow-item.na{{color:var(--na)}}
 .accordion{{margin-top:14px;overflow:hidden;border:1px solid rgba(255,255,255,.82);border-radius:18px;background:var(--glass);backdrop-filter:blur(18px) saturate(135%);box-shadow:0 8px 28px rgba(35,45,70,.08)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
 .issue-row,.optional-row{{display:grid;grid-template-columns:94px 1fr auto;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}} .issue-row:last-child,.optional-row:last-child{{border-bottom:0}} .issue-row p,.optional-row p,.optional-heading p{{margin:2px 0 0;color:var(--secondary);font-size:13px}} .state-label{{font-size:12px;font-weight:750}} .state-label.fail{{color:var(--bad)}} .na-mark{{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--na);border-radius:50%;color:var(--na);font-size:10px}} .optional-heading{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}} .optional-heading p{{margin:0}} .panel{{padding:16px;border-top:1px solid var(--line)}}
-.gate-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .gate{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}} .gate.pass{{border-top:4px solid var(--good)}} .gate.fail{{border-top:4px solid var(--bad)}} .gate.na{{border-top:4px solid var(--na)}} .gate.deferred{{border-top:4px solid var(--deferred)}} .gate-top{{display:flex;justify-content:space-between;gap:8px}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .badge{{font-size:10px;font-weight:750}} .gate h3{{font-size:16px;margin:8px 0}} .kicker,.explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
+.checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.5)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .check-status{{margin-left:auto;margin-right:8px;font-size:11px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
-@media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card{{grid-column:auto}}.gate-grid{{grid-template-columns:1fr 1fr}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
-@media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.file-bar>div:first-child{{align-items:flex-start;flex-direction:column;gap:2px}}.gate-grid{{grid-template-columns:1fr}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
+@media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card{{grid-column:auto}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
+@media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.file-bar>div:first-child{{align-items:flex-start;flex-direction:column;gap:2px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
 </style></head><body><main>
 <header class="toolbar"><span class="brand">Code Confidence</span><span class="repo">{html.escape(repository_name)} · {html.escape(report.scope.description)}</span>
 <div class="toolbar-meta"><strong>{report.mode.upper()} RUN</strong><span>{html.escape(report.generated_at)}</span></div></header>
@@ -5180,7 +5173,7 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 <article class="card"><h2>File size</h2>{file_bars}<p class="file-summary">{files_passing} of {len(report.files)} pass · limit {file_loc_limit:,} lines</p></article>
 <article class="card flow-card"><h2>Quality gates</h2><div class="gate-flow">{gate_flow}</div></article></section>
 <section class="accordion">{fix_section}{optional_section}
-<details class="data-section"><summary><span>All checks</span><span>{len(report.gates)} total · {passed_gates} pass · {failed_count} fail · {deferred_gates} deferred · {not_applicable_gates} N/A</span></summary><div class="panel gate-grid">{gate_cards}</div></details>
+<div class="checks-list">{gate_cards}</div>
 <details class="data-section"><summary><span>Functions + coverage</span><span>{functions_passing}/{len(report.functions)} pass · target {coverage_limit:g}% · complexity ≤ {complexity_limit:g} · CRAAP ≤ {craap_limit:g}</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div></details>
 <details class="data-section"><summary><span>Files</span><span>{len(report.files)} measured · {files_passing} pass · limit {file_loc_limit:,}</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div></div></details>
 <details class="data-section"><summary><span>Mutations + flaky tests</span><span>{mutants_killed}/{len(report.mutations)} mutations caught · {deferred_gates} deferred gates</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></div></details>
@@ -5255,6 +5248,7 @@ def write_initial_config(
 ) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite existing configuration: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(config_template(root, thresholds), indent=2) + "\n",
         encoding="utf-8",
@@ -5264,6 +5258,7 @@ def write_initial_config(
 def write_initial_thresholds(path: Path) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite existing thresholds: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(default_thresholds(), indent=2) + "\n", encoding="utf-8")
 
 

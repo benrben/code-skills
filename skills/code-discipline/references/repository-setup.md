@@ -20,9 +20,9 @@ versions.
    python3 <skill-directory>/scripts/repo_quality_gate.py --root . --init
    ```
 
-   `--init` creates `.quality-gate.json` for commands/adapters and
-   `.quality-thresholds.json` for every numeric quality goal. Module boundaries
-   additionally require a reviewed `.quality-dependencies.json`. Review
+   `--init` creates `.quality/quality-gate.json` for commands/adapters and
+   `.quality/quality-thresholds.json` for every numeric quality goal. Module boundaries
+   additionally require a reviewed `.quality/quality-dependencies.json`. Review
    generated detection; do not treat it as architecture intent.
 4. Configure non-mutating check commands as JSON argument arrays. Use
    `["bash", "-lc", "..."]` only when a check truly requires pipes, globbing,
@@ -78,7 +78,7 @@ JSON, LCOV, Cobertura/JaCoCo XML, or Go cover profile); otherwise configure a
 normalized `metrics.command` and `metrics.report` containing every production
 function.
 
-The numeric goals live only in `.quality-thresholds.json`:
+The numeric goals live only in `.quality/quality-thresholds.json`:
 `metrics.coverage_limit`, `metrics.complexity_limit`, and
 `metrics.craap_limit`. The default requires 100% executable-line coverage,
 cyclomatic complexity at most 6, and CRAAP at most 6 per function. Do not use
@@ -103,7 +103,7 @@ make it green.
 Make the baseline suite deterministic first: isolated temporary state, controlled
 clocks/randomness, unique ports, awaited background work, and cleanup that runs
 on failure. The full gate repeats `test.command`; the repeat count is
-`flaky_tests.runs` in `.quality-thresholds.json` (default 3). Do not use retries,
+`flaky_tests.runs` in `.quality/quality-thresholds.json` (default 3). Do not use retries,
 quarantine, or order randomization as a substitute for fixing known flakes.
 
 ### 7. Mutation testing
@@ -118,7 +118,7 @@ killed.
 
 ### 8. Module boundaries
 
-Create `.quality-dependencies.json` from intended architecture, not current
+Create `.quality/quality-dependencies.json` from intended architecture, not current
 imports. Every production file must match exactly one named module. For every
 module, declare the modules it may import and explicit denied directions where
 useful. The built-in checker handles common imports; configure
@@ -129,7 +129,7 @@ Prove one deliberately forbidden edge fails before trusting the CI rule.
 
 File LOC requires no external tool. The runner counts physical lines in every
 selected production source file, including code, comments, and blank lines.
-`file_loc.max_lines` in `.quality-thresholds.json` defaults to 1000. A failure is
+`file_loc.max_lines` in `.quality/quality-thresholds.json` defaults to 600. A failure is
 a design prompt to split cohesive responsibilities while preserving behavior;
 never minify code, remove useful documentation, or exclude a file to evade it.
 
@@ -145,7 +145,7 @@ python3 <skill-directory>/scripts/quality_loop.py --root . --no-install
 Use `--no-install` for the proof after setup: success then demonstrates that the
 repository and CI environment contain every required tool rather than depending
 on an ephemeral agent cache. Confirm all configured commands appear in command
-evidence, all applicable gates pass, thresholds in `quality-gate-state.json`
-match `.quality-thresholds.json`, and the full command exits 0. If a gate is
+evidence, all applicable gates pass, thresholds in `.quality/quality-gate-state.json`
+match `.quality/quality-thresholds.json`, and the full command exits 0. If a gate is
 `NOT APPLICABLE` but the repository needs it, add its command and set its
-`required` flag in `.quality-gate.json`.
+`required` flag in `.quality/quality-gate.json`.

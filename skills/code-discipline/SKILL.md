@@ -13,7 +13,7 @@ and record why — practicality beats purity.
 
 ## Repository quality loop
 
-When `.quality-gate.json` exists, run the bundled loop for every coding task:
+When `.quality/quality-gate.json` exists, run the bundled loop for every coding task:
 
 - During implementation: `--local-changes --fast`.
 - Before handoff: `--local-changes` without `--fast`; repair and rerun until it

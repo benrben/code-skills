@@ -22,6 +22,12 @@ LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py
 INSTALL_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "install.py"
 
 
+def quality_file(root: Path, name: str) -> Path:
+    directory = root / ".quality"
+    directory.mkdir(exist_ok=True)
+    return directory / name
+
+
 def load_script(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -61,12 +67,15 @@ class QualityGateUnitTests(unittest.TestCase):
         with mock.patch.object(
             installer,
             "download_file",
-            return_value=json.dumps({"sha": commit}).encode(),
+            return_value=commit.encode(),
         ) as download:
             resolved = installer.resolve_reference("refs/heads/main")
 
         self.assertEqual(resolved, commit)
         self.assertIn("refs%2Fheads%2Fmain", download.call_args.args[0])
+        self.assertEqual(
+            download.call_args.args[2], {"Accept": "application/vnd.github.sha"}
+        )
 
     def test_skill_package_is_complete_and_runs_without_source_checkout(self) -> None:
         skill_source = ROOT / "skills" / "code-discipline"
@@ -105,11 +114,13 @@ class QualityGateUnitTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(initialized.returncode, 0, initialized.stderr)
-            self.assertTrue((repository / ".quality-gate.json").is_file())
+            self.assertTrue((repository / ".quality" / "quality-gate.json").is_file())
             thresholds = json.loads(
-                (repository / ".quality-thresholds.json").read_text(encoding="utf-8")
+                (repository / ".quality" / "quality-thresholds.json").read_text(
+                    encoding="utf-8"
+                )
             )
-            self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
+            self.assertEqual(thresholds["file_loc"]["max_lines"], 600)
 
     def test_installer_atomically_installs_the_complete_skill(self) -> None:
         skill_source = ROOT / "skills" / "code-discipline"
@@ -120,7 +131,8 @@ class QualityGateUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target, scope_root = installer.repo_target(root)
-            repository_config = root / ".quality-gate.json"
+            repository_config = root / ".quality" / "quality-gate.json"
+            repository_config.parent.mkdir()
             repository_config.write_text('{"owned": true}\n', encoding="utf-8")
 
             versions = installer.install_skill(target, payloads, update=False)
@@ -180,7 +192,8 @@ class QualityGateUnitTests(unittest.TestCase):
             root = Path(temporary)
             runner = root / "repo_quality_gate.py"
             bundled_thresholds = root / "quality-thresholds.json"
-            repository_thresholds = root / ".quality-thresholds.json"
+            repository_thresholds = root / ".quality" / "quality-thresholds.json"
+            repository_thresholds.parent.mkdir()
             runner.write_text("old runner\n", encoding="utf-8")
             bundled_thresholds.write_text("{}\n", encoding="utf-8")
             repository_thresholds.write_text(
@@ -236,13 +249,26 @@ class QualityGateUnitTests(unittest.TestCase):
         thresholds, notes = gate.load_thresholds(thresholds_path)
         config = gate.default_config(thresholds)
 
-        self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
-        self.assertEqual(config["file_loc"]["max_lines"], 1000)
+        self.assertEqual(thresholds["file_loc"]["max_lines"], 600)
+        self.assertEqual(config["file_loc"]["max_lines"], 600)
         self.assertEqual(config["metrics"]["coverage_limit"], 100)
         self.assertEqual(config["metrics"]["complexity_limit"], 6)
         self.assertEqual(config["metrics"]["craap_limit"], 6)
         self.assertEqual(config["flaky_tests"]["runs"], 3)
         self.assertIn(str(thresholds_path), notes[0])
+
+    def test_default_repository_outputs_share_the_quality_folder(self) -> None:
+        root = Path("/repository")
+        args = quality_loop.parse_args([])
+        artifact_dir, html_path, state_path = quality_loop.resolve_artifacts(args, root)
+
+        self.assertEqual(gate.CONFIG_NAME, ".quality/quality-gate.json")
+        self.assertEqual(gate.THRESHOLDS_NAME, ".quality/quality-thresholds.json")
+        self.assertEqual(gate.DEPENDENCIES_NAME, ".quality/quality-dependencies.json")
+        self.assertEqual(gate.DEFAULT_REPORT, ".quality/quality-gate-report.html")
+        self.assertEqual(artifact_dir, root / ".quality")
+        self.assertEqual(html_path, root / ".quality" / "quality-gate-report.html")
+        self.assertEqual(state_path, root / ".quality" / "quality-gate-state.json")
 
     def test_file_loc_gate_enforces_configured_physical_line_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -291,12 +317,12 @@ class QualityGateUnitTests(unittest.TestCase):
     def test_custom_threshold_file_controls_complexity_and_file_loc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            thresholds_path = root / ".quality-thresholds.json"
+            thresholds_path = quality_file(root, "quality-thresholds.json")
             custom = gate.default_thresholds()
             custom["metrics"]["complexity_limit"] = 2
             custom["file_loc"]["max_lines"] = 25
             thresholds_path.write_text(json.dumps(custom), encoding="utf-8")
-            config_path = root / ".quality-gate.json"
+            config_path = quality_file(root, "quality-gate.json")
             config_path.write_text(
                 json.dumps(
                     {
@@ -347,16 +373,18 @@ class QualityGateUnitTests(unittest.TestCase):
                 check=False,
             )
             config = json.loads(
-                (root / ".quality-gate.json").read_text(encoding="utf-8")
+                (root / ".quality" / "quality-gate.json").read_text(encoding="utf-8")
             )
             thresholds = json.loads(
-                (root / ".quality-thresholds.json").read_text(encoding="utf-8")
+                (root / ".quality" / "quality-thresholds.json").read_text(
+                    encoding="utf-8"
+                )
             )
 
             self.assertEqual(
                 completed.returncode, 0, completed.stdout + completed.stderr
             )
-            self.assertEqual(thresholds["file_loc"]["max_lines"], 1000)
+            self.assertEqual(thresholds["file_loc"]["max_lines"], 600)
             self.assertNotIn("coverage_limit", config["metrics"])
             self.assertNotIn("runs", config["flaky_tests"])
             self.assertNotIn("file_loc", config)
@@ -568,7 +596,7 @@ class QualityGateUnitTests(unittest.TestCase):
             "scripts/install.py --update-current",
             '"$HOME/.agents/skills/code-discipline/scripts/install.py" --update-current',
             ".agents/skills/code-discipline/scripts/quality_loop.py --root .",
-            "Every run generates an HTML report",
+            "Every run writes `.quality/quality-gate-report.html`",
         ):
             with self.subTest(command_fragment=command_fragment):
                 self.assertIn(command_fragment, readme)
@@ -793,7 +821,9 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertEqual(gate.gate_outcome(deferred), "DEFERRED")
         self.assertFalse(report.passed)
         self.assertTrue(report.ready_for_full)
-        self.assertIn("FULL RUN ONLY", gate.html_report(report))
+        self.assertIn(
+            '<span class="check-status">DEFERRED</span>', gate.html_report(report)
+        )
         self.assertIn("READY FOR FULL RUN", gate.html_report(report))
 
     def test_metrics_run_diagnostically_when_baseline_tests_fail(self) -> None:
@@ -1774,7 +1804,7 @@ const helper = require('./helper.js')
                 "time.sleep(30)\n",
                 encoding="utf-8",
             )
-            (root / ".quality-gate.json").write_text(
+            (quality_file(root, "quality-gate.json")).write_text(
                 json.dumps(
                     {
                         "test": {
@@ -1846,7 +1876,7 @@ const helper = require('./helper.js')
                 "allow": {"domain": [], "infrastructure": ["domain"]},
                 "deny": [{"from": "domain", "to": "infrastructure"}],
             }
-            (root / ".quality-dependencies.json").write_text(
+            (quality_file(root, "quality-dependencies.json")).write_text(
                 json.dumps(rules), encoding="utf-8"
             )
             config = gate.default_config()
@@ -1916,12 +1946,10 @@ const helper = require('./helper.js')
                 installer.download_file("https://example.test", 2)
 
     def test_installer_rejects_invalid_metadata_and_payload_sets(self) -> None:
-        with mock.patch.object(installer, "download_file", return_value=b"{"):
+        with mock.patch.object(installer, "download_file", return_value=b"\xff"):
             with self.assertRaisesRegex(RuntimeError, "invalid ref metadata"):
                 installer.resolve_reference("main")
-        with mock.patch.object(
-            installer, "download_file", return_value=b'{"sha":"short"}'
-        ):
+        with mock.patch.object(installer, "download_file", return_value=b"short"):
             with self.assertRaisesRegex(RuntimeError, "did not resolve"):
                 installer.resolve_reference("main")
 
@@ -2571,7 +2599,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            rules_path = root / ".quality-dependencies.json"
+            rules_path = quality_file(root, "quality-dependencies.json")
             rules_path.write_text(
                 json.dumps(
                     {
@@ -2582,7 +2610,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            config_path = root / ".quality-gate.json"
+            config_path = quality_file(root, "quality-gate.json")
             config_path.write_text(
                 json.dumps(
                     gate.deep_merge(
@@ -2641,6 +2669,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
             )
 
             self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
+            passing_html = (artifacts / "quality-gate-report.html").read_text(
+                encoding="utf-8"
+            )
             self.assertEqual(passing_state["status"], "pass")
             self.assertEqual(len(passing_state["gates"]), 9)
             self.assertEqual(passing_state["counts"]["checks_applicable"], 9)
@@ -2648,14 +2679,14 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(passing_state["counts"]["mutants_static"], 0)
             self.assertEqual(passing_state["counts"]["files_total"], 1)
             self.assertEqual(passing_state["counts"]["files_failing_loc"], 0)
-            self.assertEqual(passing_state["thresholds"]["file_loc"]["max_lines"], 1000)
+            self.assertEqual(passing_state["thresholds"]["file_loc"]["max_lines"], 600)
             self.assertEqual(
                 passing_state["metrics"]["files"],
                 [
                     {
                         "path": "src/app.py",
                         "lines": 2,
-                        "limit": 1000,
+                        "limit": 600,
                         "passed": True,
                     }
                 ],
@@ -2671,6 +2702,8 @@ class QualityGateEndToEndTests(unittest.TestCase):
             )
             self.assertIsNone(passing_state["fix_prompt"])
             self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
+            self.assertEqual(passing_html.count('<details class="check-row '), 9)
+            self.assertNotIn("9 total ·", passing_html)
 
             fast_html = root / "fast-report.html"
             fast = subprocess.run(
@@ -2831,7 +2864,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / ".quality-dependencies.json").write_text(
+            (quality_file(root, "quality-dependencies.json")).write_text(
                 json.dumps(
                     {
                         "modules": [{"name": "core", "paths": ["src/**"]}],
@@ -2841,7 +2874,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / ".quality-gate.json").write_text(
+            (quality_file(root, "quality-gate.json")).write_text(
                 json.dumps(
                     {
                         "source": {"include": ["src/**"], "exclude": []},
@@ -2933,7 +2966,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
             )
 
-    def test_agent_loop_writes_report_in_repository_root_by_default(self) -> None:
+    def test_agent_loop_writes_report_in_quality_folder_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             root = workspace / "repository"
@@ -2957,8 +2990,8 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 check=False,
                 env=environment,
             )
-            html = root / "quality-gate-report.html"
-            state = root / "quality-gate-state.json"
+            html = root / ".quality" / "quality-gate-report.html"
+            state = root / ".quality" / "quality-gate-state.json"
 
             self.assertIn(
                 completed.returncode, (1, 2), completed.stdout + completed.stderr
@@ -2999,7 +3032,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 "allow": {"core": []},
                 "deny": [],
             }
-            (root / ".quality-dependencies.json").write_text(
+            (quality_file(root, "quality-dependencies.json")).write_text(
                 json.dumps(dependencies), encoding="utf-8"
             )
             config = gate.default_config()
@@ -3037,8 +3070,8 @@ class QualityGateEndToEndTests(unittest.TestCase):
             rendered = report_path.read_text(encoding="utf-8")
             self.assertIn("Can I ship this?", rendered)
             self.assertIn("READY TO SHIP", rendered)
-            self.assertEqual(rendered.count('<article class="gate '), 9)
-            self.assertEqual(rendered.count("NOT NEEDED"), 0)
+            self.assertEqual(rendered.count('<details class="check-row '), 9)
+            self.assertNotIn("9 total ·", rendered)
             self.assertEqual(rendered.count("data-copy="), 0)
             self.assertNotIn("Gherkin", rendered)
             self.assertNotIn("Executable UI", rendered)

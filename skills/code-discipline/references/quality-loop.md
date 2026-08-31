@@ -14,10 +14,10 @@ In a Claude Code plugin, the skill directory is
 `${CLAUDE_PLUGIN_ROOT}/skills/code-discipline`; in Codex, use the directory of
 the loaded `SKILL.md`.
 
-`.quality-gate.json` owns commands and adapters. `.quality-thresholds.json`
+`.quality/quality-gate.json` owns commands and adapters. `.quality/quality-thresholds.json`
 owns every numeric goal and overrides the bundled defaults in
-`../quality-thresholds.json`, including `file_loc.max_lines: 1000`. Never copy
-thresholds into `.quality-gate.json`.
+`../quality-thresholds.json`, including `file_loc.max_lines: 600`. Never copy
+thresholds into `.quality/quality-gate.json`.
 
 To update the complete installed skill:
 
@@ -45,8 +45,8 @@ baseline tests/coverage/CRAAP pass, but defers repeated flaky tests and mutation
 testing and therefore never exits `0`. When state says `ready_for_full`, run its
 `full_rerun_command` immediately.
 
-Every run writes `quality-gate-report.html` and `quality-gate-state.json` in the
-repository root and prints both paths. Add them to the repository's ignore file
+Every run writes `.quality/quality-gate-report.html` and
+`.quality/quality-gate-state.json` and prints both paths. Add them to the repository's ignore file
 when they should remain local. Use `--html PATH` to choose another report path
 or `--artifact-dir DIR` to choose the directory for both artifacts.
 
@@ -67,7 +67,7 @@ Before the first run, preserve existing worktree changes. Only one loop may run
 per repository; coverage and mutation tools often share temporary paths. Do not
 run mutation analysis while another process writes source files.
 
-If `.quality-dependencies.json` is missing, derive it from intended architecture
+If `.quality/quality-dependencies.json` is missing, derive it from intended architecture
 after reading the repository. Never bless current imports as architecture by
 default.
 

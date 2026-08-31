@@ -116,10 +116,10 @@
         "json",
         "--ignore-errors",
         "-o",
-        ".quality-coverage.json"
+        ".quality/coverage.json"
       ]
     ],
-    "coverage_report": ".quality-coverage.json",
+    "coverage_report": ".quality/coverage.json",
     "coverage_format": "coverage-json",
     "timeout_seconds": 600
   },
@@ -174,7 +174,7 @@
   "dependencies": {
     "command": null,
     "edges_report": null,
-    "rules": ".quality-dependencies.json",
+    "rules": ".quality/quality-dependencies.json",
     "timeout_seconds": 300
   },
   "tools": {

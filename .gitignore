@@ -7,12 +7,13 @@ __pycache__/
 .mypy_cache/
 /.coverage
 /.coverage.*
-/.quality-coverage.json
 /htmlcov/
 /.agents/skills/code-discipline/
 /.claude/skills/code-discipline
-/quality-gate-report.html
-/quality-gate-state.json
+/.quality/coverage.json
+/.quality/quality-gate-report.html
+/.quality/quality-gate-state.json
+/.quality/*.tmp
 evals/workspaces/
 evals/results/20*/
 evals/results/latest.txt

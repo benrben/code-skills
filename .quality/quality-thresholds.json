@@ -16,7 +16,7 @@
     "craap_limit": 6
   },
   "file_loc": {
-    "max_lines": 1000
+    "max_lines": 600
   },
   "dead_code": {
     "max_findings": 0
