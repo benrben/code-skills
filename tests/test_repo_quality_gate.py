@@ -558,8 +558,9 @@ class QualityGateUnitTests(unittest.TestCase):
             with self.subTest(option=option):
                 self.assertIn(option, readme)
         for command_fragment in (
-            "scripts/install.py | python3 - --repo --root .",
-            "scripts/install.py | python3 - --global",
+            "contents/skills/code-discipline/scripts/install.py?ref=main",
+            "| python3 - --repo --root .",
+            "| python3 - --global",
             "scripts/install.py --update-current",
             '"$HOME/.agents/skills/code-discipline/scripts/install.py" --update-current',
             ".agents/skills/code-discipline/scripts/quality_loop.py --root . --html",

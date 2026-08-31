@@ -13,13 +13,13 @@ dependencies.
 In the current repository:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/benrben/code-skills/refs/heads/main/skills/code-discipline/scripts/install.py | python3 - --repo --root .
+curl -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github.com/repos/benrben/code-skills/contents/skills/code-discipline/scripts/install.py?ref=main" | python3 - --repo --root .
 ```
 
 Globally for all repositories on this computer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/benrben/code-skills/refs/heads/main/skills/code-discipline/scripts/install.py | python3 - --global
+curl -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github.com/repos/benrben/code-skills/contents/skills/code-discipline/scripts/install.py?ref=main" | python3 - --global
 ```
 
 Restart the agents after the first installation. One command configures both:
