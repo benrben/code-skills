@@ -419,6 +419,14 @@ class QualityGateUnitTests(unittest.TestCase):
         for option in ("--init", "--local-changes", "--fast", "--update-from-github"):
             with self.subTest(option=option):
                 self.assertIn(option, readme)
+        for command_fragment in (
+            "git submodule add https://github.com/benrben/code-skills.git .code-skills",
+            'git clone https://github.com/benrben/code-skills.git "$HOME/code-skills"',
+            "python3 .code-skills/repo_quality_gate.py --update-from-github",
+            'python3 "$HOME/code-skills/repo_quality_gate.py" --update-from-github',
+        ):
+            with self.subTest(command_fragment=command_fragment):
+                self.assertIn(command_fragment, readme)
         self.assertIn("repository-setup.md", readme)
         self.assertIn("--update-from-github [REF]", core_help)
 

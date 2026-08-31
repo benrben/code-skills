@@ -1,23 +1,38 @@
 # code-skills
 
-One coding skill with an executable repository quality gate for Claude Code and
-Codex.
+`code-discipline` is a Claude Code and Codex skill with an executable quality
+gate for formatting, lint, types, contracts, tests, coverage, complexity, File
+LOC, dead code, flaky tests, mutation testing, and module boundaries.
 
-It checks:
+Requirements: Python 3.10+, Git, and the target repository's own runtime and
+dependencies.
 
-1. formatting and lint
-2. static types
-3. contracts and schemas
-4. tests, coverage, and complexity
-5. File LOC (1,000 physical lines by default)
-6. dead code
-7. flaky tests
-8. mutation testing
-9. module boundaries
+## Commands
 
-## Install once
+Choose one installation: repository-local when the skill should travel with one
+project, or global when all your repositories should share one copy.
 
-Keep one shared checkout. Every repository can use the same installation.
+### 1. Install in one repository from GitHub
+
+Run from the target repository root. This records `code-skills` as a Git
+submodule and exposes the skill to both agents.
+
+```bash
+git submodule add https://github.com/benrben/code-skills.git .code-skills
+mkdir -p .agents/skills .claude/skills
+ln -s ../../.code-skills/skills/code-discipline \
+  .agents/skills/code-discipline
+ln -s ../../.code-skills/skills/code-discipline \
+  .claude/skills/code-discipline
+python3 .code-skills/repo_quality_gate.py --root . --init
+```
+
+Commit `.gitmodules`, `.code-skills`, the two symlinks, and the generated quality
+configuration when the repository should share them with its contributors.
+
+### 2. Install globally from GitHub
+
+Run once. Every repository on this computer can then use the same installation.
 
 ```bash
 git clone https://github.com/benrben/code-skills.git "$HOME/code-skills"
@@ -28,155 +43,131 @@ ln -s "$HOME/code-skills/skills/code-discipline" \
   "$HOME/.claude/skills/code-discipline"
 ```
 
-Install only the link for the agent you use. Restart the agent after the first
-installation.
+Restart the agent after its first installation.
 
-Requirements: Python 3.10+, Git, and the target repository's own runtime and
-dependencies.
-
-## Set up a repository
-
-From any directory, run:
+Initialize any target repository with the global copy:
 
 ```bash
-python3 "$HOME/code-skills/repo_quality_gate.py" \
-  --root /path/to/repository \
-  --init
+python3 "$HOME/code-skills/repo_quality_gate.py" --root . --init
 ```
 
-This creates two small control files in the target repository:
-
-- `.quality-gate.json` — commands and adapters
-- `.quality-thresholds.json` — every numeric quality goal
-
-Then ask your coding agent:
-
-```text
-Use $code-discipline to finish setting up this repository's quality environment,
-including module boundaries, and run the fast quality check.
-```
-
-The skill detects the repository's stack, preserves its package manager and
-lockfile, and configures the relevant formatter, linter, type checker, schema
-checks, tests, coverage, dead-code detection, flaky-test runs, mutation testing,
-and architecture rules.
-
-### Agent prompt: install in this repository
-
-```text
-Install the code-discipline skill in the current repository from
-https://github.com/benrben/code-skills.git. Preserve all existing changes. Use
-one shared checkout at $HOME/code-skills and create project-local symlinks at
-.agents/skills/code-discipline and .claude/skills/code-discipline. Never
-overwrite a real file, directory, unexpected symlink, or existing quality
-configuration. If .quality-gate.json and .quality-thresholds.json are both
-absent, initialize them with repo_quality_gate.py --root . --init. Then read the
-installed repository-setup.md, finish configuring this repository's actual
-toolchain, verify the links and versions, and run the fast local-change gate.
-Report everything changed and any remaining work. Do not commit or push.
-```
-
-## Run it
-
-While working on uncommitted changes:
+### 3. Update the repository-local skill from GitHub
 
 ```bash
-python3 "$HOME/code-skills/skills/code-discipline/scripts/quality_loop.py" \
-  --root . \
-  --local-changes \
-  --fast
+python3 .code-skills/repo_quality_gate.py --update-from-github
+git add .code-skills
 ```
 
-Before shipping the whole repository:
+The first command performs a fast-forward-only update. The second records the
+new submodule commit in the parent repository; commit it when ready.
 
-```bash
-python3 "$HOME/code-skills/skills/code-discipline/scripts/quality_loop.py" \
-  --root .
-```
-
-Fast mode is diagnostic and intentionally exits nonzero. Its JSON state tells
-you when to run the full command. A full exit code of `0` means every applicable
-gate passed.
-
-Reports are written to a repository-specific user cache by default, so the
-target worktree stays clean.
-
-## Update every linked repository
-
-Run one command from anywhere:
+### 4. Update the global skill from GitHub
 
 ```bash
 python3 "$HOME/code-skills/repo_quality_gate.py" --update-from-github
 ```
 
-This performs a fast-forward-only update of the shared checkout. Every
-repository using the symlink immediately gets the new skill and runner. The
-command refuses to update when the shared checkout has local changes.
+Every repository using the global symlink immediately receives the update.
 
-To update from a release tag or commit instead of `main`:
+Both update commands stop when the skill checkout has local changes. They never
+overwrite repository-owned `.quality-gate.json`, `.quality-thresholds.json`, or
+`.quality-dependencies.json`.
+
+### 5. Install or update to a tag or commit
+
+Append the desired Git tag or commit:
 
 ```bash
+python3 .code-skills/repo_quality_gate.py \
+  --update-from-github TAG_OR_COMMIT
+
 python3 "$HOME/code-skills/repo_quality_gate.py" \
   --update-from-github TAG_OR_COMMIT
 ```
 
-Repository-owned `.quality-gate.json`, `.quality-thresholds.json`, and
-`.quality-dependencies.json` files are never overwritten.
+### 6. Run the quality gate
 
-### Agent prompt: update from GitHub
+Repository-local installation:
+
+```bash
+python3 .code-skills/skills/code-discipline/scripts/quality_loop.py \
+  --root . --local-changes --fast
+```
+
+Global installation:
+
+```bash
+python3 "$HOME/code-skills/skills/code-discipline/scripts/quality_loop.py" \
+  --root . --local-changes --fast
+```
+
+Remove `--local-changes --fast` for complete repository certification. Fast
+mode is diagnostic and intentionally exits nonzero; a full exit code of `0`
+means every applicable gate passed.
+
+### 7. Verify the installation
+
+Repository-local:
+
+```bash
+python3 .code-skills/repo_quality_gate.py --version
+python3 .code-skills/skills/code-discipline/scripts/quality_loop.py --version
+```
+
+Global:
+
+```bash
+python3 "$HOME/code-skills/repo_quality_gate.py" --version
+python3 "$HOME/code-skills/skills/code-discipline/scripts/quality_loop.py" \
+  --version
+```
+
+## Agent prompt: install in this repository
 
 ```text
-Update the code-discipline skill used by the current repository from
-https://github.com/benrben/code-skills.git. Preserve all repository changes and
-quality configuration. Resolve the existing skill symlink, then run the shared
-checkout's repo_quality_gate.py --update-from-github command. The update must be
-fast-forward-only and must stop if the shared checkout is dirty; never stash,
-reset, or discard changes. If this repository uses a standalone runner, update
-that runner instead. Verify the resolved skill path, old and new versions, skill
-validation, and updater tests. Report results. Do not modify product code,
-commit, or push.
+Install code-discipline in the current repository from
+https://github.com/benrben/code-skills.git using the repository-local submodule
+commands in README.md. Preserve all existing changes and never overwrite an
+existing file, directory, symlink, or quality configuration. Initialize quality
+configuration only when it is absent, read repository-setup.md, configure this
+repository's actual toolchain, verify the installation, and run the fast
+local-change gate. Report changes and remaining work. Do not commit or push.
 ```
 
-### Standalone copied runner
+## Agent prompt: update from GitHub
 
-If a repository cannot use the shared skill, copy the runner and bundled
-defaults once:
-
-```bash
-cp "$HOME/code-skills/repo_quality_gate.py" /path/to/repository/
-cp "$HOME/code-skills/skills/code-discipline/quality-thresholds.json" \
-  /path/to/repository/quality-thresholds.json
+```text
+Update the code-discipline installation used by the current repository with the
+matching repository-local or global command in README.md. Preserve product code
+and repository-owned quality configuration. Use only a fast-forward update and
+stop if the skill checkout is dirty; never stash, reset, or discard changes.
+Verify the resolved skill path, old and new versions, skill validation, and
+updater tests. Report results. Do not commit or push.
 ```
-
-That copy can update itself later:
-
-```bash
-python3 repo_quality_gate.py --update-from-github
-```
-
-The downloaded Python and JSON are validated before atomic replacement. Local
-repository configuration remains untouched.
 
 ## Thresholds
 
-Defaults live in
-[`quality-thresholds.json`](skills/code-discipline/quality-thresholds.json).
-`--init` copies them to `.quality-thresholds.json`, where a repository can set
-its goals. File LOC defaults to 1,000 lines; coverage defaults to 100%; function
-complexity and CRAAP default to 6.
+`--init` creates:
 
-Threshold values placed in `.quality-gate.json` are ignored, keeping one source
-of truth.
+- `.quality-gate.json` for commands and adapters
+- `.quality-thresholds.json` for every numeric goal
+
+Defaults are in
+[`quality-thresholds.json`](skills/code-discipline/quality-thresholds.json).
+File LOC defaults to 1,000 lines, coverage to 100%, and function complexity and
+CRAAP to 6. Threshold values in `.quality-gate.json` are ignored so there is one
+source of truth.
 
 ## More help
 
 ```bash
-python3 "$HOME/code-skills/repo_quality_gate.py" --help
-python3 "$HOME/code-skills/skills/code-discipline/scripts/quality_loop.py" --help
+python3 repo_quality_gate.py --help
+python3 skills/code-discipline/scripts/quality_loop.py --help
 ```
 
-The detailed environment guide is
-[`repository-setup.md`](skills/code-discipline/references/repository-setup.md).
+See the detailed
+[`repository-setup.md`](skills/code-discipline/references/repository-setup.md)
+when configuring a new language stack.
 
 ## Development
 
