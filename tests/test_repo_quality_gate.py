@@ -1,5 +1,4 @@
 import contextlib
-import hashlib
 import json
 import importlib.util
 import io
@@ -2261,7 +2260,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
             )
 
-    def test_agent_loop_writes_html_by_default_without_a_flag(self) -> None:
+    def test_agent_loop_writes_report_in_repository_root_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             root = workspace / "repository"
@@ -2285,18 +2284,15 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 check=False,
                 env=environment,
             )
-            digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:12]
-            artifacts = cache / "repo-quality-loop" / f"{root.name}-{digest}"
-            html = artifacts / "quality-gate-report.html"
-            state = artifacts / "quality-gate-state.json"
+            html = root / "quality-gate-report.html"
+            state = root / "quality-gate-state.json"
 
             self.assertIn(
                 completed.returncode, (1, 2), completed.stdout + completed.stderr
             )
             self.assertTrue(html.is_file())
             self.assertTrue(state.is_file())
-            self.assertIn(f"HTML={html}", completed.stdout)
-            self.assertFalse((root / "quality-gate-report.html").exists())
+            self.assertIn(f"HTML={html.resolve()}", completed.stdout)
 
     def test_complete_generic_adapter_run_passes_and_writes_html(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

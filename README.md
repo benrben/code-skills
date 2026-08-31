@@ -75,8 +75,9 @@ Run complete repository certification:
 python3 .agents/skills/code-discipline/scripts/quality_loop.py --root .
 ```
 
-Every run generates an HTML report and prints its path. Add
-`--html quality-gate-report.html` only when you want a specific location.
+Every run generates an HTML report named `quality-gate-report.html` and a
+`quality-gate-state.json` state file in the repository root, then prints both
+paths. Use `--html PATH` only when you want a different location.
 
 For a global installation, replace `.agents/skills/code-discipline` in those
 commands with `$HOME/.agents/skills/code-discipline`.

@@ -45,10 +45,10 @@ baseline tests/coverage/CRAAP pass, but defers repeated flaky tests and mutation
 testing and therefore never exits `0`. When state says `ready_for_full`, run its
 `full_rerun_command` immediately.
 
-Every run writes an HTML report and prints its path. By default it uses a
-repository-specific user cache so the worktree stays clean. Use `--html PATH`
-to choose another report path or `--artifact-dir DIR` to choose the directory
-for both the HTML report and JSON state.
+Every run writes `quality-gate-report.html` and `quality-gate-state.json` in the
+repository root and prints both paths. Add them to the repository's ignore file
+when they should remain local. Use `--html PATH` to choose another report path
+or `--artifact-dir DIR` to choose the directory for both artifacts.
 
 ## Results and repair loop
 

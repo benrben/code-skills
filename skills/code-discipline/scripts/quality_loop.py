@@ -438,7 +438,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     output = parser.add_mutually_exclusive_group()
     output.add_argument(
         "--artifact-dir",
-        help="report directory (default: a repository-specific user cache)",
+        help="report directory (default: repository root)",
     )
     output.add_argument(
         "--html",
@@ -506,7 +506,7 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
         artifact_dir = html_path.parent
     else:
         artifact_dir = resolve_from_root(
-            args.artifact_dir, root, default_artifact_dir(root)
+            args.artifact_dir, root, root
         )
         html_path = artifact_dir / "quality-gate-report.html"
     explicit_gate_script = args.gate_script is not None
