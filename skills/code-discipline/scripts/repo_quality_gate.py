@@ -4835,6 +4835,17 @@ def gate_card_html(gate: GateResult, presentation: tuple[str, str, str, str]) ->
     </article>"""
 
 
+def optional_gate_setup_prompt(report: AnalysisReport, gate: GateResult) -> str:
+    guidance = "\n".join(gate.details) or "Inspect the repository and choose its native toolchain."
+    return f"""Add and configure the optional `{gate.title}` quality check for this repository:
+{report.root}
+
+Current state: {gate.summary}
+Guidance: {guidance}
+
+Inspect the repository's languages, package managers, existing scripts, and CI before choosing a tool. Install the smallest maintained dependency that fits the existing toolchain, configure a deterministic non-interactive check command, and add it to `.quality-gate.json`. Do not disable another gate, weaken thresholds, add broad ignores, or replace the check with a no-op. Run the new check directly, then rerun the repository quality gate and report the exact command and result."""
+
+
 def html_report(report: AnalysisReport) -> str:
     if report.mode == "fast":
         status = (
@@ -5011,47 +5022,54 @@ def html_report(report: AnalysisReport) -> str:
     )
     if len(report.dependency_violations) > len(shown_dependencies):
         dependency_rows += f'<tr><td colspan="5">Showing 200 violations out of {len(report.dependency_violations)}.</td></tr>'
-    prompts = []
-    for gate in report.gates:
-        shown_prompts = gate.prompts[:3]
-        for title, prompt in shown_prompts:
-            prompt_id = f"prompt-issue-{len(prompts)}"
-            prompts.append(f"""<article class="prompt"><div class="prompt-head"><h3>{html.escape(title)}</h3>
-            <button data-copy="{prompt_id}">Copy prompt</button></div>
-            <pre id="{prompt_id}">{html.escape(prompt)}</pre></article>""")
-        if len(gate.prompts) > len(shown_prompts):
-            prompts.append(
-                f'<article class="prompt more"><h3>{len(gate.prompts) - len(shown_prompts)} more {html.escape(gate.title)} fixes</h3><p>Start with the prompts shown, then rerun the gate. The next highest-priority fixes will move into this queue.</p></article>'
-            )
-    if report.passed:
-        prompt_html = '<div class="all-clear">Nothing to fix. Every applicable check is green.</div>'
-    else:
-        master_prompt = html.escape(master_fix_prompt(report))
-        individual_prompt_html = "".join(prompts)
-        if individual_prompt_html:
-            individual_prompt_html = f"""<div class="prompt-group-heading"><h3>Prefer smaller tasks?</h3>
-            <p>Use these focused prompts one issue at a time, then rerun the gate.</p></div>{individual_prompt_html}"""
-        if report.mode == "fast" and report.ready_for_full:
-            prompt_kicker = "Fast checks are green · certification remains"
-            prompt_heading = "Run full certification"
-            prompt_copy = "Copy full-run prompt"
-            prompt_explanation = "The expensive flaky-test and mutation gates were deferred. Run them now before shipping."
-        elif report.mode == "fast":
-            prompt_kicker = "Fast diagnostic · one agent task"
-            prompt_heading = "Fix measured issues"
-            prompt_copy = "Copy repair prompt"
-            prompt_explanation = "Repair the executed failures quickly, rerun fast mode, then complete a full certification run."
-        else:
-            prompt_kicker = "All failing gates · one agent task"
-            prompt_heading = "Fix every issue"
-            prompt_copy = "Copy complete prompt"
-            prompt_explanation = "Paste this once. It tells the agent to repair every applicable check and keep rerunning the gate until it passes."
-        prompt_html = f"""<article class="prompt master-prompt">
-          <div class="prompt-head"><div><div class="kicker">{prompt_kicker}</div><h3>{prompt_heading}</h3></div>
-          <button data-copy="prompt-fix-everything">{prompt_copy}</button></div>
-          <p>{prompt_explanation}</p>
-          <pre id="prompt-fix-everything">{master_prompt}</pre>
-        </article>{individual_prompt_html}"""
+    failed_gates = [
+        gate
+        for gate in report.gates
+        if gate.applicable and not gate.deferred and not gate.passed
+    ]
+    optional_gates = [gate for gate in report.gates if not gate.applicable]
+    repair_action_html = ""
+    if not report.passed:
+        repair_action_html = f"""<button class="copy primary" data-copy="prompt-fix-everything">
+          <span aria-hidden="true">▣</span> Copy repair prompt
+        </button><pre class="copy-source" id="prompt-fix-everything" hidden>{html.escape(master_fix_prompt(report))}</pre>"""
+
+    fix_rows = "".join(
+        f"""<div class="issue-row"><span class="state-label fail">{gate_outcome(gate)}</span>
+        <div><strong>{html.escape(gate.title)}</strong><p>{html.escape(gate.summary)}</p></div></div>"""
+        for gate in failed_gates
+    )
+    fix_section = ""
+    if failed_gates:
+        fix_section = f"""<details class="group-section fix-section" open>
+          <summary><span><span class="summary-icon fail">!</span>Fix first</span><span>{len(failed_gates)}</span></summary>
+          <div class="group-body">{fix_rows}</div>
+        </details>"""
+
+    optional_rows = []
+    optional_prompts = []
+    for index, gate in enumerate(optional_gates):
+        prompt_id = f"prompt-install-{index}"
+        prompt = optional_gate_setup_prompt(report, gate)
+        optional_prompts.append(f"## {gate.title}\n\n{prompt}")
+        reason = gate.details[0] if gate.details else gate.summary
+        optional_rows.append(
+            f"""<div class="optional-row"><span class="na-mark">N/A</span>
+            <div><strong>{html.escape(gate.title)}</strong><p>{html.escape(reason)}</p></div>
+            <button class="copy secondary" data-copy="{prompt_id}"><span aria-hidden="true">▣</span> Copy install prompt</button>
+            <pre class="copy-source" id="{prompt_id}" hidden>{html.escape(prompt)}</pre></div>"""
+        )
+    optional_section = ""
+    if optional_rows:
+        all_optional_prompt = "\n\n---\n\n".join(optional_prompts)
+        optional_section = f"""<details class="group-section optional-section" open>
+          <summary><span><span class="summary-icon na">N/A</span>Add optional checks</span><span>{len(optional_gates)} not applicable</span></summary>
+          <div class="optional-heading"><p>These checks were not detected. Copy a prompt only if you want to add one.</p>
+          <button class="copy secondary" data-copy="prompt-install-all"><span aria-hidden="true">▣</span> Copy all install prompts</button></div>
+          <pre class="copy-source" id="prompt-install-all" hidden>{html.escape(all_optional_prompt)}</pre>
+          <div class="group-body">{"".join(optional_rows)}</div>
+        </details>"""
+
     notes_html = "".join(f"<li>{html.escape(note)}</li>" for note in report.notes)
     language_text = ", ".join(report.languages)
     setup_failed = sum(result.returncode != 0 for result in report.tool_setup)
@@ -5064,49 +5082,95 @@ def html_report(report: AnalysisReport) -> str:
     else:
         setup_summary = "No install was needed. Built-in tools and existing project tools were enough."
         setup_evidence = ""
-    if report.mode == "fast":
-        quick_guide = """<div><strong>Purple means diagnostic</strong>A full run is still required.</div><div><strong>Green means measured clean</strong>This executed check passed.</div><div><strong>Red means repair</strong>Fix it during the fast loop.</div><div><strong>Deferred means later</strong>It runs during certification.</div>"""
-    else:
-        quick_guide = """<div><strong>Green means go</strong>No action needed.</div><div><strong>Red means pause</strong>Fix it before shipping.</div><div><strong>Gray means not applicable</strong>No supported project check was detected.</div><div><strong>Need help?</strong>Copy an AI repair prompt below.</div>"""
     functions_passing = sum(function.passed for function in report.functions)
     files_passing = sum(file.passed for file in report.files)
     mutants_killed = sum(not mutation.survived for mutation in report.mutations)
+    total_gates = max(1, len(report.gates))
+    failed_count = len(failed_gates)
+    outcome_segments = "".join(
+        f'<span class="segment {state}" style="flex:{count}" title="{count} {label}"></span>'
+        for state, count, label in (
+            ("pass", passed_gates, "passed"),
+            ("fail", failed_count, "failed"),
+            ("deferred", deferred_gates, "deferred"),
+            ("na", not_applicable_gates, "not applicable"),
+        )
+        if count
+    )
+    outcome_legend = "".join(
+        f'<span><i class="{state}"></i><strong>{count}</strong> {label}</span>'
+        for state, count, label in (
+            ("pass", passed_gates, "Passed"),
+            ("fail", failed_count, "Failed"),
+            ("deferred", deferred_gates, "Deferred"),
+            ("na", not_applicable_gates, "Not applicable"),
+        )
+    )
+    dashboard_files = sorted(report.files, key=lambda item: (-item.lines, item.path))[:4]
+    file_bars = "".join(
+        f"""<div class="file-bar"><div><code>{html.escape(item.path)}</code><span>{item.lines:,} / {item.limit:,}</span></div>
+        <div class="bar-track"><span class="{'pass' if item.passed else 'fail'}" style="width:{min(100.0, 100.0 * item.lines / item.limit):.2f}%"></span></div></div>"""
+        for item in dashboard_files
+    ) or '<div class="empty">No production files selected.</div>'
+    gate_flow_items = []
+    for gate in report.gates:
+        if gate.deferred:
+            state, symbol, state_text = "deferred", "◷", "DEFERRED"
+        elif not gate.applicable:
+            state, symbol, state_text = "na", "−", "N/A"
+        elif gate.passed:
+            state, symbol, state_text = "pass", "✓", "PASS"
+        else:
+            state, symbol, state_text = "fail", "×", "FAIL"
+        short_title = gate_language.get(
+            gate.key, ("", gate.title, gate.title, gate.summary)
+        )[2]
+        gate_flow_items.append(
+            f"""<div class="flow-item {state}"><span class="flow-symbol">{symbol}</span>
+            <strong>{html.escape(short_title)}</strong><small>{state_text}</small></div>"""
+        )
+    gate_flow = "".join(gate_flow_items)
+    all_commands = [
+        result for gate in report.gates for result in gate.command_results
+    ]
+    evidence_html = commands_html(all_commands)
+    thresholds_html = html.escape(json.dumps(thresholds, indent=2))
+    repository_name = Path(report.root).name or report.root
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_heading} — {status}</title>
 <style>
-:root{{--bg:#f6f4ff;--ink:#17152b;--muted:#67637b;--card:#fff;--line:#ded9f0;--purple:#6d4aff;--purple-soft:#eee9ff;--good:#087a55;--good-soft:#e5f8f0;--bad:#c72c41;--bad-soft:#fff0f2;--na:#6b7280;--na-soft:#f1f2f4;--diagnostic:#7047c9;--diagnostic-soft:#f1eaff;--code:#19172b}}
-*{{box-sizing:border-box}} body{{margin:0;background:radial-gradient(circle at 8% 0,#ebe5ff 0,transparent 32%),var(--bg);color:var(--ink);font:16px/1.58 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}}
-main{{max-width:1220px;margin:auto;padding:42px 28px 72px}} h1,h2,h3{{line-height:1.12;letter-spacing:-.025em}} h1{{font-size:clamp(42px,7vw,76px);margin:.12em 0}} h2{{font-size:28px;margin:52px 0 8px}} h3{{font-size:24px;margin:8px 0 12px}}
-.eyebrow,.kicker{{color:var(--purple);font-size:13px;font-weight:900;letter-spacing:.1em;text-transform:uppercase}} .muted,.section-note{{color:var(--muted)}}
-.hero{{display:grid;grid-template-columns:1fr auto;gap:28px;align-items:end;padding:30px;border:1px solid var(--line);border-radius:26px;background:rgba(255,255,255,.78);box-shadow:0 18px 60px rgba(67,47,140,.09)}}
-.verdict{{min-width:220px;text-align:center;font-weight:950;font-size:24px;padding:18px 22px;border-radius:18px}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--diagnostic);background:var(--diagnostic-soft)}}
-.progress{{margin-top:16px;color:var(--muted);font-weight:700}} .progress strong{{color:var(--ink)}} .quick-guide{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .quick-guide div{{padding:14px 16px;background:rgba(255,255,255,.7);border:1px solid var(--line);border-radius:14px}} .quick-guide strong{{display:block}}
-.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}} .gate,.prompt,.setup{{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:0 10px 35px rgba(67,47,140,.06)}}
-.gate.pass{{border-top:6px solid var(--good)}} .gate.fail{{border-top:6px solid var(--bad)}} .gate.na{{border-top:6px solid var(--na)}} .gate.deferred{{border-top:6px solid var(--diagnostic)}} .gate-top,.prompt-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .step{{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--purple-soft);color:var(--purple);font-weight:950}} .badge{{font-size:12px;font-weight:950;padding:6px 9px;border-radius:99px}} .pass .badge{{background:var(--good-soft);color:var(--good)}} .fail .badge{{background:var(--bad-soft);color:var(--bad)}} .na .badge{{background:var(--na-soft);color:var(--na)}} .deferred .badge{{background:var(--diagnostic-soft);color:var(--diagnostic)}}
-.explain{{color:var(--muted);min-height:76px}} .result{{padding:12px 14px;border-radius:12px;font-weight:750}} .pass .result{{background:var(--good-soft);color:var(--good)}} .fail .result{{background:var(--bad-soft);color:var(--bad)}} .na .result{{background:var(--na-soft);color:var(--na)}} .deferred .result{{background:var(--diagnostic-soft);color:var(--diagnostic)}} .stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}} .stat{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}} .stat strong{{display:block;font-size:26px}} .stat span{{color:var(--muted)}}
-.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:var(--card)}} table{{width:100%;border-collapse:collapse}} th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{background:#f0edfa;font-size:13px;text-transform:uppercase;letter-spacing:.05em}} tr.bad{{background:#fff8f9}} tr.bad td:last-child{{color:var(--bad);font-weight:900}} tr.ok td:last-child{{color:var(--good);font-weight:800}}
-code,pre{{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f4f1ff;padding:15px;border-radius:12px;max-height:420px;overflow:auto}} details{{margin-top:12px}} summary{{cursor:pointer;font-weight:800;color:var(--purple)}} button{{background:var(--purple);color:#fff;border:0;border-radius:10px;padding:9px 13px;font-weight:900;cursor:pointer}} button.copied{{background:var(--good)}}
-.prompt{{border-left:5px solid var(--purple)}} .prompt h3{{font-size:18px;letter-spacing:0}} .master-prompt{{grid-column:1/-1;border:2px solid var(--purple);background:linear-gradient(135deg,#fff 0,#f5f1ff 100%)}} .master-prompt h3{{font-size:28px;margin-top:5px}} .master-prompt p{{color:var(--muted)}} .prompt-group-heading{{grid-column:1/-1;margin-top:12px}} .prompt-group-heading h3{{margin-bottom:4px}} .prompt-group-heading p{{margin:0;color:var(--muted)}} .all-clear{{grid-column:1/-1;padding:24px;background:var(--good-soft);color:var(--good);font-weight:850;border-radius:16px}} .setup{{padding:18px 22px}} ul{{padding-left:20px}}
-@media(max-width:900px){{.grid,.quick-guide{{grid-template-columns:1fr}}.stats{{grid-template-columns:1fr 1fr}}.explain{{min-height:0}}}} @media(max-width:650px){{main{{padding:18px}}.hero{{grid-template-columns:1fr;padding:22px}}.verdict{{min-width:0}}.stats{{grid-template-columns:1fr}}}}
+:root{{--bg:#f4f6f8;--ink:#111318;--secondary:#606773;--card:rgba(255,255,255,.94);--glass:rgba(248,251,255,.76);--line:rgba(41,50,65,.12);--blue:#087cff;--good:#16a05d;--good-soft:#eaf8f0;--bad:#ef3939;--bad-soft:#fff0f0;--deferred:#7b4ce2;--deferred-soft:#f1ebff;--na:#8b929d;--na-soft:#f0f2f4;--code:#1f232b}}
+*{{box-sizing:border-box}} body{{margin:0;overflow-x:hidden;background:radial-gradient(circle at 50% -20%,#dcecff 0,transparent 35%),var(--bg);color:var(--ink);font:15px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif}}
+main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-top:0}} h1{{font-size:clamp(34px,4vw,50px);line-height:1.04;letter-spacing:-.035em;margin:5px 0 8px}} h2{{font-size:19px}} button{{font:inherit}}
+.toolbar{{position:sticky;top:12px;z-index:5;display:flex;align-items:center;gap:18px;padding:11px 16px;border:1px solid rgba(255,255,255,.72);border-radius:18px;background:var(--glass);backdrop-filter:blur(24px) saturate(150%);box-shadow:0 8px 30px rgba(40,58,90,.11)}} .brand{{font-weight:700}} .repo{{padding:6px 12px;border-radius:999px;background:rgba(255,255,255,.62);border:1px solid var(--line)}} .toolbar-meta{{margin-left:auto;display:flex;gap:18px;color:var(--secondary);font-size:13px}} .toolbar-meta strong{{color:var(--ink)}}
+.hero{{display:grid;grid-template-columns:1fr auto;align-items:end;gap:24px;padding:28px 4px 18px}} .eyebrow{{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--secondary)}} .verdict{{display:inline-flex;margin-top:8px;padding:5px 9px;border-radius:8px;font-size:12px;font-weight:700}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--deferred);background:var(--deferred-soft)}} .meta{{color:var(--secondary)}}
+.copy{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 13px;border-radius:10px;border:1px solid rgba(8,124,255,.48);background:#fff;color:var(--blue);font-weight:650;cursor:pointer}} .copy.primary{{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 5px 14px rgba(8,124,255,.2)}} .copy:hover{{filter:brightness(.97)}} .copy.copied{{background:var(--good);border-color:var(--good);color:#fff}}
+.dashboard{{display:grid;grid-template-columns:1fr 1fr;gap:14px}} .card{{min-width:0;background:var(--card);border:1px solid rgba(255,255,255,.85);border-radius:18px;padding:16px;box-shadow:0 7px 24px rgba(35,45,70,.07)}} .card h2{{margin-bottom:14px}} .outcome-bar{{display:flex;height:22px;overflow:hidden;border-radius:7px;background:#e8ebef}} .segment.pass,.bar-track .pass,.legend i.pass{{background:var(--good)}} .segment.fail,.bar-track .fail,.legend i.fail{{background:var(--bad)}} .segment.deferred,.legend i.deferred{{background:var(--deferred)}} .segment.na,.legend i.na{{background:var(--na)}} .legend{{display:flex;flex-wrap:wrap;gap:20px;margin-top:14px;color:var(--secondary)}} .legend span{{display:flex;align-items:center;gap:6px}} .legend i{{width:10px;height:10px;border-radius:3px}}
+.file-bar+ .file-bar{{margin-top:13px}} .file-bar>div:first-child{{display:flex;justify-content:space-between;gap:12px;margin-bottom:5px}} .file-bar code{{min-width:0;overflow-wrap:anywhere}} .file-bar span{{flex:none;color:var(--secondary)}} .bar-track{{height:7px;border-radius:99px;background:#e2e5e9;overflow:hidden}} .bar-track span{{display:block;height:100%;border-radius:inherit}} .file-summary{{margin:12px 0 0;color:var(--good);font-weight:650}} .empty{{padding:20px;color:var(--secondary);text-align:center}}
+.flow-card{{grid-column:1/-1;overflow:hidden}} .gate-flow{{display:grid;grid-template-columns:repeat({total_gates},minmax(94px,1fr));gap:4px;overflow:auto;padding:4px 0}} .flow-item{{position:relative;display:grid;justify-items:center;gap:3px;text-align:center;color:var(--secondary)}} .flow-item:not(:last-child)::after{{content:"";position:absolute;top:16px;left:64%;width:72%;height:1px;background:var(--line)}} .flow-symbol{{position:relative;z-index:1;display:grid;place-items:center;width:34px;height:34px;border:1.5px solid currentColor;border-radius:50%;background:#fff;font-size:19px}} .flow-item strong{{font-size:12px;color:var(--ink);font-weight:600}} .flow-item small{{font-size:10px;font-weight:700}} .flow-item.pass{{color:var(--good)}} .flow-item.fail{{color:var(--bad)}} .flow-item.deferred{{color:var(--deferred)}} .flow-item.na{{color:var(--na)}}
+.accordion{{margin-top:14px;overflow:hidden;border:1px solid rgba(255,255,255,.82);border-radius:18px;background:var(--glass);backdrop-filter:blur(18px) saturate(135%);box-shadow:0 8px 28px rgba(35,45,70,.08)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
+.issue-row,.optional-row{{display:grid;grid-template-columns:94px 1fr auto;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}} .issue-row:last-child,.optional-row:last-child{{border-bottom:0}} .issue-row p,.optional-row p,.optional-heading p{{margin:2px 0 0;color:var(--secondary);font-size:13px}} .state-label{{font-size:12px;font-weight:750}} .state-label.fail{{color:var(--bad)}} .na-mark{{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--na);border-radius:50%;color:var(--na);font-size:10px}} .optional-heading{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}} .optional-heading p{{margin:0}} .panel{{padding:16px;border-top:1px solid var(--line)}}
+.gate-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .gate{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}} .gate.pass{{border-top:4px solid var(--good)}} .gate.fail{{border-top:4px solid var(--bad)}} .gate.na{{border-top:4px solid var(--na)}} .gate.deferred{{border-top:4px solid var(--deferred)}} .gate-top{{display:flex;justify-content:space-between;gap:8px}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .badge{{font-size:10px;font-weight:750}} .gate h3{{font-size:16px;margin:8px 0}} .kicker,.explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
+.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
+@media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card{{grid-column:auto}}.gate-grid{{grid-template-columns:1fr 1fr}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
+@media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.file-bar>div:first-child{{align-items:flex-start;flex-direction:column;gap:2px}}.gate-grid{{grid-template-columns:1fr}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
 </style></head><body><main>
-<section class="hero"><div><div class="eyebrow">CODE CONFIDENCE CHECK · v{VERSION} · {report.mode.upper()}</div><h1>{page_heading}</h1>
-<div class="muted">{html.escape(report.root)}<br>{html.escape(report.generated_at)} · {html.escape(language_text)}</div>
-<div class="progress"><strong>{passed_gates} of {applicable_gates}</strong> executed checks passed · {deferred_gates} deferred · {not_applicable_gates} not applicable</div></div>
-<div class="verdict {verdict_class}">{status}</div></section>
-<section class="quick-guide">{quick_guide}</section>
-<h2>Your quality checks</h2><p class="section-note">Start here. Technical proof is lower down when you need it.</p><section class="grid">{gate_cards}</section>
-<section class="stats"><div class="stat"><strong>{functions_passing}/{len(report.functions)}</strong><span>functions meet coverage + complexity + CRAAP</span></div><div class="stat"><strong>{files_passing}/{len(report.files)}</strong><span>files meet the {file_loc_limit}-line limit</span></div><div class="stat"><strong>{mutants_killed}/{len(report.mutations)}</strong><span>wrong-code mutations caught</span></div><div class="stat"><strong>{len(report.dependency_violations)}</strong><span>architecture violations</span></div></section>
-<h2>Fix with your coding agent</h2><p class="section-note">Choose the complete all-in-one prompt or a focused prompt for one issue.</p><section class="grid">{prompt_html}</section>
-<h2>Automatic tool setup</h2><section class="setup"><strong>{html.escape(setup_summary)}</strong>{setup_evidence}</section>
-<h2>Function health</h2><p class="section-note">Lower complexity and CRAAP are better. Required: {coverage_limit:g}% executable-line coverage, complexity ≤ {complexity_limit:g}, and CRAAP ≤ {craap_limit:g}.</p>
-<div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div>
-<h2>File size</h2><p class="section-note">Physical lines include code, comments, and blank lines. Required: at most {file_loc_limit} lines per production file.</p>
-<div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div>
-<h2>Test strength</h2><p class="section-note">A “survived” mutant is a tiny wrong-code change your tests failed to catch. Required: zero survivors.</p>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div>
-<h2>Architecture boundaries</h2><p class="section-note">These imports cross a boundary your project says should stay closed.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div>
-<h2>Run details</h2><section class="setup"><ul>{notes_html}</ul></section>
+<header class="toolbar"><span class="brand">Code Confidence</span><span class="repo">{html.escape(repository_name)} · {html.escape(report.scope.description)}</span>
+<div class="toolbar-meta"><strong>{report.mode.upper()} RUN</strong><span>{html.escape(report.generated_at)}</span></div></header>
+<section class="hero"><div><div class="eyebrow">Repository health · v{VERSION}</div><h1>{page_heading}</h1>
+<div class="meta">{html.escape(report.root)} · {html.escape(language_text)}</div><span class="verdict {verdict_class}">{status}</span></div>{repair_action_html}</section>
+<section class="dashboard"><article class="card"><h2>Gate outcomes</h2><div class="outcome-bar" aria-label="{passed_gates} passed, {failed_count} failed, {deferred_gates} deferred, {not_applicable_gates} not applicable">{outcome_segments}</div><div class="legend">{outcome_legend}</div></article>
+<article class="card"><h2>File size</h2>{file_bars}<p class="file-summary">{files_passing} of {len(report.files)} pass · limit {file_loc_limit:,} lines</p></article>
+<article class="card flow-card"><h2>Quality gates</h2><div class="gate-flow">{gate_flow}</div></article></section>
+<section class="accordion">{fix_section}{optional_section}
+<details class="data-section"><summary><span>All checks</span><span>{len(report.gates)} total · {passed_gates} pass · {failed_count} fail · {deferred_gates} deferred · {not_applicable_gates} N/A</span></summary><div class="panel gate-grid">{gate_cards}</div></details>
+<details class="data-section"><summary><span>Functions + coverage</span><span>{functions_passing}/{len(report.functions)} pass · target {coverage_limit:g}% · complexity ≤ {complexity_limit:g} · CRAAP ≤ {craap_limit:g}</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div></details>
+<details class="data-section"><summary><span>Files</span><span>{len(report.files)} measured · {files_passing} pass · limit {file_loc_limit:,}</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div></div></details>
+<details class="data-section"><summary><span>Mutations + flaky tests</span><span>{mutants_killed}/{len(report.mutations)} mutations caught · {deferred_gates} deferred gates</span></summary><div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></div></details>
+<details class="data-section"><summary><span>Evidence</span><span>{len(all_commands)} commands · {len(report.dependency_violations)} architecture violations</span></summary><div class="panel">{evidence_html}<h3>Architecture boundaries</h3><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div></div></details>
+<details class="data-section"><summary><span>Thresholds + run details</span><span>{report.mode} mode · {html.escape(report.scope.description)} · {html.escape(language_text)}</span></summary><div class="panel"><h3>Thresholds</h3><pre>{thresholds_html}</pre><h3>Automatic tool setup</h3><p>{html.escape(setup_summary)}</p>{setup_evidence}<h3>Notes</h3><ul>{notes_html}</ul></div></details>
+</section><footer>{applicable_gates} applicable · {deferred_gates} deferred · generated {html.escape(report.generated_at)}</footer>
 </main><script>
 document.querySelectorAll('[data-copy]').forEach(button=>button.addEventListener('click',async()=>{{
  const text=document.getElementById(button.dataset.copy).textContent;

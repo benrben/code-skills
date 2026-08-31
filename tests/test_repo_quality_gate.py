@@ -604,7 +604,9 @@ class QualityGateUnitTests(unittest.TestCase):
                 [root / "api.schema.json"],
             )
 
-    def test_failing_report_has_master_and_focused_repair_prompts(self) -> None:
+    def test_failing_report_has_one_repair_action_and_optional_setup_prompts(
+        self,
+    ) -> None:
         function = gate.FunctionMetric(
             path="src/app.py",
             name="choose",
@@ -663,6 +665,22 @@ class QualityGateUnitTests(unittest.TestCase):
                     "One dependency rule was violated.",
                     prompts=[("Repair boundary", "Invert the dependency.")],
                 ),
+                gate.GateResult(
+                    "types",
+                    "Static type checking",
+                    True,
+                    "Not applicable: no type checker was detected.",
+                    ["Configure the repository's complete static type checker."],
+                    applicable=False,
+                ),
+                gate.GateResult(
+                    "dead_code",
+                    "Dead code",
+                    True,
+                    "Not applicable: no unused-code detector was detected.",
+                    ["Configure a high-confidence unused-code detector."],
+                    applicable=False,
+                ),
             ],
             functions=[function],
             mutations=[mutation],
@@ -675,9 +693,14 @@ class QualityGateUnitTests(unittest.TestCase):
         combined = gate.master_fix_prompt(report)
         rendered = gate.html_report(report)
 
-        self.assertIn("Fix every issue", rendered)
-        self.assertIn("Copy complete prompt", rendered)
-        self.assertIn("Prefer smaller tasks?", rendered)
+        self.assertEqual(rendered.count("Copy repair prompt"), 1)
+        self.assertNotIn("Copy complete prompt", rendered)
+        self.assertNotIn("Prefer smaller tasks?", rendered)
+        self.assertEqual(rendered.count("Copy install prompt"), 2)
+        self.assertEqual(rendered.count("Copy all install prompts"), 1)
+        self.assertIn("Add optional checks", rendered)
+        self.assertIn("Static type checking", rendered)
+        self.assertIn("Dead code", rendered)
         self.assertEqual(rendered.count("data-copy="), 4)
         self.assertIn("every production function has 100%", combined)
         self.assertIn("zero survive", combined)
