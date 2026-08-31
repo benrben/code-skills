@@ -42,6 +42,22 @@ installer = load_script("skill_installer_test_module", INSTALL_SCRIPT)
 
 
 class QualityGateUnitTests(unittest.TestCase):
+    def test_installer_falls_back_to_curl_when_python_https_fails(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["curl"], returncode=0, stdout=b"skill payload", stderr=b""
+        )
+        with mock.patch.object(
+            installer, "urlopen", side_effect=installer.URLError("certificate")
+        ), mock.patch.object(
+            installer.shutil, "which", return_value="/usr/bin/curl"
+        ), mock.patch.object(
+            installer.subprocess, "run", return_value=completed
+        ) as run:
+            payload = installer.download_file("https://example.test/SKILL.md", 100)
+
+        self.assertEqual(payload, b"skill payload")
+        self.assertIn("--max-filesize", run.call_args.args[0])
+
     def test_skill_package_is_complete_and_runs_without_source_checkout(self) -> None:
         skill_source = ROOT / "skills" / "code-discipline"
         for relative in installer.SKILL_FILES:

@@ -22,9 +22,11 @@ Globally for all repositories on this computer:
 curl -fsSL https://raw.githubusercontent.com/benrben/code-skills/main/skills/code-discipline/scripts/install.py | python3 - --global
 ```
 
-Restart the agent after the first installation. The installer places the full
-skill in `.agents/skills/code-discipline` and safely exposes the same copy to
-Claude Code. It does not clone or add the `code-skills` repository.
+Restart the agents after the first installation. One command configures both:
+Codex reads `.agents/skills/code-discipline`, while Claude Code reads the safe
+`.claude/skills/code-discipline` link to that same complete skill. Global
+installation creates the same two paths under `$HOME`. The installer does not
+clone or add the `code-skills` repository.
 
 ## Update from GitHub
 

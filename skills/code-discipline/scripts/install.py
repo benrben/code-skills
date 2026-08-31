@@ -66,7 +66,36 @@ def download_file(url: str, maximum_bytes: int = 2_000_000) -> bytes:
         with urlopen(request, timeout=30) as response:
             payload = response.read(maximum_bytes + 1)
     except (HTTPError, URLError, TimeoutError, OSError) as error:
-        raise RuntimeError(f"could not download {url}: {error}") from error
+        curl = shutil.which("curl")
+        if curl is None:
+            raise RuntimeError(f"could not download {url}: {error}") from error
+        try:
+            completed = subprocess.run(
+                [
+                    curl,
+                    "-fsSL",
+                    "--max-time",
+                    "30",
+                    "--max-filesize",
+                    str(maximum_bytes),
+                    url,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=35,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as curl_error:
+            raise RuntimeError(
+                f"could not download {url} with Python HTTPS or curl: {curl_error}"
+            ) from curl_error
+        if completed.returncode != 0:
+            details = completed.stderr.decode(errors="replace").strip()
+            raise RuntimeError(
+                f"could not download {url} with Python HTTPS or curl: "
+                f"{details or f'curl exited {completed.returncode}'}"
+            ) from error
+        payload = completed.stdout
     if len(payload) > maximum_bytes:
         raise RuntimeError(f"download exceeds {maximum_bytes} bytes: {url}")
     return payload
