@@ -71,13 +71,18 @@ people):
    — printed in every mode; when a run measures nothing it repeats the last
    measurement with its timestamp. Use it to plan tests, not to discover gaps
    at the end.
-4. `To fix:` a numbered list: functions, oversized files, surviving mutants,
-   dependency violations, then other failing gates.
-5. The next step: the exact command to rerun, the full ship-report command
-   when a partial or fast run is green, or — when the ship report is green —
-   `HAND OFF NOW`: the next message is the hand-off; nothing is added after
-   green.
-6. `QUALITY_LOOP=PASS|FAIL|READY_FOR_FULL|ERROR`, `ITEMS_TO_FIX=n`, `STATE=`,
+4. `Since last run: fixed n · remaining m · new k` — compared with the
+   previous state file, so a cycle's effect is visible without reading twice.
+5. `To fix:` up to twelve items (functions, oversized files, surviving
+   mutants, dependency violations, then other failing gates). More than
+   twelve: the list is grouped by file with counts, most items first,
+   repository-level items last, followed by `Next file:` — the
+   `quality_items.py --next` command that prints the first file's items.
+6. The next step: the exact command to rerun; when the fast run is green,
+   "commit this step, then continue" plus the ship-report command; or — when
+   the ship report is green — `HAND OFF NOW`: the next message is the
+   hand-off; nothing is added after green.
+7. `QUALITY_LOOP=PASS|FAIL|READY_FOR_FULL|ERROR`, `ITEMS_TO_FIX=n`, `STATE=`,
    `HTML=`.
 
 Gates marked OFF (mutation, flaky) are off in the configuration and run only
@@ -88,9 +93,10 @@ them. Nothing is skipped silently: skipped, deferred, and off gates are listed.
 
 - Exit `0`: every executed check passed (a partial run's selected checks, or
   the full ship report).
-- Exit `1`: read the `To fix` list (and `fix_prompt` / `failures` in the state
-  file), repair one coherent batch, run the focused test, and rerun the same
-  command. In fast mode exit 1 may instead mean READY_FOR_FULL.
+- Exit `1`: read the `To fix` list, run `quality_items.py --next` for the
+  items of the first file, fix that file, and rerun the same command. Never
+  open the state file yourself; the items script reads it. In fast mode exit
+  1 may instead mean READY_FOR_FULL: commit the step and continue.
 - Exit `2`: configuration, an adapter, or the runner failed; repair that
   blocker first — it is an item to fix, not a reason to stop.
 
@@ -102,6 +108,43 @@ are diagnostic until the unmodified baseline suite passes; check
 
 Before the first run, preserve existing worktree changes. Only one loop may run
 per repository; coverage and mutation tools often share temporary paths.
+
+## quality_items.py: what to fix next
+
+Reads the state file the loop wrote and prints only what the next cycle needs:
+
+| Command | Prints |
+|---|---|
+| `quality_items.py --root . --next` | the first file with open items: every item with line, metric, and a hint |
+| `quality_items.py --root . --file PATH` | the same for one file (full path or file name) |
+| `quality_items.py --root . --summary` | files and counts only |
+| `quality_items.py --root . --briefs N` | one ready-to-send sub-agent brief per file for the N files with the most items |
+
+`--state PATH` selects another state file. Exit 2 means the loop has not run
+yet.
+
+## The per-step cycle
+
+New project: skeleton (manifest, test runner, one passing test of one real
+function, start command) → `--init` → `--local-changes --fast` green with 0
+items → commit. Then for every feature: write its test and code →
+`--local-changes --fast` → `quality_items.py --next` → fix that file → rerun →
+… → READY_FOR_FULL → `git commit`. Because each step is committed, every fast
+run measures only the current step. Before hand-off: the whole-repository
+ship report (`quality_loop.py --root .`, no scope flag), which includes
+Runs (smoke) and Gate scope.
+
+## Sub-agent briefs
+
+When items sit in several files, the parent fans out: `quality_items.py
+--briefs 4` prints one brief per file. Each brief names the file the
+sub-agent owns (plus its test file), lists its items with hints, and carries
+the rules: edit only those files; no `--init`, no `.quality/`, no commit;
+verify with that file's test; stop and report when a fix needs another file.
+The parent edits shared modules first, waits for every sub-agent, then reruns
+the fast run once — that report is the evidence. The same pattern builds a new
+project in parallel: after the skeleton is green, the parent writes the shared
+contracts and their tests, then one sub-agent per directory.
 
 ## Runs (smoke): the application must start
 

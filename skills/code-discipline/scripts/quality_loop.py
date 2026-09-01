@@ -27,7 +27,11 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
-from quality_report import previous_measurement, print_report  # noqa: E402
+from quality_report import (  # noqa: E402
+    previous_item_keys,
+    previous_measurement,
+    print_report,
+)
 
 from repo_quality_gate import analysis_state, write_json_atomic  # noqa: E402
 from repo_quality_gate import command_state as command_state  # noqa: E402
@@ -35,7 +39,7 @@ from repo_quality_gate import gate_status as gate_status  # noqa: E402
 from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
 from repo_quality_gate import state_status as state_status  # noqa: E402
 
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 QUALITY_DIRECTORY = ".quality"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 CHECK_FLAGS: tuple[tuple[str, str], ...] = (
@@ -524,6 +528,7 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     previous = previous_measurement(state_path)
+    previous_items = previous_item_keys(state_path)
     html_path.write_text(gate.html_report(analysis), encoding="utf-8")
     state = analysis_state(gate, analysis, html_path, state_path, exit_code, run_error)
     write_json_atomic(state_path, state)
@@ -535,6 +540,7 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
         html_path,
         args.print_prompt,
         previous,
+        previous_items,
     )
     return exit_code
 

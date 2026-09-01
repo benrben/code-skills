@@ -6523,6 +6523,19 @@ def smoke_template(root: Path) -> dict[str, Any]:
     return {"commands": commands, "_note": note}
 
 
+def ensure_git_repository(root: Path) -> str | None:
+    """Create a git repository at ``root`` when none exists; returns the line to print."""
+    if (root / ".git").exists():
+        return None
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return "git is not available here: commit each green step once it is."
+    return (
+        "Initialized an empty git repository: commit each green step (SKILL.md rule 8)."
+    )
+
+
 def smoke_init_message(commands: Sequence[Sequence[str]]) -> str:
     if commands:
         return f"Runs (smoke): the ship report starts the application with {shlex.join(commands[0])}; adjust smoke.commands if that is not how it starts."
@@ -6652,6 +6665,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Mutation testing and flaky detection are off until requested: run with --mutation or --flaky, or enable them in the configuration."
         )
         print(smoke_init_message(inferred_smoke_commands(root)))
+        git_line = ensure_git_repository(root)
+        if git_line:
+            print(git_line)
         print(
             "Review source, format/lint, types, contracts, tests, metrics, dead-code, and dependency settings before the first enforcing run."
         )

@@ -33,6 +33,7 @@ SKILL_FILES = (
     "scripts/install.py",
     "scripts/quality_loop.py",
     "scripts/quality_report.py",
+    "scripts/quality_items.py",
     "scripts/repo_quality_gate.py",
     "scripts/smoke_check.py",
 )
@@ -40,6 +41,7 @@ PYTHON_FILES = (
     "scripts/install.py",
     "scripts/quality_loop.py",
     "scripts/quality_report.py",
+    "scripts/quality_items.py",
     "scripts/repo_quality_gate.py",
     "scripts/smoke_check.py",
 )

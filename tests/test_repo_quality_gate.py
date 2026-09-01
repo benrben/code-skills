@@ -44,6 +44,8 @@ def load_script(name: str, path: Path):
 gate = load_script("quality_gate_test_module", CORE_SCRIPT)
 quality_loop = load_script("quality_loop_test_module", LOOP_SCRIPT)
 quality_report = load_script("quality_report_test_module", REPORT_SCRIPT)
+ITEMS_SCRIPT = REPORT_SCRIPT.with_name("quality_items.py")
+quality_items = load_script("quality_items_test_module", ITEMS_SCRIPT)
 installer = load_script("skill_installer_test_module", INSTALL_SCRIPT)
 EMPTY_FAILURES: dict[str, list] = {
     "checks": [],
@@ -3979,7 +3981,7 @@ class LoopReportTests(unittest.TestCase):
                 ],
                 "files": [{"path": "big.py", "lines": 700, "limit": 600}],
                 "surviving_mutants": [
-                    {"path": "a.py", "line": 4, "original": "==", "replacement": "!="}
+                    {"path": "a.py", "line": 4, "change": "== -> !="}
                 ],
                 "dependencies": [
                     {"source": "a.py", "line": 1, "target": "b.py", "rule": "deny"}
@@ -4000,7 +4002,7 @@ class LoopReportTests(unittest.TestCase):
             [
                 "a.py:3 f — coverage 50%, complexity 7",
                 "big.py — 700 lines (max 600)",
-                "a.py:4 surviving mutant `==` -> `!=`",
+                "a.py:4 surviving mutant `== -> !=`",
                 "a.py:1 -> b.py: deny",
                 "Types: 1 error",
             ],
@@ -4020,8 +4022,14 @@ class LoopReportTests(unittest.TestCase):
             }
         }
         lines = quality_report.to_fix_lines(many)
-        self.assertEqual(len(lines), 13)
-        self.assertEqual(lines[-1], "  … and 1 more (see STATE)")
+        self.assertEqual(len(lines), 14)
+        self.assertEqual(
+            lines[0], "  13 items in 13 files — one file per cycle, top first"
+        )
+        self.assertEqual(lines[1], "  1. 0.py — 1 item (1 file size)")
+        self.assertEqual(
+            lines[-1], "  … and 1 more files (quality_items.py --summary lists them)"
+        )
         twelve = {
             "failures": {**EMPTY_FAILURES, "files": many["failures"]["files"][:12]}
         }
@@ -4052,7 +4060,7 @@ class LoopReportTests(unittest.TestCase):
             quality_report.next_step_lines(
                 {**state, "status": "ready_for_full"}, SimpleNamespace(mode="fast")
             ),
-            ["Fast checks are green. Run the full ship report now:", "  full"],
+            [quality_report.COMMIT_LINE, "  full"],
         )
         self.assertEqual(
             quality_report.next_step_lines(
@@ -4856,3 +4864,379 @@ class SmokeCheckTests(unittest.TestCase):
             ).expectations,
             smoke_check.PageExpectations(None, None, smoke_check.DEFAULT_FAIL_PATTERN),
         )
+
+
+def sample_state() -> dict[str, Any]:
+    return {
+        "status": "fail",
+        "rerun_command": "rerun",
+        "full_rerun_command": "full",
+        "fix_prompt": "",
+        "thresholds": {"metrics": {"coverage_limit": 100, "complexity_limit": 6}},
+        "failures": {
+            **EMPTY_FAILURES,
+            "functions": [
+                {
+                    "path": "src/a.ts",
+                    "line": 4,
+                    "name": "one",
+                    "coverage_percent": 50.0,
+                    "complexity": 2,
+                    "covered_lines": 2,
+                    "total_lines": 4,
+                },
+                {
+                    "path": "src/a.ts",
+                    "line": 20,
+                    "name": "two",
+                    "coverage_percent": 100.0,
+                    "complexity": 9,
+                },
+                {
+                    "path": "src/b.ts",
+                    "line": 1,
+                    "name": "three",
+                    "coverage_percent": 0.0,
+                    "complexity": 1,
+                },
+            ],
+            "checks": [
+                {
+                    "key": "types",
+                    "title": "Types",
+                    "summary": "1 error",
+                    "details": ["src/b.ts:3 TS2322\nmore"],
+                }
+            ],
+        },
+    }
+
+
+class ReportGroupingTests(unittest.TestCase):
+    def test_records_carry_hints_keys_and_metrics(self) -> None:
+        records = quality_report.item_records(sample_state())
+        self.assertEqual(
+            [record["key"] for record in records],
+            [
+                "function src/a.ts one",
+                "function src/a.ts two",
+                "function src/b.ts three",
+                "check types",
+            ],
+        )
+        self.assertEqual(
+            records[0]["hint"], "add a test that reaches its 2 uncovered lines"
+        )
+        self.assertEqual(records[0]["metric"], "coverage")
+        self.assertEqual(
+            records[1]["hint"], "complexity 9 > 6: split it into smaller functions"
+        )
+        self.assertEqual(records[1]["metric"], "complexity")
+        self.assertEqual(
+            records[2]["hint"], "add a test that reaches its untested paths"
+        )
+        self.assertEqual(records[3]["path"], quality_report.REPOSITORY)
+        self.assertEqual(records[3]["hint"], "src/b.ts:3 TS2322")
+        self.assertEqual(records[3]["details"], ["src/b.ts:3 TS2322"])
+
+    def test_function_hint_covers_craap_and_the_fallback(self) -> None:
+        limits = {"coverage_limit": 100.0, "complexity_limit": 6.0, "craap_limit": 6.0}
+        item = {"coverage_percent": 100.0, "complexity": 1, "craap_score": 7.5}
+        self.assertEqual(
+            quality_report.function_hint(item, limits),
+            "CRAAP 7.5 > 6: cover it or simplify it",
+        )
+        item = {"coverage_percent": 100.0, "complexity": 1}
+        self.assertEqual(
+            quality_report.function_hint(item, limits), "cover it or simplify it"
+        )
+        both = {"coverage_percent": 10.0, "complexity": 7, "craap_score": 1}
+        self.assertEqual(quality_report.function_hint(both, limits).count(";"), 1)
+        self.assertEqual(
+            quality_report.metric_limits({}),
+            {"coverage_limit": 100.0, "complexity_limit": 6.0, "craap_limit": 6.0},
+        )
+        self.assertEqual(
+            quality_report.metric_limits(
+                {"thresholds": {"metrics": {"craap_limit": 3}}}
+            )["craap_limit"],
+            3.0,
+        )
+
+    def test_files_are_ordered_by_count_then_path_with_repository_last(self) -> None:
+        records = quality_report.item_records(sample_state())
+        groups = quality_report.files_in_order(records)
+        self.assertEqual(
+            [path for path, _ in groups], ["src/a.ts", "src/b.ts", "(repository)"]
+        )
+        self.assertEqual(
+            quality_report.metric_breakdown(groups[0][1]), "1 complexity · 1 coverage"
+        )
+        self.assertEqual(
+            quality_report.file_line(2, "src/b.ts", groups[1][1]),
+            "  2. src/b.ts — 1 item (1 coverage)",
+        )
+        tie = [
+            quality_report.file_record({"path": "z.py", "lines": 1, "limit": 0}),
+            quality_report.file_record({"path": "y.py", "lines": 1, "limit": 0}),
+        ]
+        self.assertEqual(
+            [path for path, _ in quality_report.files_in_order(tie)], ["y.py", "z.py"]
+        )
+
+    def test_other_record_kinds_have_hints(self) -> None:
+        mutant = quality_report.mutant_record(
+            {"path": "a.py", "line": 4, "change": "== -> !="}
+        )
+        self.assertEqual(mutant["text"], "a.py:4 surviving mutant `== -> !=`")
+        self.assertEqual(
+            mutant["hint"], "add a test that fails when the code changes `== -> !=`"
+        )
+        self.assertEqual(mutant["metric"], "mutant")
+        dependency = quality_report.dependency_record(
+            {"source": "a.py", "line": 1, "target": "b.py", "rule": "deny"}
+        )
+        self.assertEqual(dependency["key"], "dependency a.py -> b.py")
+        self.assertIn("remove the import of b.py", dependency["hint"])
+        scope = quality_report.scope_record("src/x.ts — excluded by source.exclude")
+        self.assertEqual(scope["path"], "src/x.ts")
+        self.assertEqual(scope["line"], 0)
+        plain = quality_report.check_record(
+            {"key": "lint", "title": "Lint", "summary": "2"}
+        )
+        self.assertEqual(plain["hint"], "read the command output in the report")
+        self.assertEqual(plain["details"], [])
+
+    def test_delta_line_and_previous_keys(self) -> None:
+        self.assertIsNone(quality_report.delta_line(None, {"a"}))
+        self.assertEqual(
+            quality_report.delta_line({"a", "b"}, {"b", "c"}),
+            "Since last run: fixed 1 · remaining 2 · new 1",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            self.assertIsNone(quality_report.previous_item_keys(path))
+            path.write_text("{}", encoding="utf-8")
+            self.assertIsNone(quality_report.previous_item_keys(path))
+            path.write_text("not json", encoding="utf-8")
+            self.assertIsNone(quality_report.previous_item_keys(path))
+            path.write_text(json.dumps(sample_state()), encoding="utf-8")
+            self.assertEqual(
+                quality_report.previous_item_keys(path),
+                quality_report.item_keys(sample_state()),
+            )
+            self.assertEqual(len(quality_report.item_keys(sample_state())), 4)
+
+    def test_fast_green_tells_the_agent_to_commit_and_continue(self) -> None:
+        state = {
+            "status": "ready_for_full",
+            "rerun_command": "r",
+            "full_rerun_command": "f",
+        }
+        lines = quality_report.next_step_lines(state, SimpleNamespace(mode="fast"))
+        self.assertEqual(lines, [quality_report.COMMIT_LINE, "  f"])
+        self.assertIn("Commit this step (git commit), then continue", lines[0])
+
+    def test_report_prints_delta_and_next_file(self) -> None:
+        analysis = SimpleNamespace(
+            mode="fast",
+            selection=["fast"],
+            scope=SimpleNamespace(description="d"),
+            gates=[],
+            thresholds={},
+            functions=[],
+        )
+        state = sample_state()
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                quality_report.print_report(
+                    gate,
+                    analysis,
+                    state,
+                    state_path,
+                    Path("h"),
+                    False,
+                    None,
+                    {"check types"},
+                )
+            text = output.getvalue()
+            self.assertIn("Since last run: fixed 0 · remaining 4 · new 3\n", text)
+            self.assertIn(
+                "To fix:\n  1. src/a.ts:4 one — coverage 50%, complexity 2\n", text
+            )
+            self.assertIn(
+                f"Next file:  python3 {ITEMS_SCRIPT} --state {state_path} --next\n",
+                text,
+            )
+            self.assertIn("ITEMS_TO_FIX=4\n", text)
+            output = io.StringIO()
+            state["failures"] = dict(EMPTY_FAILURES)
+            state["status"] = "ready_for_full"
+            with contextlib.redirect_stdout(output):
+                quality_report.print_report(
+                    gate, analysis, state, state_path, Path("h"), False
+                )
+            text = output.getvalue()
+            self.assertNotIn("Since last run", text)
+            self.assertNotIn("To fix", text)
+            self.assertNotIn("Next file", text)
+            self.assertIn("ITEMS_TO_FIX=0\n", text)
+
+
+class ItemsScriptTests(unittest.TestCase):
+    def run_items(
+        self, *arguments: str, state: dict[str, Any] | None = None
+    ) -> tuple[int, str, str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            if state is not None:
+                state_path = root / quality_items.STATE_NAME
+                state_path.parent.mkdir()
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = quality_items.main(["--root", str(root), *arguments])
+            return code, out.getvalue(), err.getvalue()
+
+    def test_next_prints_the_first_file_with_items_and_hints(self) -> None:
+        code, out, _ = self.run_items("--next", state=sample_state())
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "src/a.ts — 2 items (1 complexity · 1 coverage)")
+        self.assertEqual(
+            lines[1], "  L4     src/a.ts:4 one — coverage 50%, complexity 2"
+        )
+        self.assertEqual(
+            lines[2], "         → add a test that reaches its 2 uncovered lines"
+        )
+        self.assertEqual(
+            lines[3], "  L20    src/a.ts:20 two — coverage 100%, complexity 9"
+        )
+        self.assertEqual(
+            lines[-1],
+            "When this file is green, rerun the fast run. 2 more files after this one.",
+        )
+        code, out, _ = self.run_items(state=sample_state())
+        self.assertEqual(
+            out.splitlines()[0], "src/a.ts — 2 items (1 complexity · 1 coverage)"
+        )
+
+    def test_file_matches_a_path_or_a_file_name_and_shows_check_details(self) -> None:
+        code, out, _ = self.run_items("--file", "b.ts", state=sample_state())
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[0], "src/b.ts — 1 item (1 coverage)")
+        self.assertEqual(
+            out.splitlines()[-1],
+            "When this file is green, rerun the fast run. 2 more files after this one.",
+        )
+        code, out, _ = self.run_items("--file", "(repository)", state=sample_state())
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "(repository) — 1 item (1 Types)")
+        self.assertEqual(lines[1], "  —      Types: 1 error")
+        self.assertEqual(lines[3], "         src/b.ts:3 TS2322")
+        code, out, _ = self.run_items("--file", "nope.ts", state=sample_state())
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[0], "No open items in nope.ts.")
+        self.assertEqual(
+            out.splitlines()[1], "4 items in 3 files — one file per cycle, top first"
+        )
+
+    def test_summary_lists_files_and_counts(self) -> None:
+        code, out, _ = self.run_items("--summary", state=sample_state())
+        self.assertEqual(
+            out.splitlines(),
+            [
+                "4 items in 3 files — one file per cycle, top first",
+                "  1. src/a.ts — 2 items (1 complexity · 1 coverage)",
+                "  2. src/b.ts — 1 item (1 coverage)",
+                "  3. (repository) — 1 item (1 Types)",
+            ],
+        )
+
+    def test_briefs_skip_repository_items_and_carry_the_rules(self) -> None:
+        code, out, _ = self.run_items("--briefs", "1", state=sample_state())
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "=== brief 1 of 1: src/a.ts ===")
+        self.assertEqual(
+            lines[1],
+            "You own src/a.ts and its test file. Bring these 2 items to green:",
+        )
+        self.assertTrue(
+            lines[2].startswith(
+                "  - src/a.ts:4 one — coverage 50%, complexity 2 → add a test"
+            )
+        )
+        self.assertEqual(lines[4], quality_items.BRIEF_RULES)
+        self.assertEqual(lines[5], quality_items.PARENT_LINE)
+        code, out, _ = self.run_items("--briefs", "5", state=sample_state())
+        self.assertEqual(out.splitlines()[0], "=== brief 1 of 2: src/a.ts ===")
+        self.assertNotIn("(repository)", out)
+        code, out, _ = self.run_items("--briefs", "0", state=sample_state())
+        self.assertEqual(out.strip(), "No file-level items to delegate.")
+
+    def test_empty_state_and_missing_state(self) -> None:
+        empty = {**sample_state(), "failures": dict(EMPTY_FAILURES)}
+        for flag in ("--next", "--summary"):
+            code, out, _ = self.run_items(flag, state=empty)
+            self.assertEqual((code, out.strip()), (0, quality_items.NOTHING_TO_FIX))
+        code, out, err = self.run_items("--next")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("error: cannot read", err)
+        self.assertIn("Run the quality loop first", err)
+
+    def test_state_option_overrides_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "elsewhere.json"
+            path.write_text(json.dumps(sample_state()), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = quality_items.main(["--state", str(path), "--summary"])
+            self.assertEqual(code, 0)
+            self.assertTrue(out.getvalue().startswith("4 items in 3 files"))
+            args = quality_items.parse_args(["--root", "/r"])
+            self.assertEqual(
+                quality_items.state_path_for(args),
+                Path("/r") / quality_items.STATE_NAME,
+            )
+
+
+class InitGitTests(unittest.TestCase):
+    def test_init_creates_a_git_repository_only_when_none_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(
+                gate.ensure_git_repository(root),
+                "Initialized an empty git repository: commit each green step (SKILL.md rule 8).",
+            )
+            self.assertTrue((root / ".git").is_dir())
+            self.assertIsNone(gate.ensure_git_repository(root))
+
+    def test_init_reports_when_git_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.object(
+                gate.subprocess, "run", side_effect=OSError("no git")
+            ):
+                self.assertEqual(
+                    gate.ensure_git_repository(root),
+                    "git is not available here: commit each green step once it is.",
+                )
+            self.assertFalse((root / ".git").exists())
+
+    def test_init_command_prints_the_git_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            completed = subprocess.run(
+                [sys.executable, str(CORE_SCRIPT), "--root", str(root), "--init"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Initialized an empty git repository", completed.stdout)
+            self.assertTrue((root / ".git").is_dir())

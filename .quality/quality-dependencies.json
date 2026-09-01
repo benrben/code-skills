@@ -35,6 +35,12 @@
       "paths": [
         "skills/code-discipline/scripts/smoke_check.py"
       ]
+    },
+    {
+      "name": "quality-items",
+      "paths": [
+        "skills/code-discipline/scripts/quality_items.py"
+      ]
     }
   ],
   "allow": {
@@ -48,7 +54,10 @@
     ],
     "installer": [],
     "quality-report": [],
-    "smoke-check": []
+    "smoke-check": [],
+    "quality-items": [
+      "quality-report"
+    ]
   },
   "deny": [
     {
@@ -78,6 +87,22 @@
     {
       "from": "quality-engine",
       "to": "smoke-check"
+    },
+    {
+      "from": "quality-engine",
+      "to": "quality-items"
+    },
+    {
+      "from": "quality-items",
+      "to": "quality-engine"
+    },
+    {
+      "from": "quality-items",
+      "to": "quality-loop"
+    },
+    {
+      "from": "quality-report",
+      "to": "quality-items"
     }
   ]
 }

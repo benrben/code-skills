@@ -19,16 +19,24 @@ loaded once, and the ship report is green. The bundled loop prints that
 report. Read [references/quality-loop.md](references/quality-loop.md)
 completely before running it.
 
-1. **Deliverables first.** Before writing code, list what the task must
-   deliver (README, the command that starts the application — which you will
-   run, tests for what changes, decisions to record). "Finished" means that
-   list is done *and* the ship report is green.
-2. **Pick the check you need.** When `.quality/quality-gate.json` exists, run
-   `--local-changes --fast` for a first look, then one targeted check while
-   iterating: `--coverage`, `--craap`, `--lint`, `--types`, `--tests`,
-   `--complexity`, `--dead-code`, `--deps`, `--loc`, `--smoke` (they combine).
-   Read the report; fix what it lists; rerun until that check is green. Every
-   report shows what is covered today — use it to choose the next test.
+1. **Deliverables first, gate before source.** Before writing code, list
+   what the task must deliver (README, the command that starts the
+   application — which you will run, tests for what changes, decisions to
+   record). "Finished" means that list is done *and* the ship report is
+   green. In a new project the first files are the skeleton: the package
+   manifest, the test runner with one passing test of one real function, and
+   the start command. Run `--init`, then `--local-changes --fast`, and reach
+   0 items *before* the first feature — never write the whole application
+   and repair it afterwards.
+2. **Read the report, not the state.** The terminal report is the whole
+   interface: the gates, `Since last run`, and the files to fix in order.
+   Never open `.quality/quality-gate-state.json` or the HTML. Run
+   `quality_items.py --next` (printed as `Next file:`), fix that one file,
+   rerun `--local-changes --fast`. One file per cycle. Add a check flag —
+   `--coverage`, `--craap`, `--lint`, `--types`, `--tests`, `--complexity`,
+   `--dead-code`, `--deps`, `--loc`, `--smoke` (they combine) — only when the
+   report points at one gate. Do not run the test suite by hand between
+   cycles: the fast run is the test run.
 3. **Foreground only.** Run the loop in the same command whose exit code you
    read. Never run it in the background, never wait for a notification, never
    end a session while a run is in flight.
@@ -37,9 +45,10 @@ completely before running it.
    headless browser with `--expect-selector` for an element only a working
    page shows. A test suite that mocks the network proves nothing about this.
    The report is red until that command is configured and green.
-5. **Not finished until the ship report is green.** Before handoff run
-   `--local-changes` with no check flags: that is the ship report. Fix every
-   red line, rerun, repeat. Red means not finished. Never lower a threshold,
+5. **Not finished until the ship report is green.** Before handoff run the
+   ship report — no check flags: `--local-changes` for a change to an
+   existing repository, `--root .` alone for a new project. Fix every red
+   line, rerun, repeat. Red means not finished. Never lower a threshold,
    disable a check, or hide a finding to get green. Never add a production
    file to `source.exclude` (the **Gate scope** row catches it): an entry
    point gets a startup or smoke test instead.
@@ -50,16 +59,31 @@ completely before running it.
 7. **Green means hand off now.** The message after `QUALITY_LOOP=PASS` is the
    hand-off: the deliverables, ticked, and the report's status line. Do not
    add tools, configs, or checks after green.
+8. **Commit each green step.** When the fast run prints READY_FOR_FULL,
+   commit the step locally (`git add -A && git commit -m …`); `--init`
+   creates the repository when there is none. The next step's fast run then
+   measures only what changed. Never push, amend, or rewrite history unless
+   the user asks.
+9. **Fan out, measure once.** When the report lists items in more than one
+   file, or a feature splits into independent directories, use sub-agents
+   (the Agent tool): one per production file plus its test file, or one per
+   directory, at most four at once, all in the foreground.
+   `quality_items.py --briefs 4` prints the briefs. You keep the gate,
+   `.quality/`, the shared modules (types, schemas, contracts — edit them
+   *before* fanning out) and every commit; a sub-agent never runs `--init`,
+   never edits `.quality/`, never commits. Wait for all of them, then run
+   `--local-changes --fast` once: the report is the evidence, a sub-agent's
+   "green" is a claim. Never hand off while a sub-agent is running.
 
-When the task creates a new project, bootstrap the gate as soon as the first
-test runs (`python3 <skill-directory>/scripts/repo_quality_gate.py --root .
---init` produces a gate that runs on the first try; then follow
+In a new project, `python3 <skill-directory>/scripts/repo_quality_gate.py
+--root . --init` produces a gate that runs on the first try (then follow
 [references/repository-setup.md](references/repository-setup.md)). In an
 existing repository without a gate, run its focused checks and set the gate up
-only when asked. For a requested commit use `--commit [REF]`; use
-whole-repository scope only for requested hardening, audit, or release
-certification, which alone are read-only. Do not commit or push unless the
-user asked.
+only when asked. For a requested commit use `--commit [REF]`; whole-repository
+scope is for the ship report of a new project and for requested hardening,
+audit, or release certification (those alone are read-only). Local commits of
+your own green steps are part of the loop (rule 8); pushing, amending, or
+rewriting history needs the user.
 
 ## Readability counts.
 
