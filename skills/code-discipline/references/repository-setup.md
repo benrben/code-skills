@@ -20,10 +20,15 @@ versions.
    python3 <skill-directory>/scripts/repo_quality_gate.py --root . --init
    ```
 
-   `--init` creates `.quality/quality-gate.json` for commands/adapters and
-   `.quality/quality-thresholds.json` for every numeric quality goal. Module boundaries
-   additionally require a reviewed `.quality/quality-dependencies.json`. Review
-   generated detection; do not treat it as architecture intent.
+   `--init` creates `.quality/quality-gate.json` for commands/adapters,
+   `.quality/quality-thresholds.json` for every numeric quality goal, and a
+   generated `.quality/quality-dependencies.json` skeleton (workspace packages
+   become modules with the directions their manifests declare; otherwise one
+   module). For npm workspaces it writes per-package Vitest coverage commands
+   merged through `--merge-lcov`. Mutation testing and flaky detection start
+   off; enable them in the configuration or run `--mutation` / `--flaky` when
+   asked. Review generated detection; do not treat it as architecture intent.
+   The command prints the first loop command to run.
 4. Configure non-mutating check commands as JSON argument arrays. Use
    `["bash", "-lc", "..."]` only when a check truly requires pipes, globbing,
    command substitution, or another shell feature.
@@ -84,6 +89,38 @@ The numeric goals live only in `.quality/quality-thresholds.json`:
 cyclomatic complexity at most 6, and CRAAP at most 6 per function. Do not use
 file-average coverage or omit hard functions from an adapter report.
 
+The built-in metrics use these exact rules:
+
+- Function coverage is `covered executable lines / reported executable lines`.
+  A line is covered when its hit count is greater than zero. Named nested
+  function lines belong only to the nested function, not its parent. This is
+  line coverage; branch data may be collected by the test tool but is not part
+  of this percentage.
+- Python complexity starts at 1. It adds paths for conditionals, loops,
+  exceptions, Boolean operators, comprehensions, and non-default `match`
+  cases. Each comprehension `for` and filter adds one. Each extra OR-pattern
+  alternative adds one. An unguarded wildcard or capture case is the default
+  and adds nothing. Named nested functions are measured separately; lambda
+  paths belong to the containing function.
+- Python `.pyi` functions, `@overload` declarations, and stub-body
+  `@abstractmethod` declarations have no coverage requirement, but their
+  complexity is still checked. A normal function whose body is `pass` is not a
+  stub and still requires coverage.
+- CRAAP is always recalculated by the gate, including for normalized adapters:
+
+  ```text
+  CRAAP = complexity^2 * (1 - coverage/100)^3 + complexity
+  ```
+
+  The uncovered fraction is limited to the range 0 through 1. Pass/fail uses
+  the unrounded score, so reports retain enough digits to explain a strict
+  `CRAAP <= limit` result.
+
+With the default 100% coverage limit, every passing function has
+`CRAAP = complexity`. The CRAAP value still ranks failures by risk, but it adds
+an independent pass condition only when a repository chooses a coverage limit
+below 100% or a CRAAP limit different from its complexity limit.
+
 ### 5. Dead code
 
 Install and configure a high-confidence detector, then place its complete command
@@ -124,6 +161,17 @@ module, declare the modules it may import and explicit denied directions where
 useful. The built-in checker handles common imports; configure
 `dependencies.command` plus `dependencies.edges_report` for unsupported syntax.
 Prove one deliberately forbidden edge fails before trusting the CI rule.
+
+### 9. Runs (smoke)
+
+Configure `smoke.commands` with the command that starts the application and
+loads it once; `--init` generates it for an npm `start` script or a Python
+package. For a web UI use the bundled `scripts/smoke_check.py` with
+`--browser` and `--expect-selector` for an element only a working page shows;
+for a CLI or library run its entry point. The ship report is red until this
+command is configured and passes. Install a headless browser when the check
+asks for one (`python3 -m pip install playwright && python3 -m playwright
+install chromium`).
 
 ## File LOC
 

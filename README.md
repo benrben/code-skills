@@ -1,25 +1,12 @@
 # code-discipline
 
-A self-contained Codex and Claude Code skill for engineering discipline and
-strict repository quality gates. The installed skill includes `SKILL.md`, its
-setup guide, all thresholds, the quality engine, the repair loop, the updater,
-and HTML reporting.
+A self-contained Codex and Claude Code skill that helps an agent make safe,
+easy-to-review changes and then prove the repository still works: rules for
+readable code, a strict quality gate that runs tests and code checks, and tools
+to install or update the skill in another repository. Installing it gives the
+target repository the instructions, checking tools, and setup guidance it needs.
 
-Requirements: Python 3.10+ and the target repository's own runtime and
-dependencies.
-
-## What this project is
-
-This project provides a reusable skill for AI coding agents. It helps an agent
-make safe, easy-to-review changes and then check that the repository still
-works. The skill includes rules for readable code, a quality gate that runs
-tests and code checks, and tools to install or update the skill in another
-repository.
-
-Use it when you want Codex or Claude Code to follow the same engineering
-standards on every change. The skill is self-contained: installing it gives the
-target repository the instructions, checking tools, and setup guidance it
-needs.
+Requirements: Python 3.10+ plus the target repository's own runtime and dependencies.
 
 ## Install from GitHub
 
@@ -82,27 +69,44 @@ Run a fast diagnostic on local changes:
 python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --local-changes --fast
 ```
 
+Run just the check you need while iterating; flags combine, and partial runs
+never certify:
+
+```bash
+python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --local-changes --coverage --lint
+```
+
+Available checks: `--lint`, `--types`, `--contracts`, `--tests`, `--coverage`, `--complexity`,
+`--craap`, `--loc`, `--dead-code`, `--deps`, and on request `--flaky` and `--mutation`.
+
+Run the ship report before handoff (every enabled gate; red means not finished):
+
+```bash
+python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --local-changes
+```
+
 Run complete repository certification:
 
 ```bash
 python3 .agents/skills/code-discipline/scripts/quality_loop.py --root .
 ```
 
+Every run prints each gate, exact items to fix, `Coverage today`, a numbered
+`To fix` list, the next command, and machine-readable status and artifact paths.
+
+It also starts the app once (`smoke.commands`), rejects `source.exclude` hiding production files, and prints `HAND OFF NOW` when green.
+
 Every run writes `.quality/quality-gate-report.html` and
 `.quality/quality-gate-state.json`, then prints both paths. Use `--html PATH`
-only when you want a different location.
+to choose another HTML location.
 
-For a global installation, replace `.agents/skills/code-discipline` in those
-commands with `$HOME/.agents/skills/code-discipline`.
+For a global installation, replace `.agents/skills/code-discipline` with `$HOME/.agents/skills/code-discipline`.
 
-`--init` creates `.quality/quality-gate.json` for commands and adapters, plus
-`.quality/quality-thresholds.json` for every numeric goal. Module rules belong
-in `.quality/quality-dependencies.json`. Defaults include File LOC at 600 lines,
-coverage at 100%, and per-function complexity and CRAAP at 6. The
-skill's [repository setup guide](skills/code-discipline/references/repository-setup.md)
-explains how to configure formatter/lint, static types, contracts and schemas,
-tests, coverage, complexity, dead code, flaky-test detection, mutation testing,
-and module boundaries.
+`--init` creates command, threshold, and generated dependency-rule files under
+`.quality/`; workspace coverage is merged automatically. Mutation and flaky
+checks start off. Defaults are 600 file lines, 100% function coverage, and 6 for
+complexity and CRAAP. The [setup guide](skills/code-discipline/references/repository-setup.md)
+documents configuration, metric formulas, Python parsing, and stub rules.
 
 ## Prompt for an agent: install in this repository
 

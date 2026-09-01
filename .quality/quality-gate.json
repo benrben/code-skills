@@ -180,5 +180,21 @@
   "tools": {
     "auto_install": false,
     "cache_dir": null
+  },
+  "smoke": {
+    "enabled": true,
+    "commands": [
+      [
+        ".venv/bin/python",
+        "skills/code-discipline/scripts/quality_loop.py",
+        "--version"
+      ],
+      [
+        ".venv/bin/python",
+        "skills/code-discipline/scripts/smoke_check.py",
+        "--version"
+      ]
+    ],
+    "timeout_seconds": 120
   }
 }

@@ -296,9 +296,12 @@ class FunctionMetric:
     coverage_limit: float = 100.0
     complexity_limit: float = 6.0
     craap_limit: float = 6.0
+    coverage_measured: bool = True
 
     @property
     def passed(self) -> bool:
+        if not self.coverage_measured:
+            return self.complexity <= self.complexity_limit
         return (
             self.coverage_percent >= self.coverage_limit
             and self.complexity <= self.complexity_limit
@@ -364,6 +367,8 @@ class GateResult:
     prompts: list[tuple[str, str]] = dataclasses.field(default_factory=list)
     applicable: bool = True
     deferred: bool = False
+    skipped: bool = False
+    off: bool = False
 
 
 @dataclasses.dataclass
@@ -427,6 +432,8 @@ class AnalysisReport:
     rerun_command: str | None = None
     mode: str = "full"
     scope: GateScope = dataclasses.field(default_factory=repository_scope)
+    selection: tuple[str, ...] = ()
+    focus: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -435,6 +442,14 @@ class AnalysisReport:
             and bool(self.gates)
             and all(gate.passed for gate in self.gates)
         )
+
+    @property
+    def selected_passed(self) -> bool:
+        """True when every gate this run actually executed passed (partial runs never certify)."""
+        executed = [
+            gate for gate in self.gates if not gate.skipped and not gate.deferred
+        ]
+        return bool(executed) and all(gate.passed for gate in executed)
 
     @property
     def ready_for_full(self) -> bool:
@@ -884,6 +899,11 @@ def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
         "dead_code": {
             "enabled": "auto",
             "required": False,
+            "commands": [],
+            "timeout_seconds": 300,
+        },
+        "smoke": {
+            "enabled": "auto",
             "commands": [],
             "timeout_seconds": 300,
         },
@@ -1540,6 +1560,13 @@ def infer_test_command(root: Path) -> list[str] | None:
     )
     if "test" in scripts and executable(root, "npm"):
         return [executable(root, "npm") or "npm", "test"]
+    if npm_workspace_dirs(root) and executable(root, "npm"):
+        return [
+            executable(root, "npm") or "npm",
+            "test",
+            "--workspaces",
+            "--if-present",
+        ]
     python = executable(root, "python") or executable(root, "python3")
     if python and any(
         (root / name).exists()
@@ -1566,6 +1593,120 @@ def infer_test_command(root: Path) -> list[str] | None:
     if list(root.glob("*.sln")) and executable(root, "dotnet"):
         return [executable(root, "dotnet") or "dotnet", "test"]
     return None
+
+
+def npm_workspace_dirs(root: Path) -> list[Path]:
+    """Workspace package directories declared in the root package.json, in order."""
+    workspaces = read_package_json(root).get("workspaces")
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages")
+    if not isinstance(workspaces, list):
+        return []
+    directories: list[Path] = []
+    for pattern in workspaces:
+        for path in sorted(root.glob(str(pattern))):
+            if (path / "package.json").is_file():
+                directories.append(path)
+    return directories
+
+
+def workspace_uses_vitest(directory: Path) -> bool:
+    if any(directory.glob("vitest.config.*")):
+        return True
+    package = read_package_json(directory)
+    dependencies = {
+        **(package.get("dependencies") or {}),
+        **(package.get("devDependencies") or {}),
+    }
+    scripts = package.get("scripts") or {}
+    return "vitest" in dependencies or any(
+        "vitest" in str(command) for command in scripts.values()
+    )
+
+
+def script_reference(root: Path, script: Path) -> str:
+    """Path of a bundled script as the repository sees it (relative when inside it)."""
+    try:
+        return script.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(script.resolve())
+
+
+def workspace_coverage_template(root: Path) -> dict[str, Any]:
+    packages = [
+        directory
+        for directory in npm_workspace_dirs(root)
+        if workspace_uses_vitest(directory)
+    ]
+    if not packages:
+        return {}
+    commands: list[list[str]] = []
+    sources: list[str] = []
+    for directory in packages:
+        relative = normalize_path(directory, root)
+        name = relative.replace("/", "-")
+        commands.append(
+            [
+                "npx",
+                "vitest",
+                "run",
+                "--root",
+                relative,
+                "--coverage",
+                "--coverage.reporter=lcov",
+                f"--coverage.reportsDirectory={{root}}/{QUALITY_DIRECTORY}/coverage/{name}",
+            ]
+        )
+        sources.append(
+            f"{relative}={{root}}/{QUALITY_DIRECTORY}/coverage/{name}/lcov.info"
+        )
+    commands.append(
+        [
+            "python3",
+            script_reference(root, Path(__file__)),
+            "--merge-lcov",
+            f"{{root}}/{QUALITY_DIRECTORY}/coverage/lcov.info",
+            *sources,
+        ]
+    )
+    return {
+        "coverage_commands": commands,
+        "coverage_report": f"{QUALITY_DIRECTORY}/coverage/lcov.info",
+        "coverage_format": "lcov",
+    }
+
+
+def prefixed_lcov_line(line: str, prefix: str) -> str:
+    if not line.startswith("SF:"):
+        return line
+    path = line[3:]
+    if os.path.isabs(path) or not prefix:
+        return line
+    return f"SF:{prefix.rstrip('/')}/{path}"
+
+
+def merge_lcov_files(output: Path, sources: Sequence[str]) -> int:
+    """Concatenate PREFIX=LCOV inputs, rewriting relative SF paths under PREFIX."""
+    lines: list[str] = []
+    for item in sources:
+        prefix, separator, source = item.partition("=")
+        if not separator:
+            raise ValueError(f"expected PREFIX=LCOV, got {item!r}")
+        for line in Path(source).read_text(encoding="utf-8").splitlines():
+            lines.append(prefixed_lcov_line(line, prefix))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(sources)
+
+
+def merge_lcov_command(output: Path, sources: Sequence[str]) -> int:
+    try:
+        count = merge_lcov_files(output, sources)
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(f"Merged {count} lcov file(s) into {output}")
+    return 0
 
 
 def package_scripts(root: Path) -> dict[str, str]:
@@ -1869,6 +2010,124 @@ def deferred_check(key: str, title: str, reason: str) -> GateResult:
         f"Deferred in fast mode: {reason}",
         ["Run the full certification command without --fast before shipping."],
         deferred=True,
+    )
+
+
+SELECTABLE_CHECKS: dict[str, str] = {
+    "lint": "format_lint",
+    "types": "types",
+    "contracts": "contracts",
+    "tests": "quality",
+    "coverage": "quality",
+    "complexity": "quality",
+    "craap": "quality",
+    "loc": "file_loc",
+    "dead-code": "dead_code",
+    "deps": "dependencies",
+    "flaky": "flaky",
+    "mutation": "mutation",
+    "smoke": "smoke",
+}
+METRIC_FOCUS_PRIORITY = ("craap", "coverage", "complexity", "tests")
+
+
+@dataclasses.dataclass(frozen=True)
+class GateSelection:
+    """Which gates one run executes. ``keys`` of None means every gate."""
+
+    keys: frozenset[str] | None = None
+    focus: str | None = None
+    names: tuple[str, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        return self.keys is not None
+
+    def wants(self, key: str) -> bool:
+        return self.keys is None or key in self.keys
+
+    def forces(self, name: str) -> bool:
+        return name in self.names
+
+
+def selected_gate_keys(names: Sequence[str]) -> frozenset[str] | None:
+    if not names:
+        return None
+    return frozenset(SELECTABLE_CHECKS[name] for name in names)
+
+
+def metrics_focus(names: Sequence[str]) -> str | None:
+    chosen = set(names)
+    if {"coverage", "complexity"} <= chosen:
+        return "craap"
+    for name in METRIC_FOCUS_PRIORITY:
+        if name in chosen:
+            return name
+    return None
+
+
+def gate_selection(names: Sequence[str]) -> GateSelection:
+    return GateSelection(selected_gate_keys(names), metrics_focus(names), tuple(names))
+
+
+def skipped_check(key: str, title: str) -> GateResult:
+    return GateResult(
+        key,
+        title,
+        True,
+        "Skipped: not selected by this run.",
+        applicable=False,
+        skipped=True,
+    )
+
+
+def off_check(key: str, title: str, flag: str) -> GateResult:
+    return GateResult(
+        key,
+        title,
+        True,
+        f"Off: {title.lower()} runs only when requested (enable it in {CONFIG_NAME} or run with --{flag}).",
+        applicable=False,
+        off=True,
+    )
+
+
+def with_gate_enabled(config: dict[str, Any], section: str) -> dict[str, Any]:
+    return {**config, section: {**config[section], "enabled": True}}
+
+
+def tests_only_gate(
+    test_command: list[str] | None, baseline: CommandResult | None
+) -> GateResult:
+    if not test_command or baseline is None:
+        return GateResult(
+            "quality",
+            "Tests",
+            False,
+            "No complete test command could be configured or inferred.",
+            prompts=[
+                (
+                    "Configure the complete test suite",
+                    "Configure test.command as an argument array that runs every required test and exits non-zero on failure.",
+                )
+            ],
+        )
+    if baseline.returncode != 0:
+        return GateResult(
+            "quality",
+            "Tests",
+            False,
+            "The complete test suite failed.",
+            [baseline.stdout] if baseline.stdout else [],
+            [baseline],
+            [("Repair tests", generic_adapter_prompt("test", baseline))],
+        )
+    return GateResult(
+        "quality",
+        "Tests",
+        True,
+        f"The complete test suite passed in {baseline.duration_seconds:.1f}s.",
+        command_results=[baseline],
     )
 
 
@@ -2244,7 +2503,7 @@ def load_normalized_metrics(
         coverage = float(
             row.get("coverage_percent", (100.0 * covered / total) if total else 0.0)
         )
-        score = float(row.get("craap_score", craap_score(complexity, coverage)))
+        score = craap_score(complexity, coverage)
         functions.append(
             FunctionMetric(
                 path=normalize_report_path(str(row["path"]), root),
@@ -2404,6 +2663,11 @@ def craap_score(complexity: int, coverage_percent: float) -> float:
     return complexity**2 * uncovered**3 + complexity
 
 
+def format_craap(score: float) -> str:
+    """Show enough precision to explain a strict threshold comparison."""
+    return f"{score:.9g}"
+
+
 def parse_functions(path: Path, root: Path) -> list[tuple[str, int, int, int, str]]:
     if path.suffix.lower() in {".py", ".pyi"}:
         return parse_python_functions(path)
@@ -2411,9 +2675,10 @@ def parse_functions(path: Path, root: Path) -> list[tuple[str, int, int, int, st
 
 
 class PythonFunctionVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, stub_file: bool = False) -> None:
         self.functions: list[tuple[str, int, int, int, str]] = []
         self.scope: list[str] = []
+        self.stub_file = stub_file
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
         self.scope.append(node.name)
@@ -2429,18 +2694,65 @@ class PythonFunctionVisitor(ast.NodeVisitor):
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         name = ".".join([*self.scope, node.name])
         complexity = python_complexity(node)
+        parser = "python-ast-stub" if self._is_stub(node) else "python-ast"
         self.functions.append(
             (
                 name,
                 node.lineno,
                 getattr(node, "end_lineno", node.lineno),
                 complexity,
-                "python-ast",
+                parser,
             )
         )
         self.scope.append(node.name)
         self.generic_visit(node)
         self.scope.pop()
+
+    def _is_stub(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        decorators = {_decorator_name(item) for item in node.decorator_list}
+        return (
+            self.stub_file
+            or "overload" in decorators
+            or ("abstractmethod" in decorators and _has_stub_body(node))
+        )
+
+
+def _decorator_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return ""
+
+
+def _has_stub_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    body = list(node.body)
+    if body and isinstance(body[0], ast.Expr):
+        value = body[0].value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            body = body[1:]
+    if len(body) != 1:
+        return False
+    statement = body[0]
+    return isinstance(statement, ast.Pass) or (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and statement.value.value is Ellipsis
+    )
+
+
+def _is_irrefutable_pattern(pattern: ast.pattern) -> bool:
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _is_irrefutable_pattern(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(_is_irrefutable_pattern(item) for item in pattern.patterns)
+    return False
+
+
+def _is_default_case(case: ast.match_case) -> bool:
+    return case.guard is None and _is_irrefutable_pattern(case.pattern)
 
 
 class PythonComplexityVisitor(ast.NodeVisitor):
@@ -2460,7 +2772,7 @@ class PythonComplexityVisitor(ast.NodeVisitor):
         return None
 
     def visit_Lambda(self, node: ast.Lambda) -> Any:
-        return None
+        self.generic_visit(node)
 
     def generic_visit(self, node: ast.AST) -> Any:
         if isinstance(
@@ -2472,14 +2784,17 @@ class PythonComplexityVisitor(ast.NodeVisitor):
                 ast.While,
                 ast.ExceptHandler,
                 ast.IfExp,
-                ast.comprehension,
             ),
         ):
             self.complexity += 1
+        elif isinstance(node, ast.comprehension):
+            self.complexity += 1 + len(node.ifs)
         elif isinstance(node, ast.BoolOp):
             self.complexity += max(0, len(node.values) - 1)
         elif isinstance(node, ast.Match):
-            self.complexity += len(node.cases)
+            self.complexity += sum(not _is_default_case(case) for case in node.cases)
+        elif isinstance(node, ast.MatchOr):
+            self.complexity += max(0, len(node.patterns) - 1)
         return super().generic_visit(node)
 
 
@@ -2494,7 +2809,7 @@ def parse_python_functions(path: Path) -> list[tuple[str, int, int, int, str]]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, UnicodeDecodeError, SyntaxError):
         return []
-    visitor = PythonFunctionVisitor()
+    visitor = PythonFunctionVisitor(stub_file=path.suffix.lower() == ".pyi")
     visitor.visit(tree)
     return visitor.functions
 
@@ -2681,11 +2996,27 @@ def build_function_metrics(
         if parsed is None:
             parsed = parse_functions(path, root)
         for name, start, end, complexity, parser in parsed:
+            nested_spans = [
+                (other_start, other_end)
+                for _, other_start, other_end, _, _ in parsed
+                if start < other_start and other_end <= end
+            ]
             relevant = {
-                line: hits for line, hits in line_hits.items() if start <= line <= end
+                line: hits
+                for line, hits in line_hits.items()
+                if start <= line <= end
+                and not any(
+                    nested_start <= line <= nested_end
+                    for nested_start, nested_end in nested_spans
+                )
             }
-            covered = sum(1 for hits in relevant.values() if hits > 0)
-            total = len(relevant)
+            coverage_measured = parser != "python-ast-stub"
+            covered = (
+                sum(1 for hits in relevant.values() if hits > 0)
+                if coverage_measured
+                else 0
+            )
+            total = len(relevant) if coverage_measured else 0
             percent = (100.0 * covered / total) if total else 0.0
             functions.append(
                 FunctionMetric(
@@ -2702,6 +3033,7 @@ def build_function_metrics(
                     coverage_limit=coverage_limit,
                     complexity_limit=complexity_limit,
                     craap_limit=craap_limit,
+                    coverage_measured=coverage_measured,
                 )
             )
     return sorted(functions, key=lambda item: (item.path, item.start_line, item.name))
@@ -2800,7 +3132,7 @@ def cleaner_prompt(function: FunctionMetric) -> str:
 Current evidence:
 - line coverage: {function.coverage_percent:.2f}% ({function.covered_lines}/{function.total_lines})
 - cyclomatic complexity: {function.complexity}
-- CRAAP score: {function.craap_score:.2f}
+- CRAAP score: {format_craap(function.craap_score)}
 - required: {function.coverage_limit:g}% coverage, complexity <= {function.complexity_limit:g}, and CRAAP <= {function.craap_limit:g}
 
 Read the function, its callers, and neighboring tests. Add behavior-focused tests for every uncovered path, then simplify control flow without changing behavior until complexity and CRAAP satisfy the threshold. Preserve error paths and public contracts. Run the repository's real coverage command and report the exact before/after metrics; do not exclude lines, weaken assertions, or mock the function under test."""
@@ -3117,6 +3449,94 @@ def run_metrics_gate(
     return result, functions
 
 
+def static_function_metrics(
+    source_files: Sequence[Path],
+    root: Path,
+    complexity_limit: float,
+    external_functions: dict[str, list[tuple[str, int, int, int, str]]],
+) -> list[FunctionMetric]:
+    functions: list[FunctionMetric] = []
+    for path in source_files:
+        relative = normalize_path(path, root)
+        parsed = external_functions.get(relative)
+        if parsed is None:
+            parsed = parse_functions(path, root)
+        for name, start, end, complexity, parser in parsed:
+            functions.append(
+                FunctionMetric(
+                    path=relative,
+                    name=name,
+                    start_line=start,
+                    end_line=end,
+                    complexity=complexity,
+                    covered_lines=0,
+                    total_lines=0,
+                    coverage_percent=0.0,
+                    craap_score=float(complexity),
+                    parser=parser,
+                    complexity_limit=complexity_limit,
+                    coverage_measured=False,
+                )
+            )
+    return sorted(functions, key=lambda item: (item.path, item.start_line, item.name))
+
+
+def run_complexity_gate(
+    root: Path,
+    config: dict[str, Any],
+    source_files: Sequence[Path],
+    workspace: Path,
+    tools: ToolContext,
+) -> tuple[GateResult, list[FunctionMetric]]:
+    """Static complexity only: no tests, no coverage. Used by ``--complexity``."""
+    limit = float(config["metrics"].get("complexity_limit", 6))
+    lizard_functions, lizard_result = analyze_with_lizard(
+        source_files, root, workspace, tools
+    )
+    commands = [lizard_result] if lizard_result else []
+    functions = static_function_metrics(source_files, root, limit, lizard_functions)
+    if not functions:
+        return GateResult(
+            "quality",
+            "Complexity",
+            False,
+            "No functions were discovered.",
+            [],
+            commands,
+        ), []
+    failures = sorted(
+        (function for function in functions if not function.passed),
+        key=lambda function: (-function.complexity, function.path, function.start_line),
+    )
+    if failures:
+        return GateResult(
+            "quality",
+            "Complexity",
+            False,
+            f"{len(failures)} of {len(functions)} functions exceed complexity {limit:g}.",
+            [
+                f"{function.path}:{function.start_line} {function.name}: complexity {function.complexity}"
+                for function in failures[:100]
+            ],
+            commands,
+            [
+                (
+                    f"Fix {function.path}:{function.start_line} {function.name}",
+                    cleaner_prompt(function),
+                )
+                for function in failures
+            ],
+        ), functions
+    return GateResult(
+        "quality",
+        "Complexity",
+        True,
+        f"All {len(functions)} functions have complexity <= {limit:g}.",
+        [],
+        commands,
+    ), functions
+
+
 def finish_metrics_gate(
     functions: list[FunctionMetric],
     commands: list[CommandResult],
@@ -3152,7 +3572,7 @@ def finish_metrics_gate(
         ),
     )
     details = [
-        f"{function.path}:{function.start_line} {function.name}: coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {function.craap_score:.2f}"
+        f"{function.path}:{function.start_line} {function.name}: coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {format_craap(function.craap_score)}"
         for function in failures[:100]
     ]
     prompts = [
@@ -4704,7 +5124,7 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     )
     function_summary = (
         "\n".join(
-            f"- {function.path}:{function.start_line} `{function.name}` — coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {function.craap_score:.2f}"
+            f"- {function.path}:{function.start_line} `{function.name}` — coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {format_craap(function.craap_score)}"
             for function in failing_functions[:50]
         )
         or "- None in the current report."
@@ -4743,7 +5163,13 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
     craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
     file_loc_limit = threshold_number(thresholds, "file_loc", "max_lines")
-    if report.mode == "fast" and report.ready_for_full:
+    if report.mode == "partial":
+        flags = " ".join(f"--{name}" for name in report.selection)
+        objective = f"""This was a partial run ({flags}). Fix every issue it reports and rerun the same command until it is green. A partial run never certifies: run the full ship report (the same command without {flags}) before handoff."""
+        run_instructions = f"""Rerun the partial check:
+{rerun_command}"""
+        loop_rule = "Rerun the same partial check after each coherent repair batch until it is green, then run the full ship report."
+    elif report.mode == "fast" and report.ready_for_full:
         objective = """The fast diagnostic checks are green. Do not claim the repository is ready to ship yet. Run the full certification command now; it executes the deferred flaky-test repetitions and exhaustive mutation gate."""
         run_instructions = f"""Run from the repository root:
 {full_command}"""
@@ -4777,9 +5203,11 @@ Non-negotiable finish conditions:
 4. The complete test suite passes; every production function has {coverage_limit:g}% executable-line coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.
 5. Every production file has at most {file_loc_limit:g} physical lines.
 6. Every applicable dead-code detector reports zero findings.
-7. The complete test suite passes consistently across every configured flaky-test run.
-8. The complete test suite kills every generated operator mutant; zero survive.
+7. The complete test suite passes consistently across every configured flaky-test run{off_note(report, "flaky")}.
+8. The complete test suite kills every generated operator mutant; zero survive{off_note(report, "mutation")}.
 9. The dependency checker reports zero ownership or direction-rule violations.
+10. The smoke check starts the application and loads it once with zero errors (a web UI in a headless browser).
+11. No production file is hidden from the gate by source.exclude.
 
 Current gate status:
 {gate_summary}
@@ -4814,9 +5242,21 @@ Repair rules:
 - {loop_rule}"""
 
 
+def off_note(report: AnalysisReport, key: str) -> str:
+    """Suffix for a finish condition whose gate is off unless the user asks for it."""
+    for gate in report.gates:
+        if gate.key == key and gate.off:
+            return " (off: run only when the user asks)"
+    return ""
+
+
 def gate_outcome(gate: GateResult) -> str:
     if gate.deferred:
         return "DEFERRED"
+    if getattr(gate, "skipped", False):
+        return "SKIPPED"
+    if getattr(gate, "off", False):
+        return "OFF"
     if not gate.applicable:
         return "NOT APPLICABLE"
     return "PASS" if gate.passed else "FAIL"
@@ -4830,8 +5270,9 @@ def function_measurement(function: Any) -> dict[str, Any]:
         "covered_lines": function.covered_lines,
         "total_lines": function.total_lines,
         "coverage_percent": round(function.coverage_percent, 2),
+        "coverage_measured": bool(getattr(function, "coverage_measured", True)),
         "complexity": function.complexity,
-        "craap_score": round(function.craap_score, 2),
+        "craap_score": round(function.craap_score, 8),
         "passed": function.passed,
     }
 
@@ -4871,9 +5312,16 @@ def dependency_failure(violation: Any) -> dict[str, Any]:
 def state_status(analysis: Any, error: str | None) -> str:
     if error:
         return "error"
-    if analysis.passed:
+    if analysis.passed or partial_run_passed(analysis):
         return "pass"
     return "ready_for_full" if analysis.ready_for_full else "fail"
+
+
+def partial_run_passed(analysis: Any) -> bool:
+    return bool(
+        getattr(analysis, "mode", "full") == "partial"
+        and getattr(analysis, "selected_passed", False)
+    )
 
 
 def command_state(command: Any) -> dict[str, Any]:
@@ -4888,6 +5336,10 @@ def command_state(command: Any) -> dict[str, Any]:
 def gate_status(result: Any) -> str:
     if result.deferred:
         return "deferred"
+    if getattr(result, "skipped", False):
+        return "skipped"
+    if getattr(result, "off", False):
+        return "off"
     if not result.applicable:
         return "not_applicable"
     return "pass" if result.passed else "fail"
@@ -4926,6 +5378,8 @@ def count_state(
         "checks_total": len(outcomes),
         "checks_executed": len(outcomes) - outcomes.count("deferred"),
         "checks_deferred": outcomes.count("deferred"),
+        "checks_skipped": outcomes.count("skipped"),
+        "checks_off": outcomes.count("off"),
         "checks_applicable": outcomes.count("pass") + outcomes.count("fail"),
         "checks_passing": outcomes.count("pass"),
         "functions_total": len(analysis.functions),
@@ -5006,7 +5460,10 @@ def repository_certified(analysis: Any) -> bool:
 
 
 def state_fix_prompt(gate: Any, analysis: Any) -> str | None:
-    return None if analysis.passed else gate.master_fix_prompt(analysis)
+    if analysis.passed or partial_run_passed(analysis):
+        return None
+    prompt: str = gate.master_fix_prompt(analysis)
+    return prompt
 
 
 def analysis_state(
@@ -5040,6 +5497,8 @@ def analysis_state(
             "reference": analysis.scope.reference,
             "changed_files": list(analysis.scope.paths),
         },
+        "selection": list(getattr(analysis, "selection", ())),
+        "focus": getattr(analysis, "focus", None),
         "metrics": metrics_state(analysis, quality_gate),
         "thresholds": analysis.thresholds,
         "gates": [gate_state(result) for result in analysis.gates],
@@ -5105,7 +5564,16 @@ Inspect the repository's languages, package managers, existing scripts, and CI b
 
 
 def html_report(report: AnalysisReport) -> str:
-    if report.mode == "fast":
+    if report.mode == "partial":
+        status = (
+            "SELECTED CHECKS PASSED"
+            if report.selected_passed
+            else "SELECTED CHECKS NEED WORK"
+        )
+        flags = " ".join(f"--{name}" for name in report.selection)
+        page_heading = f"Partial quality check ({flags})"
+        verdict_class = "diagnostic"
+    elif report.mode == "fast":
         status = (
             "READY FOR FULL RUN" if report.ready_for_full else "FAST CHECKS NEED WORK"
         )
@@ -5212,7 +5680,7 @@ def html_report(report: AnalysisReport) -> str:
             f"""<tr class="{"ok" if function.passed else "bad"}">
           <td><code>{html.escape(function.path)}:{function.start_line}</code></td>
           <td>{html.escape(function.name)}</td><td>{function.coverage_percent:.2f}%</td>
-          <td>{function.complexity}</td><td>{function.craap_score:.2f}</td>
+          <td>{function.complexity}</td><td>{format_craap(function.craap_score)}</td>
           <td>{html.escape(function.parser)}</td><td>{"PASS" if function.passed else "FAIL"}</td>
         </tr>"""
             for function in shown_functions
@@ -5398,6 +5866,8 @@ def html_report(report: AnalysisReport) -> str:
     for gate in report.gates:
         if gate.deferred:
             state, symbol, state_text = "deferred", "◷", "DEFERRED"
+        elif gate.skipped or gate.off:
+            state, symbol, state_text = "na", "−", gate_outcome(gate)
         elif not gate.applicable:
             state, symbol, state_text = "na", "−", "N/A"
         elif gate.passed:
@@ -5481,7 +5951,10 @@ def config_template(
         default_config(thresholds),
         {
             "test": {"command": test},
-            "mutation": {"test_command": test},
+            "metrics": workspace_coverage_template(root),
+            "mutation": {"enabled": False, "test_command": test},
+            "flaky_tests": {"enabled": False},
+            "smoke": smoke_template(root),
             "_adapter_contract": {
                 "metrics": {
                     "functions": [
@@ -5520,6 +5993,56 @@ def write_initial_config(
     )
 
 
+def dependency_rules_template(root: Path) -> dict[str, Any]:
+    """A rules file that runs on the first try: workspace packages become modules,
+    with directions taken from their declared manifests; otherwise one module."""
+    packages = npm_workspace_dirs(root)
+    if not packages:
+        return {
+            "_note": "Generated skeleton: one module covers the repository. Split it into real modules and declare allowed directions.",
+            "modules": [{"name": "repository", "paths": ["**"]}],
+            "allow": {"repository": []},
+            "deny": [],
+        }
+    module_names = {
+        str(
+            read_package_json(directory).get("name") or normalize_path(directory, root)
+        ): normalize_path(directory, root)
+        for directory in packages
+    }
+    allow: dict[str, list[str]] = {}
+    for directory in packages:
+        package = read_package_json(directory)
+        declared = {
+            **(package.get("dependencies") or {}),
+            **(package.get("devDependencies") or {}),
+        }
+        module = normalize_path(directory, root)
+        allow[module] = sorted(
+            module_names[name]
+            for name in declared
+            if name in module_names and module_names[name] != module
+        )
+    return {
+        "_note": "Generated from workspace manifests: each package is a module and may import only the workspace packages it declares. Review before relying on it.",
+        "modules": [
+            {"name": module, "paths": [f"{module}/**"]} for module in sorted(allow)
+        ],
+        "allow": allow,
+        "deny": [],
+    }
+
+
+def write_initial_dependencies(root: Path, path: Path) -> bool:
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(dependency_rules_template(root), indent=2) + "\n", encoding="utf-8"
+    )
+    return True
+
+
 def write_initial_thresholds(path: Path) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite existing thresholds: {path}")
@@ -5537,8 +6060,10 @@ def run(
     cli_mutation_workers: str | int | None = None,
     scope: GateScope | None = None,
     thresholds: dict[str, Any] | None = None,
+    selection: GateSelection | None = None,
 ) -> AnalysisReport:
     scope = scope or repository_scope()
+    selection = selection or GateSelection()
     languages = detect_languages(root)
     all_source_files = discover_source_files(root, config["source"])
     source_files = discover_source_files(root, config["source"], scope)
@@ -5583,114 +6108,89 @@ def run(
         )
     with tempfile.TemporaryDirectory(prefix="repo-quality-gate-") as temporary:
         workspace = Path(temporary)
-        format_lint_gate = run_command_check_gate(
-            root,
-            "format_lint",
-            "Formatter & lint",
-            config["format_lint"],
-            infer_format_lint_commands(root, source_files, tools, scope),
-            "Configure format_lint.commands with non-mutating check-mode formatter and linter commands.",
-            tools.python_env,
-        )
-        types_gate = run_command_check_gate(
-            root,
-            "types",
-            "Static type checking",
-            config["types"],
-            infer_type_commands(root, source_files, tools),
-            "Configure types.commands with the repository's complete static type checker.",
-            tools.python_env,
-        )
-        contracts_gate = run_contract_gate(root, config, tools)
-        test_command, test_baseline = run_test_baseline(root, config)
-        if scope.incremental and not source_files:
-            raw_metrics_gate = GateResult(
-                "craap",
-                "CRAAP: coverage + complexity",
-                True,
-                f"No changed production source files were selected from {scope.description}; file metrics were not needed.",
-            )
-            functions: list[FunctionMetric] = []
-        else:
-            raw_metrics_gate, functions = run_metrics_gate(
-                root, config, source_files, workspace, tools
-            )
-        quality_gate = combine_test_and_metrics_gate(
-            raw_metrics_gate, test_command, test_baseline
-        )
-        if scope.incremental and not source_files:
-            file_loc_gate = GateResult(
-                "file_loc",
-                "File LOC",
-                True,
-                f"Not applicable: no changed production source files were selected from {scope.description}.",
-                applicable=False,
-            )
-            files: list[FileLineMetric] = []
-        else:
-            file_loc_gate, files = run_file_loc_gate(
-                root, source_files, config["file_loc"]
-            )
-        dead_code_gate = run_command_check_gate(
-            root,
-            "dead_code",
-            "Dead code",
-            config["dead_code"],
-            infer_dead_code_commands(root, source_files, tools),
-            "Configure dead_code.commands with a high-confidence unused-code detector such as Vulture, Knip, or ts-prune.",
-            tools.python_env,
-        )
-        if fast:
-            flaky_gate = deferred_check(
-                "flaky",
-                "Flaky-test detection",
-                "repeated complete-suite runs are reserved for full certification.",
-            )
-            mutation_gate = deferred_check(
-                "mutation",
-                "Mutation testing",
-                "the exhaustive mutant run is reserved for full certification.",
-            )
-            mutations: list[Mutation] = []
-        elif scope.incremental and not source_files:
-            flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
-            mutation_gate = GateResult(
-                "mutation",
-                "Mutation testing",
-                True,
-                f"Not applicable: no changed production source files were selected from {scope.description}.",
-                applicable=False,
-            )
-            mutations = []
-        else:
-            flaky_gate = run_flaky_test_gate(root, config, test_command, test_baseline)
-            mutation_gate, mutations = run_mutation_gate(
+        format_lint_gate = (
+            run_command_check_gate(
                 root,
-                config,
-                source_files,
-                cli_max_mutants,
-                test_baseline,
-                cli_mutation_workers,
-                tools,
-                scope,
+                "format_lint",
+                "Formatter & lint",
+                config["format_lint"],
+                infer_format_lint_commands(root, source_files, tools, scope),
+                "Configure format_lint.commands with non-mutating check-mode formatter and linter commands.",
+                tools.python_env,
             )
-        if scope.incremental and not source_files:
-            dependency_gate = GateResult(
-                "dependencies",
-                "Module dependencies",
-                True,
-                f"Not applicable: no changed production source files were selected from {scope.description}.",
-                applicable=False,
-            )
-            violations: list[DependencyViolation] = []
-        else:
-            dependency_gate, violations = run_dependency_gate(
+            if selection.wants("format_lint")
+            else skipped_check("format_lint", "Formatter & lint")
+        )
+        types_gate = (
+            run_command_check_gate(
                 root,
-                config,
-                source_files,
-                workspace,
-                resolution_files=all_source_files,
+                "types",
+                "Static type checking",
+                config["types"],
+                infer_type_commands(root, source_files, tools),
+                "Configure types.commands with the repository's complete static type checker.",
+                tools.python_env,
             )
+            if selection.wants("types")
+            else skipped_check("types", "Static type checking")
+        )
+        contracts_gate = (
+            run_contract_gate(root, config, tools)
+            if selection.wants("contracts")
+            else skipped_check("contracts", "Contract/schema validation")
+        )
+        test_command, test_baseline = (
+            run_test_baseline(root, config)
+            if selection_needs_test_baseline(selection)
+            else (None, None)
+        )
+        quality_gate, functions = run_quality_gate(
+            root,
+            config,
+            source_files,
+            workspace,
+            tools,
+            scope,
+            selection,
+            test_command,
+            test_baseline,
+        )
+        file_loc_gate, files = run_file_loc_for_selection(
+            root, source_files, config["file_loc"], scope, selection
+        )
+        dead_code_gate = (
+            run_command_check_gate(
+                root,
+                "dead_code",
+                "Dead code",
+                config["dead_code"],
+                infer_dead_code_commands(root, source_files, tools),
+                "Configure dead_code.commands with a high-confidence unused-code detector such as Vulture, Knip, or ts-prune.",
+                tools.python_env,
+            )
+            if selection.wants("dead_code")
+            else skipped_check("dead_code", "Dead code")
+        )
+        flaky_gate = flaky_gate_for_run(
+            root, config, test_command, test_baseline, fast, selection
+        )
+        mutation_gate, mutations = mutation_gate_for_run(
+            root,
+            config,
+            source_files,
+            cli_max_mutants,
+            test_baseline,
+            cli_mutation_workers,
+            tools,
+            scope,
+            fast,
+            selection,
+        )
+        dependency_gate, violations = dependency_gate_for_run(
+            root, config, source_files, workspace, all_source_files, scope, selection
+        )
+        smoke_gate = smoke_gate_for_run(root, config, fast, selection, tools.python_env)
+        scope_gate = scope_gate_for_run(root, config, selection)
     analysis = AnalysisReport(
         root=str(root),
         generated_at=time.strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -5700,11 +6200,13 @@ def run(
             types_gate,
             contracts_gate,
             quality_gate,
+            smoke_gate,
             file_loc_gate,
             dead_code_gate,
             flaky_gate,
             mutation_gate,
             dependency_gate,
+            scope_gate,
         ],
         functions=functions,
         mutations=mutations,
@@ -5713,12 +6215,318 @@ def run(
         notes=notes,
         files=files,
         thresholds=thresholds or default_thresholds(),
-        mode="fast" if fast else "full",
+        mode=run_mode(fast, selection),
         scope=scope,
+        selection=selection.names,
+        focus=selection.focus,
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(html_report(analysis), encoding="utf-8")
     return analysis
+
+
+def run_mode(fast: bool, selection: GateSelection) -> str:
+    if selection.partial:
+        return "partial"
+    return "fast" if fast else "full"
+
+
+def selection_needs_test_baseline(selection: GateSelection) -> bool:
+    if selection.wants("quality") and selection.focus != "complexity":
+        return True
+    return selection.wants("flaky") or selection.wants("mutation")
+
+
+def run_quality_gate(
+    root: Path,
+    config: dict[str, Any],
+    source_files: Sequence[Path],
+    workspace: Path,
+    tools: ToolContext,
+    scope: GateScope,
+    selection: GateSelection,
+    test_command: list[str] | None,
+    test_baseline: CommandResult | None,
+) -> tuple[GateResult, list[FunctionMetric]]:
+    if not selection.wants("quality"):
+        return skipped_check("quality", "Tests, coverage & CRAAP"), []
+    if selection.focus == "tests":
+        return tests_only_gate(test_command, test_baseline), []
+    if scope.incremental and not source_files:
+        raw = GateResult(
+            "craap",
+            "CRAAP: coverage + complexity",
+            True,
+            f"No changed production source files were selected from {scope.description}; file metrics were not needed.",
+        )
+        return combine_test_and_metrics_gate(raw, test_command, test_baseline), []
+    if selection.focus == "complexity":
+        return run_complexity_gate(root, config, source_files, workspace, tools)
+    raw, functions = run_metrics_gate(root, config, source_files, workspace, tools)
+    return combine_test_and_metrics_gate(raw, test_command, test_baseline), functions
+
+
+def not_applicable_for_scope(key: str, title: str, scope: GateScope) -> GateResult:
+    return GateResult(
+        key,
+        title,
+        True,
+        f"Not applicable: no changed production source files were selected from {scope.description}.",
+        applicable=False,
+    )
+
+
+def run_file_loc_for_selection(
+    root: Path,
+    source_files: Sequence[Path],
+    section: dict[str, Any],
+    scope: GateScope,
+    selection: GateSelection,
+) -> tuple[GateResult, list[FileLineMetric]]:
+    if not selection.wants("file_loc"):
+        return skipped_check("file_loc", "File LOC"), []
+    if scope.incremental and not source_files:
+        return not_applicable_for_scope("file_loc", "File LOC", scope), []
+    return run_file_loc_gate(root, source_files, section)
+
+
+def flaky_gate_for_run(
+    root: Path,
+    config: dict[str, Any],
+    test_command: list[str] | None,
+    baseline: CommandResult | None,
+    fast: bool,
+    selection: GateSelection,
+) -> GateResult:
+    if not selection.wants("flaky"):
+        return skipped_check("flaky", "Flaky-test detection")
+    if fast and not selection.partial:
+        return deferred_check(
+            "flaky",
+            "Flaky-test detection",
+            "repeated complete-suite runs are reserved for full certification.",
+        )
+    if config["flaky_tests"].get("enabled", True) is False:
+        if not selection.forces("flaky"):
+            return off_check("flaky", "Flaky-test detection", "flaky")
+        config = with_gate_enabled(config, "flaky_tests")
+    return run_flaky_test_gate(root, config, test_command, baseline)
+
+
+def mutation_gate_for_run(
+    root: Path,
+    config: dict[str, Any],
+    source_files: Sequence[Path],
+    cli_max_mutants: int | None,
+    baseline: CommandResult | None,
+    cli_mutation_workers: str | int | None,
+    tools: ToolContext,
+    scope: GateScope,
+    fast: bool,
+    selection: GateSelection,
+) -> tuple[GateResult, list[Mutation]]:
+    if not selection.wants("mutation"):
+        return skipped_check("mutation", "Mutation testing"), []
+    if fast and not selection.partial:
+        return deferred_check(
+            "mutation",
+            "Mutation testing",
+            "the exhaustive mutant run is reserved for full certification.",
+        ), []
+    if scope.incremental and not source_files:
+        return not_applicable_for_scope("mutation", "Mutation testing", scope), []
+    if config["mutation"].get("enabled", True) is False:
+        if not selection.forces("mutation"):
+            return off_check("mutation", "Mutation testing", "mutation"), []
+        config = with_gate_enabled(config, "mutation")
+    return run_mutation_gate(
+        root,
+        config,
+        source_files,
+        cli_max_mutants,
+        baseline,
+        cli_mutation_workers,
+        tools,
+        scope,
+    )
+
+
+def dependency_gate_for_run(
+    root: Path,
+    config: dict[str, Any],
+    source_files: Sequence[Path],
+    workspace: Path,
+    all_source_files: Sequence[Path],
+    scope: GateScope,
+    selection: GateSelection,
+) -> tuple[GateResult, list[DependencyViolation]]:
+    if not selection.wants("dependencies"):
+        return skipped_check("dependencies", "Module dependencies"), []
+    if scope.incremental and not source_files:
+        return not_applicable_for_scope(
+            "dependencies", "Module dependencies", scope
+        ), []
+    return run_dependency_gate(
+        root, config, source_files, workspace, resolution_files=all_source_files
+    )
+
+
+SMOKE_TITLE = "Runs (smoke)"
+SMOKE_GUIDANCE = (
+    "Configure smoke.commands with a command that starts the application and loads it once: "
+    "for a web UI `python3 <skill>/scripts/smoke_check.py --start '<start command>' --browser`; "
+    "for a CLI or library, its entry point (`--help` or an import). "
+    "A test suite that mocks the network does not prove the application runs."
+)
+SCOPE_TITLE = "Gate scope"
+TOOLING_FILE_PATTERNS = (
+    "**/*.config.*",
+    "**/.*rc.*",
+    "**/*.d.ts",
+    "**/conftest.py",
+    "**/setup.py",
+)
+
+
+def smoke_gate_for_run(
+    root: Path,
+    config: dict[str, Any],
+    fast: bool,
+    selection: GateSelection,
+    extra_env: dict[str, str] | None = None,
+) -> GateResult:
+    """Start the application once; unconfigured is a failure, because the ship report must prove it runs."""
+    if not selection.wants("smoke"):
+        return skipped_check("smoke", SMOKE_TITLE)
+    if fast and not selection.partial:
+        return deferred_check(
+            "smoke",
+            SMOKE_TITLE,
+            "starting the application once is reserved for the ship report; run --smoke to do it now.",
+        )
+    section = {**config["smoke"], "required": True}
+    return run_command_check_gate(
+        root, "smoke", SMOKE_TITLE, section, [], SMOKE_GUIDANCE, extra_env
+    )
+
+
+def first_match(relative: str, patterns: Sequence[str]) -> str | None:
+    for pattern in patterns:
+        if matches_any(relative, [pattern]):
+            return pattern
+    return None
+
+
+def excluded_production_files(
+    root: Path, source_config: dict[str, Any]
+) -> list[tuple[str, str]]:
+    """Production files that only an extra source.exclude pattern keeps out of the gate."""
+    extra = [
+        str(pattern)
+        for pattern in source_config.get("exclude", [])
+        if str(pattern) not in DEFAULT_TEST_PATTERNS
+    ]
+    if not extra:
+        return []
+    without_extra = {**source_config, "exclude": list(DEFAULT_TEST_PATTERNS)}
+    hidden: list[tuple[str, str]] = []
+    for path in discover_source_files(root, without_extra):
+        relative = normalize_path(path, root)
+        pattern = first_match(relative, extra)
+        if pattern is not None and not matches_any(relative, TOOLING_FILE_PATTERNS):
+            hidden.append((relative, pattern))
+    return hidden
+
+
+def run_scope_gate(root: Path, source_config: dict[str, Any]) -> GateResult:
+    hidden = excluded_production_files(root, source_config)
+    if not hidden:
+        return GateResult(
+            "scope",
+            SCOPE_TITLE,
+            True,
+            "No production file is excluded from the gate beyond the standard test patterns.",
+        )
+    details = [
+        f"{relative} — hidden by source.exclude pattern {pattern!r}"
+        for relative, pattern in hidden
+    ]
+    return GateResult(
+        "scope",
+        SCOPE_TITLE,
+        False,
+        f"{len(hidden)} production files are hidden from the gate by source.exclude.",
+        details,
+        prompts=[
+            (
+                "Restore gate scope",
+                "Remove the extra source.exclude patterns and cover those files; an entry point gets a startup or smoke test. Only tooling files (*.config.*, rc files, *.d.ts, conftest.py, setup.py) may be excluded.",
+            )
+        ],
+    )
+
+
+def scope_gate_for_run(
+    root: Path, config: dict[str, Any], selection: GateSelection
+) -> GateResult:
+    if not selection.wants("scope"):
+        return skipped_check("scope", SCOPE_TITLE)
+    return run_scope_gate(root, config["source"])
+
+
+def has_web_client(root: Path) -> bool:
+    return any(path.name == "index.html" for path in walk_files(root))
+
+
+def npm_start_smoke(root: Path) -> list[str] | None:
+    if "start" not in package_scripts(root):
+        return None
+    command = [
+        "python3",
+        script_reference(root, Path(__file__).with_name("smoke_check.py")),
+        "--start",
+        "npm start",
+    ]
+    if has_web_client(root):
+        command.append("--browser")
+    return command
+
+
+def python_package_name(root: Path) -> str | None:
+    for pattern in ("src/*/__init__.py", "*/__init__.py"):
+        for path in sorted(root.glob(pattern)):
+            name = path.parent.name
+            if not name.startswith(("test", ".")):
+                return name
+    return None
+
+
+def python_import_smoke(root: Path) -> list[str] | None:
+    name = python_package_name(root)
+    if name is None:
+        return None
+    python = executable(root, "python") or executable(root, "python3") or "python3"
+    return [python, "-c", f"import {name}"]
+
+
+def inferred_smoke_commands(root: Path) -> list[list[str]]:
+    command = npm_start_smoke(root) or python_import_smoke(root)
+    return [command] if command else []
+
+
+def smoke_template(root: Path) -> dict[str, Any]:
+    commands = inferred_smoke_commands(root)
+    if commands:
+        note = "Generated: starts the application once and loads it. The ship report is red until this runs green."
+    else:
+        note = "Not detected: add a command that starts the application and loads it once (see references/quality-loop.md). The ship report is red until then."
+    return {"commands": commands, "_note": note}
+
+
+def smoke_init_message(commands: Sequence[Sequence[str]]) -> str:
+    if commands:
+        return f"Runs (smoke): the ship report starts the application with {shlex.join(commands[0])}; adjust smoke.commands if that is not how it starts."
+    return "Runs (smoke): no start command detected. Add smoke.commands (start the application and load it once); the ship report is red until it is green."
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -5751,6 +6559,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--init", action="store_true", help=f"write a detected {CONFIG_NAME} and exit"
+    )
+    parser.add_argument(
+        "--merge-lcov",
+        metavar="OUTPUT",
+        help="merge PREFIX=LCOV inputs into OUTPUT, prefixing relative SF paths, and exit",
+    )
+    parser.add_argument(
+        "lcov_sources", nargs="*", metavar="PREFIX=LCOV", help="inputs for --merge-lcov"
     )
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument(
@@ -5791,6 +6607,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.update_from_github:
         return update_from_github(Path(__file__).resolve(), args.update_from_github)
+    if args.merge_lcov:
+        return merge_lcov_command(Path(args.merge_lcov), args.lcov_sources)
     root = Path(args.root).resolve()
     if not root.is_dir():
         print(f"error: repository root does not exist: {root}", file=sys.stderr)
@@ -5819,14 +6637,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             thresholds = default_thresholds()
             write_initial_thresholds(thresholds_path)
             write_initial_config(root, config_path, thresholds)
+            rules_path = root / DEPENDENCIES_NAME
+            wrote_rules = write_initial_dependencies(root, rules_path)
         except (OSError, ValueError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 2
         print(f"Wrote {config_path}")
         print(f"Wrote {thresholds_path}")
+        if wrote_rules:
+            print(
+                f"Wrote {rules_path} (generated skeleton: review the module boundaries)"
+            )
         print(
-            "Review source, format/lint, types, contracts, tests, metrics, dead-code, flaky-test, mutation, and dependency settings before the first enforcing run."
+            "Mutation testing and flaky detection are off until requested: run with --mutation or --flaky, or enable them in the configuration."
         )
+        print(smoke_init_message(inferred_smoke_commands(root)))
+        print(
+            "Review source, format/lint, types, contracts, tests, metrics, dead-code, and dependency settings before the first enforcing run."
+        )
+        loop = script_reference(root, Path(__file__).with_name("quality_loop.py"))
+        print(f"Next: python3 {loop} --root . --fast")
         return 0
     report_path = Path(args.html)
     if not report_path.is_absolute():

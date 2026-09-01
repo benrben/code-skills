@@ -19,9 +19,21 @@
       ]
     },
     {
+      "name": "quality-report",
+      "paths": [
+        "skills/code-discipline/scripts/quality_report.py"
+      ]
+    },
+    {
       "name": "installer",
       "paths": [
         "skills/code-discipline/scripts/install.py"
+      ]
+    },
+    {
+      "name": "smoke-check",
+      "paths": [
+        "skills/code-discipline/scripts/smoke_check.py"
       ]
     }
   ],
@@ -31,9 +43,12 @@
     ],
     "quality-engine": [],
     "quality-loop": [
-      "quality-engine"
+      "quality-engine",
+      "quality-report"
     ],
-    "installer": []
+    "installer": [],
+    "quality-report": [],
+    "smoke-check": []
   },
   "deny": [
     {
@@ -51,6 +66,18 @@
     {
       "from": "installer",
       "to": "quality-engine"
+    },
+    {
+      "from": "quality-report",
+      "to": "quality-loop"
+    },
+    {
+      "from": "quality-engine",
+      "to": "quality-report"
+    },
+    {
+      "from": "quality-engine",
+      "to": "smoke-check"
     }
   ]
 }

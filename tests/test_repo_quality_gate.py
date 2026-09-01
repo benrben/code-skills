@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -14,11 +15,13 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "repo_quality_gate.py"
 LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py"
+REPORT_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_report.py"
 INSTALL_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "install.py"
 
 
@@ -40,7 +43,16 @@ def load_script(name: str, path: Path):
 
 gate = load_script("quality_gate_test_module", CORE_SCRIPT)
 quality_loop = load_script("quality_loop_test_module", LOOP_SCRIPT)
+quality_report = load_script("quality_report_test_module", REPORT_SCRIPT)
 installer = load_script("skill_installer_test_module", INSTALL_SCRIPT)
+EMPTY_FAILURES: dict[str, list] = {
+    "checks": [],
+    "functions": [],
+    "files": [],
+    "surviving_mutants": [],
+    "dependencies": [],
+    "tool_setup": [],
+}
 
 
 class QualityGateUnitTests(unittest.TestCase):
@@ -1439,6 +1451,50 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertEqual(gate.craap_score(4, 0), 20)
         self.assertAlmostEqual(gate.craap_score(4, 50), 6)
 
+    def test_craap_state_keeps_enough_precision_to_explain_failure(self) -> None:
+        score = gate.craap_score(6, 99.9)
+        function = gate.FunctionMetric(
+            path="app.py",
+            name="almost_covered",
+            start_line=1,
+            end_line=2,
+            complexity=6,
+            covered_lines=999,
+            total_lines=1000,
+            coverage_percent=99.9,
+            craap_score=score,
+            parser="python-ast",
+        )
+
+        self.assertGreater(score, 6)
+        self.assertFalse(function.passed)
+        self.assertGreater(gate.function_measurement(function)["craap_score"], 6)
+
+    def test_normalized_adapter_cannot_override_craap_formula(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "metrics.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "app.py",
+                                "name": "choose",
+                                "complexity": 4,
+                                "coverage_percent": 50,
+                                "craap_score": 999,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            functions = gate.load_normalized_metrics(report, root)
+
+        self.assertEqual(functions[0].craap_score, 6)
+
     def test_lizard_adapter_normalizes_multilanguage_functions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1489,6 +1545,110 @@ def outer(value):
         by_name = {name: complexity for name, _, _, complexity, _ in functions}
         self.assertEqual(by_name["outer"], 3)
         self.assertEqual(by_name["outer.inner"], 2)
+
+    def test_python_complexity_counts_lambda_and_comprehension_paths(self) -> None:
+        source = """\
+def mapped(values):
+    return list(map(lambda value: value if value and value > 1 else 0, values))
+
+def flattened(rows):
+    return [value for row in rows for value in row if value > 0 if value % 2]
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.py"
+            path.write_text(source, encoding="utf-8")
+            functions = gate.parse_python_functions(path)
+
+        by_name = {name: complexity for name, _, _, complexity, _ in functions}
+        self.assertEqual(by_name["mapped"], 3)
+        self.assertEqual(by_name["flattened"], 5)
+
+    def test_python_match_does_not_count_default_and_counts_or_patterns(self) -> None:
+        source = """\
+def default_only(value):
+    match value:
+        case _:
+            return 0
+
+def alternatives(value):
+    match value:
+        case 1 | 2:
+            return 1
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.py"
+            path.write_text(source, encoding="utf-8")
+            functions = gate.parse_python_functions(path)
+
+        by_name = {name: complexity for name, _, _, complexity, _ in functions}
+        self.assertEqual(by_name["default_only"], 1)
+        self.assertEqual(by_name["alternatives"], 3)
+
+    def test_nested_function_lines_belong_only_to_nested_coverage(self) -> None:
+        source = """\
+def outer(value):
+    def inner(flag):
+        if flag:
+            return 1
+    if value:
+        return inner(value)
+    return 0
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "sample.py"
+            path.write_text(source, encoding="utf-8")
+            coverage = {
+                "sample.py": {
+                    1: 1,
+                    2: 1,
+                    3: 0,
+                    4: 0,
+                    5: 1,
+                    6: 1,
+                    7: 1,
+                }
+            }
+
+            functions = gate.build_function_metrics([path], root, coverage)
+
+        by_name = {function.name: function for function in functions}
+        self.assertEqual(by_name["outer"].coverage_percent, 100)
+        self.assertEqual(by_name["outer"].total_lines, 4)
+        self.assertAlmostEqual(by_name["outer.inner"].coverage_percent, 100 / 3)
+        self.assertEqual(by_name["outer.inner"].total_lines, 3)
+
+    def test_python_stubs_skip_coverage_but_concrete_pass_does_not(self) -> None:
+        source = """\
+from abc import abstractmethod
+from typing import overload
+
+class Service:
+    @abstractmethod
+    def required(self):
+        ...
+
+@overload
+def convert(value: int) -> str: ...
+
+def no_op():
+    pass
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "sample.py"
+            path.write_text(source, encoding="utf-8")
+            coverage = {"sample.py": {6: 1, 7: 0, 10: 1, 12: 1, 13: 0}}
+
+            functions = gate.build_function_metrics([path], root, coverage)
+
+        by_name = {function.name: function for function in functions}
+        self.assertFalse(by_name["Service.required"].coverage_measured)
+        self.assertTrue(by_name["Service.required"].passed)
+        self.assertFalse(by_name["convert"].coverage_measured)
+        self.assertTrue(by_name["convert"].passed)
+        self.assertTrue(by_name["no_op"].coverage_measured)
+        self.assertFalse(by_name["no_op"].passed)
 
     def test_import_scanner_keeps_import_strings_and_ignores_comments(self) -> None:
         source = """\
@@ -2407,13 +2567,26 @@ const helper = require('./helper.js')
             self.assertEqual(result.mode, "full")
 
         output = io.StringIO()
-        summary_gate = SimpleNamespace(gate_outcome=lambda item: "PASS")
-        summary_analysis = SimpleNamespace(
-            gates=[SimpleNamespace(title="One", summary="ok")]
+        summary_gate = SimpleNamespace(
+            gate_outcome=lambda item: "PASS", gate_status=lambda item: "pass"
         )
-        summary_state = {"status": "pass", "fix_prompt": "fix"}
+        summary_analysis = SimpleNamespace(
+            gates=[SimpleNamespace(title="One", summary="ok", details=[])],
+            mode="full",
+            selection=(),
+            scope=SimpleNamespace(description="the entire repository"),
+            thresholds={},
+            functions=[],
+        )
+        summary_state = {
+            "status": "pass",
+            "fix_prompt": "fix",
+            "rerun_command": "run",
+            "full_rerun_command": "run",
+            "failures": EMPTY_FAILURES,
+        }
         with contextlib.redirect_stdout(output):
-            quality_loop.print_run_summary(
+            quality_report.print_report(
                 summary_gate,
                 summary_analysis,
                 summary_state,
@@ -2422,6 +2595,7 @@ const helper = require('./helper.js')
                 True,
             )
         self.assertIn("QUALITY_LOOP=PASS", output.getvalue())
+        self.assertIn("Ship report is green", output.getvalue())
 
     def test_quality_loop_atomic_write_cleanup_and_main_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2562,7 +2736,7 @@ const helper = require('./helper.js')
                     quality_loop, "analysis_state", return_value={"status": "fail"}
                 ),
                 mock.patch.object(quality_loop, "write_json_atomic"),
-                mock.patch.object(quality_loop, "print_run_summary"),
+                mock.patch.object(quality_loop, "print_report"),
             ):
                 self.assertEqual(quality_loop.run_locked(args, run_root), 1)
 
@@ -2618,6 +2792,11 @@ class QualityGateEndToEndTests(unittest.TestCase):
                         {
                             "source": {"include": ["src/**"], "exclude": []},
                             "test": {"command": [sys.executable, "check.py"]},
+                            "smoke": {
+                                "commands": [
+                                    [sys.executable, "-c", "print('app answers')"]
+                                ]
+                            },
                             "format_lint": {
                                 "commands": [
                                     [sys.executable, "-c", "print('format clean')"]
@@ -2673,9 +2852,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertEqual(passing_state["status"], "pass")
-            self.assertEqual(len(passing_state["gates"]), 9)
-            self.assertEqual(passing_state["counts"]["checks_applicable"], 9)
-            self.assertEqual(passing_state["counts"]["checks_passing"], 9)
+            self.assertEqual(len(passing_state["gates"]), 11)
+            self.assertEqual(passing_state["counts"]["checks_applicable"], 11)
+            self.assertEqual(passing_state["counts"]["checks_passing"], 11)
             self.assertEqual(passing_state["counts"]["mutants_static"], 0)
             self.assertEqual(passing_state["counts"]["files_total"], 1)
             self.assertEqual(passing_state["counts"]["files_failing_loc"], 0)
@@ -2702,7 +2881,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             )
             self.assertIsNone(passing_state["fix_prompt"])
             self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
-            self.assertEqual(passing_html.count('<details class="check-row '), 9)
+            self.assertEqual(passing_html.count('<details class="check-row '), 11)
             self.assertNotIn("9 total ·", passing_html)
 
             fast_html = root / "fast-report.html"
@@ -2740,7 +2919,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(fast_state["mode"], "fast")
             self.assertFalse(fast_state["certified"])
             self.assertTrue(fast_state["ready_for_full"])
-            self.assertEqual(fast_state["counts"]["checks_deferred"], 2)
+            self.assertEqual(fast_state["counts"]["checks_deferred"], 3)
             self.assertEqual(fast_statuses["flaky"], "deferred")
             self.assertEqual(fast_statuses["mutation"], "deferred")
             self.assertEqual(len(fast_test_commands), 1)
@@ -2792,6 +2971,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                         "covered_lines": 2,
                         "total_lines": 2,
                         "coverage_percent": 100.0,
+                        "coverage_measured": True,
                         "complexity": 1,
                         "craap_score": 1.0,
                         "passed": True,
@@ -2879,6 +3059,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
                     {
                         "source": {"include": ["src/**"], "exclude": []},
                         "test": {"command": [sys.executable, "check.py"]},
+                        "smoke": {
+                            "commands": [[sys.executable, "-c", "print('app answers')"]]
+                        },
                         "metrics": {"report": "metrics.json"},
                     }
                 ),
@@ -3042,6 +3225,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 {
                     "source": {"include": ["src/**"], "exclude": []},
                     "test": {"command": passing_command},
+                    "smoke": {
+                        "commands": [[sys.executable, "-c", "print('app answers')"]]
+                    },
                     "format_lint": {
                         "commands": [[sys.executable, "-c", "print('format clean')"]]
                     },
@@ -3070,7 +3256,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             rendered = report_path.read_text(encoding="utf-8")
             self.assertIn("Can I ship this?", rendered)
             self.assertIn("READY TO SHIP", rendered)
-            self.assertEqual(rendered.count('<details class="check-row '), 9)
+            self.assertEqual(rendered.count('<details class="check-row '), 11)
             self.assertNotIn("9 total ·", rendered)
             self.assertIn("Code metrics", rendered)
             self.assertIn("<strong>1.00</strong><span>Average CRAAP", rendered)
@@ -3090,3 +3276,1583 @@ class QualityGateEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def fixture_repository(root: Path, mutation_enabled: bool = True) -> Path:
+    """A one-function Python repository whose every gate command is a stub."""
+    (root / "src").mkdir()
+    (root / "src" / "app.py").write_text(
+        "def is_one(value):\n    return value == 1\n", encoding="utf-8"
+    )
+    (root / "check.py").write_text(
+        "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\n",
+        encoding="utf-8",
+    )
+    (root / "metrics.json").write_text(
+        json.dumps(
+            {
+                "functions": [
+                    {
+                        "path": "src/app.py",
+                        "name": "is_one",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "complexity": 1,
+                        "covered_lines": 2,
+                        "total_lines": 2,
+                        "coverage_percent": 100,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    quality_file(root, "quality-dependencies.json").write_text(
+        json.dumps(
+            {
+                "modules": [{"name": "core", "paths": ["src/**"]}],
+                "allow": {"core": []},
+                "deny": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stub = lambda text: [[sys.executable, "-c", f"print({text!r})"]]  # noqa: E731
+    config_path = quality_file(root, "quality-gate.json")
+    config_path.write_text(
+        json.dumps(
+            gate.deep_merge(
+                gate.default_config(),
+                {
+                    "source": {"include": ["src/**"], "exclude": []},
+                    "test": {"command": [sys.executable, "check.py"]},
+                    "smoke": {"commands": stub("app answers")},
+                    "format_lint": {"commands": stub("format clean")},
+                    "types": {"commands": stub("types clean")},
+                    "contracts": {"commands": stub("contracts valid")},
+                    "metrics": {"report": "metrics.json"},
+                    "dead_code": {"commands": stub("no dead code")},
+                    "mutation": {
+                        "enabled": mutation_enabled,
+                        "test_command": [sys.executable, "check.py"],
+                        "operators": {"==": "!="},
+                    },
+                    "flaky_tests": {"enabled": mutation_enabled},
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def run_loop(root: Path, *flags: str) -> tuple[subprocess.CompletedProcess, dict]:
+    artifacts = root / "artifacts"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(LOOP_SCRIPT),
+            "--root",
+            str(root),
+            "--artifact-dir",
+            str(artifacts),
+            "--no-install",
+            *flags,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    state = json.loads((artifacts / "quality-gate-state.json").read_text("utf-8"))
+    return completed, state
+
+
+class CheckSelectionTests(unittest.TestCase):
+    def test_selection_helpers_map_flags_to_gates_and_focus(self) -> None:
+        self.assertIsNone(gate.selected_gate_keys([]))
+        self.assertEqual(
+            gate.selected_gate_keys(["lint", "coverage", "dead-code"]),
+            frozenset({"format_lint", "quality", "dead_code"}),
+        )
+        self.assertEqual(gate.metrics_focus(["coverage", "complexity"]), "craap")
+        self.assertEqual(gate.metrics_focus(["tests", "coverage"]), "coverage")
+        self.assertEqual(gate.metrics_focus(["complexity", "lint"]), "complexity")
+        self.assertEqual(gate.metrics_focus(["tests"]), "tests")
+        self.assertIsNone(gate.metrics_focus(["lint"]))
+        everything = gate.gate_selection([])
+        self.assertFalse(everything.partial)
+        self.assertTrue(everything.wants("mutation"))
+        partial = gate.gate_selection(["lint", "flaky"])
+        self.assertTrue(partial.partial)
+        self.assertTrue(partial.wants("format_lint"))
+        self.assertFalse(partial.wants("types"))
+        self.assertTrue(partial.forces("flaky"))
+        self.assertFalse(partial.forces("mutation"))
+        self.assertEqual(gate.run_mode(True, everything), "fast")
+        self.assertEqual(gate.run_mode(False, everything), "full")
+        self.assertEqual(gate.run_mode(True, partial), "partial")
+
+    def test_selection_decides_whether_the_test_baseline_runs(self) -> None:
+        self.assertTrue(gate.selection_needs_test_baseline(gate.gate_selection([])))
+        self.assertTrue(
+            gate.selection_needs_test_baseline(gate.gate_selection(["coverage"]))
+        )
+        self.assertTrue(
+            gate.selection_needs_test_baseline(gate.gate_selection(["mutation"]))
+        )
+        self.assertFalse(
+            gate.selection_needs_test_baseline(gate.gate_selection(["complexity"]))
+        )
+        self.assertFalse(
+            gate.selection_needs_test_baseline(gate.gate_selection(["lint"]))
+        )
+
+    def test_skipped_off_and_tests_only_gates(self) -> None:
+        skipped = gate.skipped_check("types", "Static type checking")
+        self.assertTrue(skipped.passed)
+        self.assertTrue(skipped.skipped)
+        self.assertEqual(gate.gate_outcome(skipped), "SKIPPED")
+        self.assertEqual(gate.gate_status(skipped), "skipped")
+        off = gate.off_check("mutation", "Mutation testing", "mutation")
+        self.assertTrue(off.off)
+        self.assertEqual(gate.gate_outcome(off), "OFF")
+        self.assertEqual(gate.gate_status(off), "off")
+        self.assertIn("--mutation", off.summary)
+        enabled = gate.with_gate_enabled({"mutation": {"enabled": False}}, "mutation")
+        self.assertTrue(enabled["mutation"]["enabled"])
+        self.assertFalse(gate.tests_only_gate(None, None).passed)
+        failed = gate.CommandResult(["t"], 1, "boom", 0.5)
+        result = gate.tests_only_gate(["t"], failed)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.details, ["boom"])
+        passed = gate.tests_only_gate(["t"], gate.CommandResult(["t"], 0, "", 0.25))
+        self.assertTrue(passed.passed)
+        self.assertIn("0.2s", passed.summary)
+
+    def test_static_complexity_gate_needs_no_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text(
+                "def simple(a):\n    return a\n\n\n"
+                "def branchy(a, b, c, d, e, f, g):\n"
+                "    if a:\n        return 1\n    if b:\n        return 2\n"
+                "    if c:\n        return 3\n    if d:\n        return 4\n"
+                "    if e:\n        return 5\n    if f:\n        return 6\n"
+                "    return g\n",
+                encoding="utf-8",
+            )
+            tools = gate.ToolContext(root, sys.executable, root / "pythonpath")
+            config = {"metrics": {"complexity_limit": 6}}
+            result, functions = gate.run_complexity_gate(
+                root, config, [source], root, tools
+            )
+            self.assertFalse(result.passed)
+            self.assertEqual(result.title, "Complexity")
+            self.assertEqual([f.name for f in functions], ["simple", "branchy"])
+            self.assertFalse(functions[1].coverage_measured)
+            self.assertFalse(functions[1].passed)
+            self.assertTrue(functions[0].passed)
+            self.assertIn("branchy: complexity 7", result.details[0])
+            self.assertFalse(
+                gate.function_measurement(functions[1])["coverage_measured"]
+            )
+            passing, _ = gate.run_complexity_gate(
+                root, {"metrics": {"complexity_limit": 8}}, [source], root, tools
+            )
+            self.assertTrue(passing.passed)
+            empty, _ = gate.run_complexity_gate(root, config, [], root, tools)
+            self.assertFalse(empty.passed)
+
+    def test_flaky_and_mutation_gates_honour_selection_and_off_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = gate.deep_merge(
+                gate.default_config(),
+                {"flaky_tests": {"enabled": False}, "mutation": {"enabled": False}},
+            )
+            everything = gate.gate_selection([])
+            self.assertTrue(
+                gate.flaky_gate_for_run(root, config, None, None, False, everything).off
+            )
+            self.assertTrue(
+                gate.flaky_gate_for_run(
+                    root, config, None, None, False, gate.gate_selection(["lint"])
+                ).skipped
+            )
+            self.assertTrue(
+                gate.flaky_gate_for_run(
+                    root, config, None, None, True, everything
+                ).deferred
+            )
+            forced = gate.flaky_gate_for_run(
+                root, config, None, None, False, gate.gate_selection(["flaky"])
+            )
+            self.assertFalse(forced.applicable)
+            self.assertIn("no complete test command", forced.summary)
+            tools = gate.ToolContext(root, sys.executable, root / "pythonpath")
+            scope = gate.repository_scope()
+            off, mutations = gate.mutation_gate_for_run(
+                root, config, [], None, None, None, tools, scope, False, everything
+            )
+            self.assertTrue(off.off)
+            self.assertEqual(mutations, [])
+            skipped, _ = gate.mutation_gate_for_run(
+                root,
+                config,
+                [],
+                None,
+                None,
+                None,
+                tools,
+                scope,
+                False,
+                gate.gate_selection(["lint"]),
+            )
+            self.assertTrue(skipped.skipped)
+            deferred, _ = gate.mutation_gate_for_run(
+                root, config, [], None, None, None, tools, scope, True, everything
+            )
+            self.assertTrue(deferred.deferred)
+            incremental, _ = gate.mutation_gate_for_run(
+                root,
+                config,
+                [],
+                None,
+                None,
+                None,
+                tools,
+                gate.GateScope("local_changes"),
+                False,
+                everything,
+            )
+            self.assertFalse(incremental.applicable)
+            forced_mutation, _ = gate.mutation_gate_for_run(
+                root,
+                config,
+                [root / "missing.py"],
+                None,
+                None,
+                None,
+                tools,
+                scope,
+                False,
+                gate.gate_selection(["mutation"]),
+            )
+            self.assertFalse(forced_mutation.passed)
+            self.assertIn("No full-suite test command", forced_mutation.summary)
+            dependency, _ = gate.dependency_gate_for_run(
+                root, config, [], root, [], scope, gate.gate_selection(["lint"])
+            )
+            self.assertTrue(dependency.skipped)
+            not_applicable, _ = gate.dependency_gate_for_run(
+                root, config, [], root, [], gate.GateScope("commit"), everything
+            )
+            self.assertFalse(not_applicable.applicable)
+            loc, files = gate.run_file_loc_for_selection(
+                root, [], config["file_loc"], scope, gate.gate_selection(["lint"])
+            )
+            self.assertTrue(loc.skipped)
+            self.assertEqual(files, [])
+            loc_scope, _ = gate.run_file_loc_for_selection(
+                root, [], config["file_loc"], gate.GateScope("commit"), everything
+            )
+            self.assertFalse(loc_scope.applicable)
+
+    def test_quality_gate_dispatches_on_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = gate.ToolContext(root, sys.executable, root / "pythonpath")
+            config = gate.default_config()
+            scope = gate.repository_scope()
+            skipped, functions = gate.run_quality_gate(
+                root,
+                config,
+                [],
+                root,
+                tools,
+                scope,
+                gate.gate_selection(["lint"]),
+                None,
+                None,
+            )
+            self.assertTrue(skipped.skipped)
+            self.assertEqual(functions, [])
+            tests_only, _ = gate.run_quality_gate(
+                root,
+                config,
+                [],
+                root,
+                tools,
+                scope,
+                gate.gate_selection(["tests"]),
+                ["t"],
+                gate.CommandResult(["t"], 0, "", 0.1),
+            )
+            self.assertEqual(tests_only.title, "Tests")
+            self.assertTrue(tests_only.passed)
+            incremental, _ = gate.run_quality_gate(
+                root,
+                config,
+                [],
+                root,
+                tools,
+                gate.GateScope("local_changes"),
+                gate.gate_selection([]),
+                ["t"],
+                gate.CommandResult(["t"], 0, "", 0.1),
+            )
+            self.assertTrue(incremental.passed)
+            source = root / "app.py"
+            source.write_text("def f(a):\n    return a\n", encoding="utf-8")
+            complexity, _ = gate.run_quality_gate(
+                root,
+                config,
+                [source],
+                root,
+                tools,
+                scope,
+                gate.gate_selection(["complexity"]),
+                None,
+                None,
+            )
+            self.assertEqual(complexity.title, "Complexity")
+            self.assertTrue(complexity.passed)
+
+    def test_partial_state_status_and_prompt_notes(self) -> None:
+        partial = SimpleNamespace(
+            passed=False, mode="partial", selected_passed=True, ready_for_full=False
+        )
+        self.assertTrue(gate.partial_run_passed(partial))
+        self.assertEqual(gate.state_status(partial, None), "pass")
+        self.assertIsNone(gate.state_fix_prompt(SimpleNamespace(), partial))
+        partial.selected_passed = False
+        self.assertFalse(gate.partial_run_passed(partial))
+        self.assertEqual(gate.state_status(partial, None), "fail")
+        full = SimpleNamespace(
+            passed=False, mode="full", selected_passed=True, ready_for_full=False
+        )
+        self.assertFalse(gate.partial_run_passed(full))
+        report = gate.AnalysisReport(
+            root="/repo",
+            generated_at="now",
+            languages=[],
+            gates=[gate.off_check("mutation", "Mutation testing", "mutation")],
+            functions=[],
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+            mode="partial",
+            selection=("lint",),
+        )
+        self.assertEqual(
+            gate.off_note(report, "mutation"), " (off: run only when the user asks)"
+        )
+        self.assertEqual(gate.off_note(report, "flaky"), "")
+        self.assertTrue(report.selected_passed)
+        self.assertFalse(report.passed)
+        prompt = gate.master_fix_prompt(report)
+        self.assertIn("partial run (--lint)", prompt)
+        self.assertIn("zero survive (off: run only when the user asks)", prompt)
+        self.assertIn("SELECTED CHECKS PASSED", gate.html_report(report))
+        self.assertIn("OFF", gate.html_report(report))
+        report.gates = [gate.skipped_check("types", "Static type checking")]
+        self.assertFalse(report.selected_passed)
+        self.assertIn("SELECTED CHECKS NEED WORK", gate.html_report(report))
+
+    def test_init_is_workspace_aware_and_turns_slow_gates_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "mono",
+                        "workspaces": {"packages": ["packages/*"]},
+                        "devDependencies": {"vitest": "2.1.9"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for name, manifest in (
+                ("shared", {"name": "@m/shared", "scripts": {"test": "vitest run"}}),
+                ("server", {"name": "@m/server", "dependencies": {"@m/shared": "*"}}),
+                ("docs", {"name": "@m/docs"}),
+            ):
+                (root / "packages" / name).mkdir(parents=True)
+                (root / "packages" / name / "package.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+            (root / "packages" / "server" / "vitest.config.ts").write_text("", "utf-8")
+            (root / "packages" / "stray").mkdir()
+            self.assertEqual(
+                [path.name for path in gate.npm_workspace_dirs(root)],
+                ["docs", "server", "shared"],
+            )
+            self.assertTrue(gate.workspace_uses_vitest(root / "packages" / "server"))
+            self.assertTrue(gate.workspace_uses_vitest(root / "packages" / "shared"))
+            self.assertFalse(gate.workspace_uses_vitest(root / "packages" / "docs"))
+            self.assertEqual(gate.npm_workspace_dirs(root / "packages"), [])
+            with mock.patch.object(gate, "executable", return_value="npm"):
+                self.assertEqual(
+                    gate.infer_test_command(root),
+                    ["npm", "test", "--workspaces", "--if-present"],
+                )
+            coverage = gate.workspace_coverage_template(root)
+            self.assertEqual(coverage["coverage_format"], "lcov")
+            self.assertEqual(len(coverage["coverage_commands"]), 3)
+            self.assertEqual(
+                coverage["coverage_commands"][0][3:5], ["--root", "packages/server"]
+            )
+            self.assertEqual(coverage["coverage_commands"][-1][2], "--merge-lcov")
+            self.assertEqual(gate.workspace_coverage_template(root / "packages"), {})
+            rules = gate.dependency_rules_template(root)
+            self.assertEqual(
+                rules["allow"],
+                {
+                    "packages/docs": [],
+                    "packages/server": ["packages/shared"],
+                    "packages/shared": [],
+                },
+            )
+            self.assertEqual(
+                gate.dependency_rules_template(root / "packages")["modules"],
+                [{"name": "repository", "paths": ["**"]}],
+            )
+            completed = subprocess.run(
+                [sys.executable, str(CORE_SCRIPT), "--root", str(root), "--init"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            config = json.loads(
+                (root / ".quality" / "quality-gate.json").read_text("utf-8")
+            )
+            self.assertFalse(config["mutation"]["enabled"])
+            self.assertFalse(config["flaky_tests"]["enabled"])
+            self.assertEqual(
+                config["metrics"]["coverage_report"], ".quality/coverage/lcov.info"
+            )
+            self.assertTrue((root / ".quality" / "quality-dependencies.json").is_file())
+            self.assertIn("generated skeleton", completed.stdout)
+            self.assertIn("Next: python3", completed.stdout)
+            self.assertFalse(
+                gate.write_initial_dependencies(
+                    root, root / ".quality" / "quality-dependencies.json"
+                )
+            )
+            self.assertEqual(gate.script_reference(root, root / "x.py"), "x.py")
+            self.assertTrue(
+                Path(gate.script_reference(root, CORE_SCRIPT)).is_absolute()
+            )
+
+    def test_merge_lcov_prefixes_relative_source_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "a.info").write_text(
+                "TN:\nSF:src/a.ts\nDA:1,1\nend_of_record\n", "utf-8"
+            )
+            (root / "b.info").write_text("SF:/abs/b.ts\nend_of_record\n", "utf-8")
+            output = root / "out" / "lcov.info"
+            self.assertEqual(gate.prefixed_lcov_line("SF:x.ts", ""), "SF:x.ts")
+            self.assertEqual(gate.prefixed_lcov_line("SF:x.ts", "pkg/"), "SF:pkg/x.ts")
+            self.assertEqual(
+                gate.merge_lcov_files(
+                    output, [f"packages/a={root / 'a.info'}", f"b={root / 'b.info'}"]
+                ),
+                2,
+            )
+            self.assertEqual(
+                output.read_text("utf-8"),
+                "TN:\nSF:packages/a/src/a.ts\nDA:1,1\nend_of_record\nSF:/abs/b.ts\nend_of_record\n",
+            )
+            with self.assertRaises(ValueError):
+                gate.merge_lcov_files(output, ["no-separator"])
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(gate.merge_lcov_command(output, ["x=missing.info"]), 2)
+            self.assertIn("error:", stderr.getvalue())
+            self.assertEqual(
+                gate.main(["--merge-lcov", str(output), f"a={root / 'a.info'}"]), 0
+            )
+
+    def test_loop_runs_selected_checks_only_and_reports_coverage_today(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture_repository(root, mutation_enabled=False)
+            partial, state = run_loop(root, "--lint", "--types")
+            self.assertEqual(partial.returncode, 0, partial.stdout + partial.stderr)
+            self.assertEqual(state["mode"], "partial")
+            self.assertEqual(state["selection"], ["lint", "types"])
+            self.assertEqual(state["status"], "pass")
+            self.assertFalse(state["certified"])
+            statuses = {item["key"]: item["status"] for item in state["gates"]}
+            self.assertEqual(statuses["format_lint"], "pass")
+            self.assertEqual(statuses["quality"], "skipped")
+            self.assertEqual(state["counts"]["checks_skipped"], 9)
+            self.assertIn("mode: partial (--lint --types)", partial.stdout)
+            self.assertIn("Coverage today: not measured yet", partial.stdout)
+            self.assertIn("does not certify", partial.stdout)
+            self.assertIn("ITEMS_TO_FIX=0", partial.stdout)
+            self.assertIn("--lint --types", state["rerun_command"])
+
+            full, full_state = run_loop(root)
+            self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+            statuses = {item["key"]: item["status"] for item in full_state["gates"]}
+            self.assertEqual(statuses["mutation"], "off")
+            self.assertEqual(statuses["flaky"], "off")
+            self.assertEqual(full_state["counts"]["checks_off"], 2)
+            self.assertTrue(full_state["certified"])
+            self.assertIn("[OFF] Mutation testing", full.stdout)
+            self.assertIn(
+                "Coverage today: 1 of 1 functions fully covered (100%)", full.stdout
+            )
+            self.assertIn("Ship report is green", full.stdout)
+
+            later, later_state = run_loop(root, "--lint")
+            self.assertEqual(later.returncode, 0)
+            self.assertIn("last measured", later.stdout)
+            self.assertIn("1 of 1 functions", later.stdout)
+            self.assertEqual(later_state["focus"], None)
+
+            forced, forced_state = run_loop(
+                root, "--mutation", "--mutation-workers", "auto"
+            )
+            self.assertEqual(forced.returncode, 0, forced.stdout + forced.stderr)
+            statuses = {item["key"]: item["status"] for item in forced_state["gates"]}
+            self.assertEqual(statuses["mutation"], "pass")
+            self.assertEqual(forced_state["mode"], "partial")
+
+
+class LoopReportTests(unittest.TestCase):
+    def test_selection_names_and_rerun_flags(self) -> None:
+        args = quality_loop.parse_args(["--coverage", "--dead-code"])
+        self.assertEqual(quality_loop.selection_names(args), ("coverage", "dead-code"))
+        self.assertEqual(quality_loop.selection_names(quality_loop.parse_args([])), ())
+        command: list[str] = []
+        quality_loop.append_rerun_execution(command, [], False, False, None, ("craap",))
+        self.assertEqual(command, ["--craap"])
+
+    def test_run_passed_and_header(self) -> None:
+        scope = SimpleNamespace(description="local changes")
+        partial = SimpleNamespace(
+            passed=False,
+            mode="partial",
+            selected_passed=True,
+            selection=("lint",),
+            scope=scope,
+        )
+        self.assertTrue(quality_loop.run_passed(partial))
+        self.assertEqual(
+            quality_report.report_header(partial),
+            "QUALITY REPORT · mode: partial (--lint) · scope: local changes",
+        )
+        fast = SimpleNamespace(
+            passed=False, mode="fast", selected_passed=True, selection=(), scope=scope
+        )
+        self.assertFalse(quality_loop.run_passed(fast))
+        self.assertEqual(
+            quality_report.report_header(fast),
+            "QUALITY REPORT · mode: fast · scope: local changes",
+        )
+        self.assertTrue(quality_loop.run_passed(SimpleNamespace(passed=True)))
+
+    def test_gate_lines_show_details_only_for_failures(self) -> None:
+        fake = SimpleNamespace(
+            gate_outcome=lambda item: item.outcome, gate_status=lambda item: item.status
+        )
+        failed = SimpleNamespace(
+            outcome="FAIL",
+            status="fail",
+            title="Types",
+            summary="1 error",
+            details=["", "a.py:1 bad\nmore", "x" * 300],
+        )
+        lines = quality_report.gate_lines(fake, failed)
+        self.assertEqual(lines[0], "[FAIL] Types: 1 error")
+        self.assertEqual(lines[1], "    ")
+        self.assertEqual(lines[2], "    a.py:1 bad")
+        self.assertEqual(len(lines[3]), 204)
+        passed = SimpleNamespace(
+            outcome="PASS",
+            status="pass",
+            title="Types",
+            summary="ok",
+            details=["ignored"],
+        )
+        self.assertEqual(quality_report.gate_lines(fake, passed), ["[PASS] Types: ok"])
+        self.assertEqual(quality_report.first_line("  \n"), "")
+
+    def test_coverage_today_counts_functions_at_the_limit_as_covered(self) -> None:
+        functions = [
+            SimpleNamespace(path="b.py", coverage_percent=100.0),
+            SimpleNamespace(path="a.py", coverage_percent=99.9),
+            SimpleNamespace(path="a.py", coverage_percent=0.0),
+            SimpleNamespace(path="b.py", coverage_percent=50.0),
+            SimpleNamespace(
+                path="c.py", coverage_percent=10.0, coverage_measured=False
+            ),
+        ]
+        summary = quality_report.coverage_today(functions, 100.0)
+        self.assertEqual(
+            summary,
+            {
+                "covered": 1,
+                "total": 4,
+                "percent": 25,
+                "gaps": [("a.py", 2), ("b.py", 1)],
+            },
+        )
+        self.assertEqual(
+            quality_report.coverage_summary_text(summary),
+            "1 of 4 functions fully covered (25%) · 3 not covered — most in: a.py (2), b.py (1)",
+        )
+        full = quality_report.coverage_today(functions[:1], 100.0)
+        self.assertEqual(
+            quality_report.coverage_summary_text(full),
+            "1 of 1 functions fully covered (100%)",
+        )
+        self.assertIsNone(quality_report.coverage_today(functions[4:], 100.0))
+        self.assertEqual(
+            quality_report.coverage_today(functions[1:2], 99.9)["covered"], 1
+        )
+
+    def test_coverage_today_line_falls_back_to_the_previous_state(self) -> None:
+        analysis = SimpleNamespace(
+            thresholds={"metrics": {"coverage_limit": 100}}, functions=[]
+        )
+        previous = (
+            "2026-09-01",
+            {"covered": 2, "total": 3, "percent": 67, "gaps": [("a.py", 1)]},
+        )
+        self.assertEqual(
+            quality_report.coverage_today_line(analysis, previous),
+            "Coverage today: not measured in this run — last measured 2026-09-01: 2 of 3 functions fully covered (67%) · 1 not covered — most in: a.py (1)",
+        )
+        self.assertEqual(
+            quality_report.coverage_today_line(analysis, None),
+            "Coverage today: not measured yet — run --fast or --coverage.",
+        )
+        analysis.functions = [SimpleNamespace(path="a.py", coverage_percent=100.0)]
+        self.assertEqual(
+            quality_report.coverage_today_line(analysis, previous),
+            "Coverage today: 1 of 1 functions fully covered (100%)",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            self.assertIsNone(quality_report.previous_measurement(state_path))
+            state_path.write_text(json.dumps({"metrics": {"functions": []}}), "utf-8")
+            self.assertIsNone(quality_report.previous_measurement(state_path))
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": "then",
+                        "thresholds": {"metrics": {"coverage_limit": 90}},
+                        "metrics": {
+                            "functions": [{"path": "a.py", "coverage_percent": 95.0}]
+                        },
+                    }
+                ),
+                "utf-8",
+            )
+            self.assertEqual(
+                quality_report.previous_measurement(state_path),
+                ("then", {"covered": 1, "total": 1, "percent": 100, "gaps": []}),
+            )
+            state_path.write_text("{", "utf-8")
+            self.assertIsNone(quality_report.previous_measurement(state_path))
+
+    def test_to_fix_lists_every_failure_kind_and_caps_the_list(self) -> None:
+        state = {
+            "failures": {
+                "functions": [
+                    {
+                        "path": "a.py",
+                        "line": 3,
+                        "name": "f",
+                        "coverage_percent": 50.0,
+                        "complexity": 7,
+                    }
+                ],
+                "files": [{"path": "big.py", "lines": 700, "limit": 600}],
+                "surviving_mutants": [
+                    {"path": "a.py", "line": 4, "original": "==", "replacement": "!="}
+                ],
+                "dependencies": [
+                    {"source": "a.py", "line": 1, "target": "b.py", "rule": "deny"}
+                ],
+                "checks": [
+                    {"key": "types", "title": "Types", "summary": "1 error"},
+                    {
+                        "key": "quality",
+                        "title": "Quality",
+                        "summary": "already itemised",
+                    },
+                ],
+            }
+        }
+        items = quality_report.to_fix_items(state)
+        self.assertEqual(
+            items,
+            [
+                "a.py:3 f — coverage 50%, complexity 7",
+                "big.py — 700 lines (max 600)",
+                "a.py:4 surviving mutant `==` -> `!=`",
+                "a.py:1 -> b.py: deny",
+                "Types: 1 error",
+            ],
+        )
+        self.assertEqual(
+            quality_report.to_fix_lines(state)[0],
+            "  1. a.py:3 f — coverage 50%, complexity 7",
+        )
+        self.assertEqual(quality_report.to_fix_lines(state)[4], "  5. Types: 1 error")
+        self.assertEqual(len(quality_report.to_fix_lines(state)), 5)
+        many = {
+            "failures": {
+                **EMPTY_FAILURES,
+                "files": [
+                    {"path": f"{i}.py", "lines": 1, "limit": 0} for i in range(13)
+                ],
+            }
+        }
+        lines = quality_report.to_fix_lines(many)
+        self.assertEqual(len(lines), 13)
+        self.assertEqual(lines[-1], "  … and 1 more (see STATE)")
+        twelve = {
+            "failures": {**EMPTY_FAILURES, "files": many["failures"]["files"][:12]}
+        }
+        self.assertEqual(len(quality_report.to_fix_lines(twelve)), 12)
+        self.assertEqual(quality_report.to_fix_lines({"failures": EMPTY_FAILURES}), [])
+
+    def test_next_step_lines_cover_every_status(self) -> None:
+        state = {
+            "status": "pass",
+            "rerun_command": "again",
+            "full_rerun_command": "full",
+        }
+        self.assertEqual(
+            quality_report.next_step_lines(state, SimpleNamespace(mode="partial")),
+            [
+                "Selected checks are green. This does not certify: run the full ship report:",
+                "  full",
+            ],
+        )
+        self.assertEqual(
+            quality_report.next_step_lines(state, SimpleNamespace(mode="full")),
+            [
+                "Ship report is green: every executed check passed.",
+                quality_report.HAND_OFF_LINE,
+            ],
+        )
+        self.assertEqual(
+            quality_report.next_step_lines(
+                {**state, "status": "ready_for_full"}, SimpleNamespace(mode="fast")
+            ),
+            ["Fast checks are green. Run the full ship report now:", "  full"],
+        )
+        self.assertEqual(
+            quality_report.next_step_lines(
+                {**state, "status": "fail"}, SimpleNamespace(mode="full")
+            ),
+            ["Fix the items above, then rerun:", "  again"],
+        )
+
+    def test_print_report_lists_fixes_and_counts_them(self) -> None:
+        fake = SimpleNamespace(
+            gate_outcome=lambda item: "FAIL", gate_status=lambda item: "fail"
+        )
+        analysis = SimpleNamespace(
+            gates=[
+                SimpleNamespace(
+                    title="Types", summary="1 error", details=["a.py:1 bad"]
+                )
+            ],
+            mode="partial",
+            selection=("types",),
+            scope=SimpleNamespace(description="local changes"),
+            thresholds={},
+            functions=[],
+        )
+        state = {
+            "status": "fail",
+            "fix_prompt": "PROMPT",
+            "rerun_command": "again",
+            "full_rerun_command": "full",
+            "failures": {
+                **EMPTY_FAILURES,
+                "checks": [{"key": "types", "title": "Types", "summary": "1 error"}],
+            },
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            quality_report.print_report(
+                fake, analysis, state, Path("s"), Path("h"), True, None
+            )
+        text = output.getvalue()
+        self.assertIn("mode: partial (--types)", text)
+        self.assertIn("    a.py:1 bad", text)
+        self.assertIn("To fix:\n  1. Types: 1 error", text)
+        self.assertIn("Fix the items above, then rerun:\n  again", text)
+        self.assertIn(
+            "QUALITY_LOOP=FAIL\nITEMS_TO_FIX=1\nSTATE=s\nHTML=h\n\nPROMPT", text
+        )
+        quiet = io.StringIO()
+        with contextlib.redirect_stdout(quiet):
+            quality_report.print_report(
+                fake,
+                analysis,
+                {**state, "fix_prompt": None},
+                Path("s"),
+                Path("h"),
+                True,
+                None,
+            )
+        self.assertNotIn("PROMPT", quiet.getvalue())
+
+
+SMOKE_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "smoke_check.py"
+smoke_check = load_script("smoke_check_test_module", SMOKE_SCRIPT)
+
+
+def stub_command(text: str) -> list[list[str]]:
+    return [[sys.executable, "-c", f"print({text!r})"]]
+
+
+class SmokeGateTests(unittest.TestCase):
+    def config(self, **smoke: Any) -> dict[str, Any]:
+        return gate.deep_merge(gate.default_config(), {"smoke": smoke})
+
+    def test_unconfigured_smoke_fails_the_ship_report_with_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = gate.smoke_gate_for_run(
+                Path(temporary), self.config(), False, gate.gate_selection([])
+            )
+            self.assertFalse(result.passed)
+            self.assertTrue(result.applicable)
+            self.assertIn("runs (smoke)", result.summary)
+            self.assertIn("smoke_check.py", result.details[0])
+            self.assertIn("does not prove the application runs", result.details[0])
+
+    def test_configured_smoke_passes_and_fails_with_its_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            passing = gate.smoke_gate_for_run(
+                root,
+                self.config(commands=stub_command("app answers")),
+                False,
+                gate.gate_selection([]),
+            )
+            self.assertTrue(passing.passed)
+            self.assertEqual(
+                passing.summary,
+                "All 1 runs (smoke) commands passed with zero violations.",
+            )
+            failing = gate.smoke_gate_for_run(
+                root,
+                self.config(commands=[[sys.executable, "-c", "raise SystemExit(3)"]]),
+                False,
+                gate.gate_selection(["smoke"]),
+            )
+            self.assertFalse(failing.passed)
+            self.assertIn("1 of 1 runs (smoke) commands failed", failing.summary)
+
+    def test_smoke_is_deferred_in_fast_mode_forced_by_flag_and_never_disabled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self.config(commands=stub_command("app answers"))
+            deferred = gate.smoke_gate_for_run(
+                root, config, True, gate.gate_selection([])
+            )
+            self.assertTrue(deferred.deferred)
+            self.assertIn("run --smoke to do it now", deferred.summary)
+            forced = gate.smoke_gate_for_run(
+                root, config, True, gate.gate_selection(["smoke"])
+            )
+            self.assertTrue(forced.passed)
+            self.assertFalse(forced.deferred)
+            skipped = gate.smoke_gate_for_run(
+                root, config, False, gate.gate_selection(["lint"])
+            )
+            self.assertTrue(skipped.skipped)
+            disabled = gate.smoke_gate_for_run(
+                root, self.config(enabled=False), False, gate.gate_selection([])
+            )
+            self.assertFalse(disabled.passed)
+            self.assertIn("cannot be skipped", disabled.summary)
+        self.assertEqual(gate.SELECTABLE_CHECKS["smoke"], "smoke")
+        self.assertIn("smoke", [name for name, _ in quality_loop.CHECK_FLAGS])
+
+    def test_fix_prompt_lists_the_smoke_and_scope_conditions(self) -> None:
+        report = gate.AnalysisReport(
+            root="r",
+            generated_at="now",
+            languages=["Python"],
+            gates=[],
+            functions=[],
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+        )
+        prompt = gate.master_fix_prompt(report)
+        self.assertIn("10. The smoke check starts the application", prompt)
+        self.assertIn("11. No production file is hidden from the gate", prompt)
+
+
+class ScopeGateTests(unittest.TestCase):
+    def repository(self, root: Path) -> None:
+        (root / "src" / "server").mkdir(parents=True)
+        (root / "src" / "server" / "index.ts").write_text("export {};\n")
+        (root / "src" / "app.ts").write_text("export const a = 1;\n")
+        (root / ".eslintrc.cjs").write_text("module.exports = {};\n")
+        (root / "vite.config.ts").write_text("export default {};\n")
+        (root / "types.d.ts").write_text("declare const x: number;\n")
+
+    def test_default_exclusions_pass_and_extra_production_exclusions_fail(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.repository(root)
+            source = gate.default_config()["source"]
+            self.assertEqual(gate.excluded_production_files(root, source), [])
+            self.assertTrue(gate.run_scope_gate(root, source).passed)
+            hidden = {
+                **source,
+                "exclude": [*source["exclude"], "src/server/index.ts", ".eslintrc.cjs"],
+            }
+            self.assertEqual(
+                gate.excluded_production_files(root, hidden),
+                [("src/server/index.ts", "src/server/index.ts")],
+            )
+            result = gate.run_scope_gate(root, hidden)
+            self.assertFalse(result.passed)
+            self.assertEqual(
+                result.summary,
+                "1 production files are hidden from the gate by source.exclude.",
+            )
+            self.assertEqual(
+                result.details,
+                [
+                    "src/server/index.ts — hidden by source.exclude pattern 'src/server/index.ts'"
+                ],
+            )
+            self.assertEqual(result.prompts[0][0], "Restore gate scope")
+
+    def test_tooling_files_may_be_excluded_and_partial_runs_skip_the_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.repository(root)
+            config = gate.deep_merge(
+                gate.default_config(),
+                {"source": {"exclude": ["*.config.*", ".*rc.*", "*.d.ts"]}},
+            )
+            self.assertTrue(
+                gate.scope_gate_for_run(root, config, gate.gate_selection([])).passed
+            )
+            self.assertTrue(
+                gate.scope_gate_for_run(
+                    root, config, gate.gate_selection(["coverage"])
+                ).skipped
+            )
+        self.assertIsNone(gate.first_match("src/app.ts", ["docs/**"]))
+        self.assertEqual(
+            gate.first_match("src/app.ts", ["docs/**", "src/**"]), "src/**"
+        )
+
+
+class SmokeTemplateTests(unittest.TestCase):
+    def test_npm_start_becomes_a_browser_smoke_when_a_page_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"name": "app", "scripts": {"start": "node server.js"}})
+            )
+            api_only = gate.npm_start_smoke(root)
+            assert api_only is not None
+            self.assertEqual(api_only[0], "python3")
+            self.assertTrue(api_only[1].endswith("smoke_check.py"))
+            self.assertEqual(api_only[2:], ["--start", "npm start"])
+            (root / "client").mkdir()
+            (root / "client" / "index.html").write_text("<html></html>")
+            web = gate.npm_start_smoke(root)
+            assert web is not None
+            self.assertEqual(web[-1], "--browser")
+            self.assertEqual(gate.inferred_smoke_commands(root), [web])
+            template = gate.smoke_template(root)
+            self.assertEqual(template["commands"], [web])
+            self.assertIn("Generated", template["_note"])
+            self.assertIn("npm start", gate.smoke_init_message(template["commands"]))
+
+    def test_python_package_import_and_nothing_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIsNone(gate.npm_start_smoke(root))
+            self.assertIsNone(gate.python_package_name(root))
+            self.assertIsNone(gate.python_import_smoke(root))
+            self.assertEqual(gate.inferred_smoke_commands(root), [])
+            template = gate.smoke_template(root)
+            self.assertEqual(template["commands"], [])
+            self.assertIn("Not detected", template["_note"])
+            self.assertIn("no start command detected", gate.smoke_init_message([]))
+            (root / "tests").mkdir()
+            (root / "tests" / "__init__.py").write_text("")
+            (root / "src" / "mypkg").mkdir(parents=True)
+            (root / "src" / "mypkg" / "__init__.py").write_text("")
+            self.assertEqual(gate.python_package_name(root), "mypkg")
+            command = gate.python_import_smoke(root)
+            assert command is not None
+            self.assertEqual(command[1:], ["-c", "import mypkg"])
+            (root / "src" / "mypkg" / "__init__.py").unlink()
+            (root / "src" / "mypkg").rmdir()
+            self.assertIsNone(gate.python_package_name(root))
+            (root / "toolpkg").mkdir()
+            (root / "toolpkg" / "__init__.py").write_text("")
+            self.assertEqual(gate.python_package_name(root), "toolpkg")
+
+    def test_init_writes_the_smoke_section_and_announces_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "package.json").write_text(
+                json.dumps({"name": "app", "scripts": {"start": "node s.js"}})
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(gate.main(["--root", str(root), "--init"]), 0)
+            written = json.loads(
+                (root / ".quality" / "quality-gate.json").read_text("utf-8")
+            )
+            self.assertEqual(
+                written["smoke"]["commands"][0][2:], ["--start", "npm start"]
+            )
+            self.assertIn("Runs (smoke): the ship report starts", output.getvalue())
+
+
+class LoopReportWordingTests(unittest.TestCase):
+    def test_not_applicable_rows_say_nothing_is_required(self) -> None:
+        fake = SimpleNamespace(
+            gate_outcome=lambda item: "NOT APPLICABLE",
+            gate_status=lambda item: "not_applicable",
+        )
+        result = SimpleNamespace(
+            title="Dead code", summary="Not applicable: none detected.", details=["x"]
+        )
+        self.assertEqual(
+            quality_report.gate_lines(fake, result),
+            [
+                "[N/A] Dead code: Not applicable: none detected. Nothing to do here; not needed for hand-off."
+            ],
+        )
+
+    def test_scope_failures_are_itemized_and_other_checks_summarized(self) -> None:
+        checks = [
+            {"key": "quality", "title": "Q", "summary": "s", "details": []},
+            {
+                "key": "scope",
+                "title": "Gate scope",
+                "summary": "1 hidden",
+                "details": ["a.ts — hidden"],
+            },
+            {
+                "key": "smoke",
+                "title": "Runs (smoke)",
+                "summary": "failed",
+                "details": ["out"],
+            },
+        ]
+        self.assertEqual(
+            quality_report.check_failure_items(checks, {"quality"}),
+            ["a.ts — hidden", "Runs (smoke): failed"],
+        )
+        self.assertEqual(
+            quality_report.check_failure_items(checks[:1]),
+            ["Q: s"],
+        )
+        failures = {**EMPTY_FAILURES, "checks": checks[:1]}
+        self.assertEqual(quality_report.itemized_gates(failures), set())
+        self.assertEqual(quality_report.to_fix_items({"failures": failures}), ["Q: s"])
+        with_functions = {
+            **failures,
+            "functions": [
+                {
+                    "path": "a.py",
+                    "line": 1,
+                    "name": "f",
+                    "coverage_percent": 50.0,
+                    "complexity": 1,
+                }
+            ],
+        }
+        self.assertEqual(quality_report.itemized_gates(with_functions), {"quality"})
+        self.assertEqual(
+            quality_report.to_fix_items({"failures": with_functions}),
+            ["a.py:1 f — coverage 50%, complexity 1"],
+        )
+
+    def test_green_ship_report_tells_the_agent_to_hand_off(self) -> None:
+        state = {"status": "pass", "rerun_command": "r", "full_rerun_command": "f"}
+        lines = quality_report.next_step_lines(state, SimpleNamespace(mode="full"))
+        self.assertEqual(lines[1], quality_report.HAND_OFF_LINE)
+        self.assertIn("Do not add tools, configs, or checks after green", lines[1])
+
+
+class LocalHttpServer:
+    """A tiny HTTP server for smoke tests: 200 on /, 404 elsewhere, one thread."""
+
+    def __init__(self) -> None:
+        import http.server
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                status = 200 if self.path == "/" else 404
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args: Any) -> None:
+                return None
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> "LocalHttpServer":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def url(self, path: str = "/") -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
+
+
+def smoke_options(**overrides: Any) -> Any:
+    values: dict[str, Any] = {
+        "start": None,
+        "cwd": Path.cwd(),
+        "url": None,
+        "path": "/",
+        "port": None,
+        "port_env": "PORT",
+        "browser": False,
+        "timeout": 3.0,
+        "env": {},
+    }
+    values.update(overrides)
+    return smoke_check.SmokeOptions(**values)
+
+
+class FakeProcess:
+    def __init__(self, timeouts: int = 0, output: str = "out") -> None:
+        self.pid = 4194304
+        self.signals: list[int] = []
+        self.timeouts = timeouts
+        self.output = output
+
+    def send_signal(self, signum: int) -> None:
+        self.signals.append(signum)
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, None]:
+        if self.timeouts:
+            self.timeouts -= 1
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
+        return self.output, None
+
+
+class FakePage:
+    def __init__(self, events: list[tuple[str, Any]]) -> None:
+        self.handlers: dict[str, Any] = {}
+        self.events = events
+        self.visited: list[str] = []
+
+    def on(self, name: str, handler: Any) -> None:
+        self.handlers[name] = handler
+
+    def goto(self, url: str, **kwargs: Any) -> None:
+        self.visited.append(url)
+        for name, payload in self.events:
+            self.handlers[name](payload)
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def query_selector(self, selector: str) -> Any:
+        return object() if selector == "canvas" else None
+
+    def inner_text(self, _selector: str) -> str:
+        return "Whiteboard ready"
+
+
+class FakePlaywright:
+    def __init__(self, page: FakePage) -> None:
+        self.page = page
+        self.closed = False
+        self.chromium = self
+
+    def __call__(self) -> "FakePlaywright":
+        return self
+
+    def __enter__(self) -> "FakePlaywright":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def launch(self) -> "FakePlaywright":
+        return self
+
+    def new_page(self) -> FakePage:
+        return self.page
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class SmokeCheckTests(unittest.TestCase):
+    def test_status_helpers_and_free_port(self) -> None:
+        self.assertTrue(smoke_check.status_ok(200))
+        self.assertTrue(smoke_check.status_ok(399))
+        self.assertFalse(smoke_check.status_ok(400))
+        self.assertFalse(smoke_check.status_ok(199))
+        self.assertFalse(smoke_check.status_ok(500))
+        port = smoke_check.free_port()
+        self.assertTrue(1024 <= port <= 65535)
+
+    def test_http_status_answers_missing_and_invalid_urls(self) -> None:
+        with LocalHttpServer() as server:
+            self.assertEqual(smoke_check.http_status(server.url(), 2), 200)
+            self.assertEqual(smoke_check.http_status(server.url("/nope"), 2), 404)
+        self.assertIsNone(smoke_check.http_status(server.url(), 1))
+        self.assertIsNone(smoke_check.http_status("not a url", 1))
+
+    def test_wait_for_http_polls_until_an_answer_or_the_deadline(self) -> None:
+        answers = iter([None, None, 200])
+        slept: list[float] = []
+        with mock.patch.object(
+            smoke_check, "http_status", lambda url, t: next(answers)
+        ):
+            status = smoke_check.wait_for_http(
+                "u", 5, clock=iter([0.0, 0.1, 0.2]).__next__, sleep=slept.append
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(slept, [smoke_check.POLL_SECONDS, smoke_check.POLL_SECONDS])
+        with mock.patch.object(smoke_check, "http_status", lambda url, t: None):
+            self.assertIsNone(
+                smoke_check.wait_for_http(
+                    "u", 1, clock=iter([0.0, 0.5, 1.0]).__next__, sleep=lambda _s: None
+                )
+            )
+
+    def test_page_expectations(self) -> None:
+        none = smoke_check.PageExpectations(None, None, None)
+        self.assertEqual(smoke_check.page_expectation_errors(none, False, "Error"), [])
+        expectations = smoke_check.PageExpectations("canvas", "Whiteboard")
+        self.assertEqual(
+            smoke_check.page_expectation_errors(expectations, True, "Whiteboard ready"),
+            [],
+        )
+        self.assertEqual(
+            smoke_check.page_expectation_errors(
+                expectations, False, "Could not load the board: Failed to fetch"
+            ),
+            [
+                "expected selector not found: canvas",
+                "expected text not found: 'Whiteboard'",
+                "page text looks like a failure: 'Could not load the board: Failed to fetch'",
+            ],
+        )
+        self.assertEqual(
+            smoke_check.snippet("a" * 100 + "ERROR" + "b" * 100, 100),
+            "a" * 40 + "ERROR" + "b" * 75,
+        )
+        self.assertEqual(smoke_check.snippet("x  y\n z", 0), "x y z")
+
+    def test_judge_covers_every_verdict(self) -> None:
+        options = smoke_options()
+        missing = smoke_check.judge("u", None, options)
+        self.assertFalse(missing.passed)
+        self.assertEqual(missing.reason, "no HTTP answer within 3s")
+        self.assertEqual(smoke_check.judge("u", 500, options).reason, "HTTP 500")
+        self.assertTrue(smoke_check.judge("u", 200, options).passed)
+        with mock.patch.object(smoke_check, "browser_errors", lambda *a: []):
+            clean = smoke_check.judge("u", 200, smoke_options(browser=True))
+        self.assertTrue(clean.passed)
+        with mock.patch.object(
+            smoke_check, "browser_errors", lambda *a: ["console: boom"]
+        ):
+            broken = smoke_check.judge("u", 200, smoke_options(browser=True))
+        self.assertFalse(broken.passed)
+        self.assertEqual(broken.reason, "page loaded with errors")
+        self.assertEqual(
+            broken.lines(),
+            [
+                "SMOKE=FAIL url=u http=200",
+                "reason: page loaded with errors",
+                "  console: boom",
+            ],
+        )
+        self.assertEqual(clean.lines(), ["SMOKE=PASS url=u http=200"])
+
+    def test_browser_backends_are_tried_in_order(self) -> None:
+        cwd = Path.cwd()
+        expectations = smoke_check.PageExpectations()
+        with mock.patch.object(
+            smoke_check, "python_playwright_errors", lambda u, t, e: ["a"]
+        ):
+            self.assertEqual(
+                smoke_check.browser_errors("u", cwd, 1, expectations), ["a"]
+            )
+        with (
+            mock.patch.object(
+                smoke_check, "python_playwright_errors", lambda u, t, e: None
+            ),
+            mock.patch.object(
+                smoke_check, "node_playwright_errors", lambda u, c, t, e: ["b"]
+            ),
+        ):
+            self.assertEqual(
+                smoke_check.browser_errors("u", cwd, 1, expectations), ["b"]
+            )
+        with (
+            mock.patch.object(
+                smoke_check, "python_playwright_errors", lambda u, t, e: None
+            ),
+            mock.patch.object(
+                smoke_check, "node_playwright_errors", lambda u, c, t, e: None
+            ),
+        ):
+            self.assertEqual(
+                smoke_check.browser_errors("u", cwd, 1, expectations),
+                [smoke_check.BROWSER_MISSING],
+            )
+
+    def test_python_playwright_collects_page_and_console_errors(self) -> None:
+        def missing(name: str) -> Any:
+            raise ImportError(name)
+
+        expectations = smoke_check.PageExpectations("canvas", "Whiteboard")
+        with mock.patch.object(smoke_check.importlib, "import_module", missing):
+            self.assertIsNone(
+                smoke_check.python_playwright_errors("u", 1, expectations)
+            )
+        page = FakePage(
+            [
+                ("pageerror", "TypeError: boom"),
+                ("console", SimpleNamespace(type="error", text="bad")),
+                ("console", SimpleNamespace(type="log", text="fine")),
+            ]
+        )
+        playwright = FakePlaywright(page)
+        module = SimpleNamespace(sync_playwright=playwright)
+        with mock.patch.object(
+            smoke_check.importlib, "import_module", lambda name: module
+        ):
+            errors = smoke_check.python_playwright_errors("http://x/", 2, expectations)
+        self.assertEqual(errors, ["pageerror: TypeError: boom", "console: bad"])
+        self.assertEqual(page.visited, ["http://x/"])
+        self.assertTrue(playwright.closed)
+        with mock.patch.object(
+            smoke_check.importlib, "import_module", lambda name: module
+        ):
+            errors = smoke_check.python_playwright_errors(
+                "http://x/", 2, smoke_check.PageExpectations("#app")
+            )
+        self.assertEqual(errors[-1], "expected selector not found: #app")
+        with mock.patch.object(
+            smoke_check.importlib, "import_module", lambda name: module
+        ):
+            plain = smoke_check.python_playwright_errors(
+                "http://x/", 2, smoke_check.PageExpectations()
+            )
+        self.assertEqual(plain, ["pageerror: TypeError: boom", "console: bad"])
+
+    def test_node_playwright_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = Path(temporary)
+            expectations = smoke_check.PageExpectations("canvas")
+            self.assertIsNone(smoke_check.find_node_playwright(cwd))
+            self.assertIsNone(
+                smoke_check.node_playwright_errors("u", cwd, 1, expectations)
+            )
+            module_dir = cwd / "node_modules" / "playwright-core"
+            module_dir.mkdir(parents=True)
+            self.assertEqual(smoke_check.find_node_playwright(cwd), module_dir)
+            calls: list[dict[str, Any]] = []
+
+            def fake_run(command: list[str], **kwargs: Any) -> Any:
+                calls.append({"command": command, **kwargs})
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout='{"errors": ["console: x"], "found": false, "body": "ok"}',
+                    stderr="",
+                )
+
+            with mock.patch.object(smoke_check.subprocess, "run", fake_run):
+                self.assertEqual(
+                    smoke_check.node_playwright_errors(
+                        "http://x/", cwd, 2, expectations
+                    ),
+                    ["console: x", "expected selector not found: canvas"],
+                )
+            self.assertEqual(
+                calls[0]["command"][3:],
+                [str(module_dir), "http://x/", "2000", "canvas"],
+            )
+            self.assertEqual(calls[0]["timeout"], 32)
+
+            def failing_run(command: list[str], **kwargs: Any) -> Any:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="", stderr="crash\n"
+                )
+
+            with mock.patch.object(smoke_check.subprocess, "run", failing_run):
+                self.assertEqual(
+                    smoke_check.node_playwright_errors("u", cwd, 1, expectations),
+                    ["browser runner failed: crash"],
+                )
+
+            def empty_run(command: list[str], **kwargs: Any) -> Any:
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.object(smoke_check.subprocess, "run", empty_run):
+                self.assertEqual(
+                    smoke_check.node_playwright_errors(
+                        "u", cwd, 1, smoke_check.PageExpectations()
+                    ),
+                    [],
+                )
+
+    def test_process_lifecycle_and_signal_fallbacks(self) -> None:
+        process = smoke_check.start_process(
+            f"{shlex.quote(sys.executable)} -c \"print('hello')\"",
+            Path.cwd(),
+            dict(os.environ),
+        )
+        process.wait(timeout=20)
+        self.assertEqual(smoke_check.stop_process(process, 5).strip(), "hello")
+        fake = FakeProcess()
+        self.assertEqual(smoke_check.stop_process(fake), "out")
+        self.assertEqual(fake.signals, [smoke_check.signal.SIGTERM])
+        stubborn = FakeProcess(timeouts=1, output="late")
+        self.assertEqual(smoke_check.stop_process(stubborn, 0.01), "late")
+        self.assertEqual(
+            stubborn.signals,
+            [smoke_check.signal.SIGTERM, smoke_check.signal.SIGKILL],
+        )
+        self.assertEqual(smoke_check.stop_process(FakeProcess(output="")), "")
+
+        class Vanished(FakeProcess):
+            def send_signal(self, signum: int) -> None:
+                raise ProcessLookupError
+
+        smoke_check.signal_group(Vanished(), smoke_check.signal.SIGTERM)
+
+    def test_check_starts_the_application_and_always_stops_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = Path(temporary)
+            (cwd / "index.html").write_text("<html></html>")
+            start = (
+                f"{shlex.quote(sys.executable)} -m http.server --bind 127.0.0.1 $PORT"
+            )
+            outcome = smoke_check.check(smoke_options(start=start, cwd=cwd, timeout=20))
+            self.assertTrue(outcome.passed, outcome.lines())
+            self.assertEqual(outcome.status, 200)
+            self.assertTrue(outcome.url.startswith("http://127.0.0.1:"))
+            self.assertIsNone(smoke_check.http_status(outcome.url, 1))
+            dead = smoke_check.check(
+                smoke_options(
+                    start=f"{shlex.quote(sys.executable)} -c \"print('boom')\"",
+                    cwd=cwd,
+                    timeout=0.5,
+                    port=smoke_check.free_port(),
+                )
+            )
+            self.assertFalse(dead.passed)
+            self.assertIn("no HTTP answer", dead.reason)
+            self.assertIn("process output (tail): boom", dead.errors[0])
+        with LocalHttpServer() as server:
+            running = smoke_check.check(smoke_options(url=server.url()))
+            self.assertTrue(running.passed)
+            self.assertEqual(running.url, server.url())
+
+    def test_environment_and_url_helpers(self) -> None:
+        options = smoke_options(
+            env={"MODE": "test"}, port_env="APP_PORT", path="/health"
+        )
+        env = smoke_check.build_env(options, 4321)
+        self.assertEqual(env["APP_PORT"], "4321")
+        self.assertEqual(env["MODE"], "test")
+        self.assertNotIn("APP_PORT", smoke_check.build_env(options, None))
+        self.assertEqual(
+            smoke_check.target_url(options, 4321), "http://127.0.0.1:4321/health"
+        )
+        self.assertEqual(
+            smoke_check.target_url(smoke_options(url="http://h/"), None), "http://h/"
+        )
+        self.assertEqual(
+            smoke_check.parse_env(["A=1", "B=x=y"]), {"A": "1", "B": "x=y"}
+        )
+        with self.assertRaises(ValueError):
+            smoke_check.parse_env(["novalue"])
+        with self.assertRaises(ValueError):
+            smoke_check.parse_env(["=1"])
+
+    def test_cli_exit_codes(self) -> None:
+        with self.assertRaises(ValueError):
+            smoke_check.options_from_args(smoke_check.parse_args([]))
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(smoke_check.main([]), 2)
+        self.assertIn("--start", error.getvalue())
+        with LocalHttpServer() as server:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    smoke_check.main(["--url", server.url(), "--env", "K=V"]), 0
+                )
+            self.assertIn("SMOKE=PASS", output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                smoke_check.main(["--url", "http://127.0.0.1:1/", "--timeout", "0.2"]),
+                1,
+            )
+        self.assertIn("SMOKE=FAIL", output.getvalue())
+        options = smoke_check.options_from_args(
+            smoke_check.parse_args(
+                [
+                    "--start",
+                    "x",
+                    "--port",
+                    "5",
+                    "--browser",
+                    "--expect-selector",
+                    "canvas",
+                    "--expect-text",
+                    "Board",
+                    "--fail-on-text",
+                    "",
+                ]
+            )
+        )
+        self.assertEqual((options.port, options.browser, options.start), (5, True, "x"))
+        self.assertEqual(
+            options.expectations, smoke_check.PageExpectations("canvas", "Board", None)
+        )
+        self.assertEqual(
+            smoke_check.options_from_args(
+                smoke_check.parse_args(["--url", "u"])
+            ).expectations,
+            smoke_check.PageExpectations(None, None, smoke_check.DEFAULT_FAIL_PATTERN),
+        )

@@ -27,15 +27,32 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
+from quality_report import previous_measurement, print_report  # noqa: E402
+
 from repo_quality_gate import analysis_state, write_json_atomic  # noqa: E402
 from repo_quality_gate import command_state as command_state  # noqa: E402
 from repo_quality_gate import gate_status as gate_status  # noqa: E402
 from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
 from repo_quality_gate import state_status as state_status  # noqa: E402
 
-VERSION = "3.2.0"
+VERSION = "3.4.0"
 QUALITY_DIRECTORY = ".quality"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
+CHECK_FLAGS: tuple[tuple[str, str], ...] = (
+    ("lint", "formatter and linter"),
+    ("types", "static type checker"),
+    ("contracts", "contract/schema validation"),
+    ("tests", "the test suite only"),
+    ("coverage", "tests plus per-function coverage"),
+    ("complexity", "static complexity per function, no tests"),
+    ("craap", "tests, coverage and complexity (CRAAP per function)"),
+    ("loc", "file size"),
+    ("dead-code", "unused code"),
+    ("deps", "module boundaries"),
+    ("smoke", "start the application once and load it (the ship report requires it)"),
+    ("flaky", "repeated test runs (off unless requested)"),
+    ("mutation", "mutation testing (off unless requested)"),
+)
 
 
 class ConcurrentRunError(RuntimeError):
@@ -203,6 +220,7 @@ def append_rerun_execution(
     no_install: bool,
     fast: bool,
     mutation_workers: str | None,
+    selection: Sequence[str] = (),
 ) -> None:
     command.extend(scope_arguments)
     if no_install:
@@ -211,6 +229,7 @@ def append_rerun_execution(
         command.extend(["--mutation-workers", mutation_workers])
     if fast:
         command.append("--fast")
+    command.extend(f"--{name}" for name in selection)
 
 
 def build_rerun_command(
@@ -229,6 +248,7 @@ def build_rerun_command(
     no_install: bool,
     fast: bool,
     mutation_workers: str | None,
+    selection: Sequence[str] = (),
 ) -> str:
     command = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
     append_rerun_configuration(
@@ -245,7 +265,9 @@ def build_rerun_command(
         gate_script,
         explicit_gate_script,
     )
-    append_rerun_execution(command, scope_arguments, no_install, fast, mutation_workers)
+    append_rerun_execution(
+        command, scope_arguments, no_install, fast, mutation_workers, selection
+    )
     return shlex.join(command)
 
 
@@ -343,8 +365,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="print the complete repair prompt after a failing run",
     )
+    checks = parser.add_argument_group(
+        "select checks", "combinable; omit all of them for the full ship report"
+    )
+    for name, description in CHECK_FLAGS:
+        checks.add_argument(f"--{name}", action="store_true", help=f"run {description}")
     parser.add_argument("--version", action="version", version=VERSION)
     return parser.parse_args(argv)
+
+
+def selection_names(args: argparse.Namespace) -> tuple[str, ...]:
+    return tuple(
+        name for name, _ in CHECK_FLAGS if getattr(args, name.replace("-", "_"), False)
+    )
 
 
 def resolve_artifacts(args: argparse.Namespace, root: Path) -> tuple[Path, Path, Path]:
@@ -421,30 +454,21 @@ def execute_analysis(
             cli_mutation_workers=args.mutation_workers,
             scope=scope,
             thresholds=thresholds,
+            selection=gate.gate_selection(selection_names(args)),
         )
         analysis.rerun_command = command
-        return analysis, 0 if analysis.passed else 1, None
+        return analysis, 0 if run_passed(analysis) else 1, None
     except (OSError, ValueError, KeyError, TypeError) as error:
         message = str(error)
         analysis = error_report(gate, root, message, command, args.fast, scope)
         return analysis, 2, message
 
 
-def print_run_summary(
-    gate: ModuleType,
-    analysis: Any,
-    state: dict[str, Any],
-    state_path: Path,
-    html_path: Path,
-    print_prompt: bool,
-) -> None:
-    for result in analysis.gates:
-        print(f"[{gate.gate_outcome(result)}] {result.title}: {result.summary}")
-    print(f"QUALITY_LOOP={state['status'].upper()}")
-    print(f"STATE={state_path}")
-    print(f"HTML={html_path}")
-    if print_prompt and state["fix_prompt"]:
-        print("\n" + state["fix_prompt"])
+def run_passed(analysis: Any) -> bool:
+    """Exit 0 for a green full run, or a partial run whose selected checks are green."""
+    if analysis.passed:
+        return True
+    return bool(analysis.mode == "partial" and analysis.selected_passed)
 
 
 def run_locked(args: argparse.Namespace, root: Path) -> int:
@@ -486,6 +510,7 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
         args.no_install,
         args.fast,
         args.mutation_workers,
+        selection_names(args),
     )
     analysis, exit_code, run_error = execute_analysis(
         args,
@@ -498,16 +523,18 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
     )
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    previous = previous_measurement(state_path)
     html_path.write_text(gate.html_report(analysis), encoding="utf-8")
     state = analysis_state(gate, analysis, html_path, state_path, exit_code, run_error)
     write_json_atomic(state_path, state)
-    print_run_summary(
+    print_report(
         gate,
         analysis,
         state,
         state_path,
         html_path,
         args.print_prompt,
+        previous,
     )
     return exit_code
 

@@ -13,25 +13,53 @@ and record why — practicality beats purity.
 
 ## Repository quality loop
 
-When `.quality/quality-gate.json` exists, run the bundled loop for every coding task:
+Discipline means the work is not finished until three things are true: every
+deliverable the user asked for exists, the application has been started and
+loaded once, and the ship report is green. The bundled loop prints that
+report. Read [references/quality-loop.md](references/quality-loop.md)
+completely before running it.
 
-- During implementation: `--local-changes --fast`.
-- Before handoff: `--local-changes` without `--fast`; repair and rerun until it
-  exits `0`.
-- For a requested commit: use `--commit [REF]`.
-- Use whole-repository scope only for requested hardening, audit, or release
-  certification.
+1. **Deliverables first.** Before writing code, list what the task must
+   deliver (README, the command that starts the application — which you will
+   run, tests for what changes, decisions to record). "Finished" means that
+   list is done *and* the ship report is green.
+2. **Pick the check you need.** When `.quality/quality-gate.json` exists, run
+   `--local-changes --fast` for a first look, then one targeted check while
+   iterating: `--coverage`, `--craap`, `--lint`, `--types`, `--tests`,
+   `--complexity`, `--dead-code`, `--deps`, `--loc`, `--smoke` (they combine).
+   Read the report; fix what it lists; rerun until that check is green. Every
+   report shows what is covered today — use it to choose the next test.
+3. **Foreground only.** Run the loop in the same command whose exit code you
+   read. Never run it in the background, never wait for a notification, never
+   end a session while a run is in flight.
+4. **The application must run.** The ship report includes **Runs (smoke)**:
+   `smoke.commands` starts the application and loads it once — a web UI in a
+   headless browser with `--expect-selector` for an element only a working
+   page shows. A test suite that mocks the network proves nothing about this.
+   The report is red until that command is configured and green.
+5. **Not finished until the ship report is green.** Before handoff run
+   `--local-changes` with no check flags: that is the ship report. Fix every
+   red line, rerun, repeat. Red means not finished. Never lower a threshold,
+   disable a check, or hide a finding to get green. Never add a production
+   file to `source.exclude` (the **Gate scope** row catches it): an entry
+   point gets a startup or smoke test instead.
+6. **Mutation and flaky testing only when asked.** They are off in new
+   configurations and show as OFF in the report. Run `--mutation` or `--flaky`
+   when the user asks for them. `[N/A]` rows are optional checks that are not
+   configured; they are not to-do items.
+7. **Green means hand off now.** The message after `QUALITY_LOOP=PASS` is the
+   hand-off: the deliverables, ticked, and the report's status line. Do not
+   add tools, configs, or checks after green.
 
-Audit or certification alone is read-only; repair failures only when asked.
-
-Before running the loop, read
-[references/quality-loop.md](references/quality-loop.md) completely. If the
-gate is not configured, run the repository's existing focused checks; set it up
-only when asked, following
-[references/repository-setup.md](references/repository-setup.md).
-
-Never weaken thresholds or checks merely to pass. Do not commit or push unless
-the user asked.
+When the task creates a new project, bootstrap the gate as soon as the first
+test runs (`python3 <skill-directory>/scripts/repo_quality_gate.py --root .
+--init` produces a gate that runs on the first try; then follow
+[references/repository-setup.md](references/repository-setup.md)). In an
+existing repository without a gate, run its focused checks and set the gate up
+only when asked. For a requested commit use `--commit [REF]`; use
+whole-repository scope only for requested hardening, audit, or release
+certification, which alone are read-only. Do not commit or push unless the
+user asked.
 
 ## Readability counts.
 
