@@ -48,6 +48,12 @@ quality_report = load_script("quality_report_test_module", REPORT_SCRIPT)
 ITEMS_SCRIPT = REPORT_SCRIPT.with_name("quality_items.py")
 quality_items = load_script("quality_items_test_module", ITEMS_SCRIPT)
 installer = load_script("skill_installer_test_module", INSTALL_SCRIPT)
+
+
+def result_link(target: Path) -> Path:
+    return target.parent.parent.parent / ".claude" / "skills" / "code-discipline"
+
+
 EMPTY_FAILURES: dict[str, list] = {
     "checks": [],
     "functions": [],
@@ -2228,7 +2234,23 @@ const helper = require('./helper.js')
                 installer.validate_claude_link(conflict, managed)
 
             update_args = SimpleNamespace(update_current=True, repo=False, root=".")
-            self.assertTrue(installer.install_destination(update_args)[1])
+            self.assertEqual(
+                installer.install_destination(update_args)[1:], (True, None)
+            )
+            agents_target = root / ".agents" / "skills" / "code-discipline"
+            self.assertEqual(
+                installer.sibling_claude_link(agents_target),
+                root / ".claude" / "skills" / "code-discipline",
+            )
+            self.assertIsNone(installer.sibling_claude_link(root / "skills" / "x"))
+            self.assertIsNone(installer.sibling_claude_link(root / "other" / "x"))
+            with mock.patch.dict(
+                os.environ, {installer.UPDATE_TARGET_ENV: str(agents_target)}
+            ):
+                self.assertEqual(
+                    installer.install_destination(update_args)[2],
+                    root / ".claude" / "skills" / "code-discipline",
+                )
             repo_args = SimpleNamespace(update_current=False, repo=True, root=str(root))
             self.assertEqual(
                 installer.install_destination(repo_args)[0],
@@ -2251,6 +2273,7 @@ const helper = require('./helper.js')
 
     def test_installer_main_reports_success_and_failure(self) -> None:
         result = (Path("target"), False, None, "4", "3")
+        # install_from_args is mocked, so the registry is never touched here.
         payloads = {installer.INSTALLER_FILE: b"fresh"}
         with (
             mock.patch.object(installer, "resolve_reference", return_value="a" * 40),
@@ -2278,11 +2301,16 @@ const helper = require('./helper.js')
         current = installer.current_installer().read_bytes()
         same = {installer.INSTALLER_FILE: current}
         newer = {installer.INSTALLER_FILE: current + b"\n# newer\n"}
-        update = SimpleNamespace(update_current=True)
-        fresh = SimpleNamespace(update_current=False)
+        update = SimpleNamespace(update_current=True, update_all=False)
+        everything = SimpleNamespace(update_current=False, update_all=True)
+        fresh = SimpleNamespace(update_current=False, update_all=False)
+        self.assertEqual(installer.update_flag(update), "--update-current")
+        self.assertEqual(installer.update_flag(everything), "--update-all")
+        self.assertIsNone(installer.update_flag(fresh))
         self.assertFalse(installer.handoff_needed(fresh, newer))
         self.assertFalse(installer.handoff_needed(update, same))
         self.assertTrue(installer.handoff_needed(update, newer))
+        self.assertTrue(installer.handoff_needed(everything, newer))
         with mock.patch.dict(os.environ, {installer.HANDOFF_ENV: "1"}):
             self.assertFalse(installer.handoff_needed(update, newer))
 
@@ -2304,8 +2332,20 @@ const helper = require('./helper.js')
             self.assertEqual(installer.main(["--update-current"]), 7)
         install.assert_not_called()
         handoff.assert_called_once_with(
-            newer[installer.INSTALLER_FILE], installer.update_target(), commit
+            newer[installer.INSTALLER_FILE],
+            "--update-current",
+            installer.update_target(),
+            commit,
         )
+        with (
+            mock.patch.object(installer, "resolve_reference", return_value=commit),
+            mock.patch.object(installer, "download_skill", return_value=newer),
+            mock.patch.object(
+                installer, "run_downloaded_installer", return_value=5
+            ) as handoff,
+        ):
+            self.assertEqual(installer.main(["--update-all"]), 5)
+        self.assertEqual(handoff.call_args.args[1], "--update-all")
 
     def test_installer_runs_the_downloaded_installer_with_the_update_target(
         self,
@@ -2321,7 +2361,7 @@ const helper = require('./helper.js')
                 "sys.exit(3)\n"
             ).encode()
             code = installer.run_downloaded_installer(
-                script, Path(temporary) / "skill", "c" * 40
+                script, "--update-current", Path(temporary) / "skill", "c" * 40
             )
             self.assertEqual(code, 3)
             recorded = json.loads(report.read_text())
@@ -2329,7 +2369,117 @@ const helper = require('./helper.js')
         self.assertEqual(recorded["handoff"], "1")
         self.assertEqual(recorded["target"], str(Path(temporary) / "skill"))
         with self.assertRaises(SyntaxError):
-            installer.run_downloaded_installer(b"def (", Path(temporary), "c" * 40)
+            installer.run_downloaded_installer(
+                b"def (", "--update-all", Path(temporary), "c" * 40
+            )
+
+    def test_installer_registry_records_each_install_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = root / "registry" / "installs.json"
+            with mock.patch.dict(os.environ, {installer.REGISTRY_ENV: str(registry)}):
+                self.assertEqual(installer.registry_path(), registry)
+                self.assertEqual(installer.registered_installs(), [])
+                installer.record_install(root / "one")
+                installer.record_install(root / "two")
+                installer.record_install(root / "one")
+                self.assertEqual(
+                    installer.registered_installs(), [root / "one", root / "two"]
+                )
+                self.assertTrue(registry.read_text(encoding="utf-8").endswith("]\n"))
+                registry.write_text("{", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "unreadable"):
+                    installer.registered_installs()
+                registry.write_text('{"installs": []}', encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "list of paths"):
+                    installer.registered_installs()
+                registry.write_text("[1]", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "list of paths"):
+                    installer.registered_installs()
+            with (
+                mock.patch.dict(os.environ, {installer.REGISTRY_ENV: ""}),
+                mock.patch.object(installer.Path, "home", return_value=root),
+            ):
+                self.assertEqual(
+                    installer.registry_path(),
+                    root / ".agents" / "code-discipline-installs.json",
+                )
+
+    def test_installer_update_all_refreshes_every_registered_install(self) -> None:
+        skill_source = ROOT / "skills" / "code-discipline"
+        payloads = {
+            relative: (skill_source / relative).read_bytes()
+            for relative in installer.SKILL_FILES
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = root / "installs.json"
+            with mock.patch.dict(os.environ, {installer.REGISTRY_ENV: str(registry)}):
+                with self.assertRaisesRegex(RuntimeError, "no installs are registered"):
+                    installer.update_registered_installs(payloads)
+
+                first, _ = installer.repo_target(root / "first")
+                second, _ = installer.repo_target(root / "second")
+                for target in (first, second):
+                    installer.install_skill(target, payloads, update=False)
+                    (target / "SKILL.md").write_text(
+                        "---\nname: code-discipline\n---\nold\n", encoding="utf-8"
+                    )
+                second_link = installer.claude_link_for(second, root / "second")
+                second_link.parent.mkdir(parents=True)
+                second_link.symlink_to(second)
+                gone = root / "gone" / ".agents" / "skills" / "code-discipline"
+                for target in (first, gone, second):
+                    installer.record_install(target)
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    results = installer.update_registered_installs(payloads)
+
+                self.assertEqual([result[0] for result in results], [first, second])
+                self.assertEqual(
+                    [result[2].resolve() for result in results],
+                    [result_link(first).resolve(), second_link.resolve()],
+                )
+                self.assertIn(f"skipped {gone}", stderr.getvalue())
+                for target in (first, second):
+                    self.assertEqual(
+                        (target / "SKILL.md").read_bytes(), payloads["SKILL.md"]
+                    )
+                    self.assertEqual(result_link(target).resolve(), target.resolve())
+                self.assertEqual(installer.registered_installs(), [first, gone, second])
+
+                blocked = result_link(first)
+                blocked.unlink()
+                blocked.write_text("occupied", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "refusing to replace"):
+                    installer.update_install(first, payloads)
+
+                loose = root / "loose"
+                installer.install_skill(loose, payloads, update=False)
+                target_result = installer.update_install(loose, payloads)
+                self.assertEqual(target_result[:3], (loose, True, None))
+                self.assertIn(loose, installer.registered_installs())
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    installer, "resolve_reference", return_value="a" * 40
+                ),
+                mock.patch.object(installer, "download_skill", return_value=payloads),
+                mock.patch.object(
+                    installer,
+                    "update_registered_installs",
+                    return_value=[
+                        (first, True, None, "4", "3"),
+                        (second, True, None, "4", "3"),
+                    ],
+                ),
+                mock.patch.object(installer, "handoff_needed", return_value=False),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(installer.main(["--update-all"]), 0)
+            self.assertEqual(output.getvalue().count("Updated code-discipline"), 2)
 
     def test_quality_loop_platform_lock_and_owner_paths(self) -> None:
         with tempfile.TemporaryFile(mode="w+") as handle:
@@ -2744,7 +2894,9 @@ const helper = require('./helper.js')
             repo_args = SimpleNamespace(
                 update_current=False, repo=True, root=str(root), ref="main"
             )
+            registry = root / "installs.json"
             with (
+                mock.patch.dict(os.environ, {installer.REGISTRY_ENV: str(registry)}),
                 mock.patch.object(
                     installer,
                     "install_destination",
@@ -2761,11 +2913,13 @@ const helper = require('./helper.js')
             validate.assert_called_once_with(missing_link, target)
             install.assert_called_once_with(target, {}, False)
             ensure.assert_called_once_with(missing_link, target)
+            self.assertEqual(json.loads(registry.read_text()), [str(target)])
 
             update_args = SimpleNamespace(
                 update_current=True, repo=False, root=".", ref="main"
             )
             with (
+                mock.patch.dict(os.environ, {installer.REGISTRY_ENV: str(registry)}),
                 mock.patch.object(
                     installer,
                     "install_destination",

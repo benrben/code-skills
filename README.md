@@ -86,16 +86,16 @@ creates the same two paths under `$HOME`; nothing clones this repository.
 ```bash
 python3 .agents/skills/code-discipline/scripts/install.py --update-current
 python3 "$HOME/.agents/skills/code-discipline/scripts/install.py" --update-current
+python3 .agents/skills/code-discipline/scripts/install.py --update-all
 ```
 
-The first updates the repository copy, the second the global one; add
-`--ref TAG_OR_COMMIT` to pin.
-Updates validate a staged copy before atomically replacing the old one and
-never overwrite repository-owned quality configuration. An update runs the
-downloaded installer when it differs, so old copies follow layout changes; copies
-before 1.4.0 need `scripts/install.py` overwritten from `main` once, then rerun. Every change under
-`skills/` is also published to GHCR as an OCI Agent Skill package:
-`skr install oci://ghcr.io/benrben/code-skills.code-discipline:latest`.
+The first two update this repository copy and the global one (add `--ref
+TAG_OR_COMMIT` to pin); the third refreshes every copy the installer has
+recorded on this computer and restores each `.claude/skills` link. Restart
+the agents afterwards. Updates keep repository-owned quality configuration and
+run the downloaded installer when it differs (copies before 1.4.0 need
+`scripts/install.py` overwritten from `main` once). Every change under `skills/`
+is also published to GHCR as an OCI Agent Skill package: `skr install oci://ghcr.io/benrben/code-skills.code-discipline:latest`.
 
 ## Run the quality gate
 

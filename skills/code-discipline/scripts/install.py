@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -27,6 +27,7 @@ API_BASE = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
 INSTALLER_FILE = "scripts/install.py"
 HANDOFF_ENV = "CODE_DISCIPLINE_INSTALLER_HANDOFF"
 UPDATE_TARGET_ENV = "CODE_DISCIPLINE_UPDATE_TARGET"
+REGISTRY_ENV = "CODE_DISCIPLINE_INSTALL_REGISTRY"
 SKILL_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -355,6 +356,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="update the skill containing this script",
     )
+    destination.add_argument(
+        "--update-all",
+        action="store_true",
+        help="update every install this installer has recorded on this computer",
+    )
     parser.add_argument("--root", default=".", help="repository root for --repo")
     parser.add_argument(
         "--ref",
@@ -377,33 +383,122 @@ def update_target() -> Path:
     return current_installer().parent.parent
 
 
+def update_flag(args: argparse.Namespace) -> str | None:
+    if args.update_all:
+        return "--update-all"
+    if args.update_current:
+        return "--update-current"
+    return None
+
+
 def handoff_needed(args: argparse.Namespace, payloads: Mapping[str, bytes]) -> bool:
     # A stale installer may reject a newer skill layout (for example a bumped
     # thresholds schema), so an update runs the downloaded installer instead.
-    if not args.update_current or os.environ.get(HANDOFF_ENV):
+    if update_flag(args) is None or os.environ.get(HANDOFF_ENV):
         return False
     return payloads[INSTALLER_FILE] != current_installer().read_bytes()
 
 
-def run_downloaded_installer(installer: bytes, target: Path, commit: str) -> int:
+def run_downloaded_installer(
+    installer: bytes, flag: str, target: Path, commit: str
+) -> int:
     compile(installer, INSTALLER_FILE, "exec")
     with tempfile.TemporaryDirectory(prefix="code-discipline-installer-") as directory:
         script = Path(directory) / "install.py"
         script.write_bytes(installer)
         environment = {**os.environ, HANDOFF_ENV: "1", UPDATE_TARGET_ENV: str(target)}
         completed = subprocess.run(
-            [sys.executable, str(script), "--update-current", "--ref", commit],
+            [sys.executable, str(script), flag, "--ref", commit],
             env=environment,
             check=False,
         )
     return completed.returncode
 
 
+def registry_path() -> Path:
+    configured = os.environ.get(REGISTRY_ENV)
+    if configured:
+        return Path(configured)
+    return Path.home() / ".agents" / "code-discipline-installs.json"
+
+
+def registered_installs() -> list[Path]:
+    path = registry_path()
+    if not path.is_file():
+        return []
+    try:
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"install registry is unreadable: {path} ({error})"
+        ) from error
+    return registry_entries(recorded, path)
+
+
+def registry_entries(recorded: object, path: Path) -> list[Path]:
+    if not isinstance(recorded, list) or not all(
+        isinstance(entry, str) for entry in recorded
+    ):
+        raise RuntimeError(f"install registry must be a JSON list of paths: {path}")
+    return [Path(entry) for entry in recorded]
+
+
+def record_install(target: Path) -> None:
+    entries = [str(entry) for entry in registered_installs()]
+    if str(target) in entries:
+        return
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps([*entries, str(target)], indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def sibling_claude_link(target: Path) -> Path | None:
+    # Installs live at <scope>/.agents/skills/code-discipline; Claude Code reads
+    # <scope>/.claude/skills/code-discipline, which links to the same files.
+    if target.parent.name != "skills" or target.parent.parent.name != ".agents":
+        return None
+    return claude_link_for(target, target.parent.parent.parent)
+
+
+def update_registered_installs(
+    payloads: Mapping[str, bytes],
+) -> list[tuple[Path, bool, Path | None, str, str]]:
+    targets = registered_installs()
+    if not targets:
+        raise RuntimeError(
+            f"no installs are registered in {registry_path()}; run "
+            "--update-current once in each repository and for the global copy"
+        )
+    results = []
+    for target in targets:
+        if not managed_skill(target):
+            print(f"skipped {target}: not a code-discipline install", file=sys.stderr)
+            continue
+        results.append(update_install(target, payloads))
+    return results
+
+
+def update_install(
+    target: Path, payloads: Mapping[str, bytes]
+) -> tuple[Path, bool, Path | None, str, str]:
+    link = sibling_claude_link(target)
+    if link:
+        validate_claude_link(link, target)
+    core_version, loop_version = install_skill(target, payloads, update=True)
+    if link:
+        ensure_claude_link(link, target)
+    record_install(target)
+    return target, True, link, core_version, loop_version
+
+
 def install_destination(
     args: argparse.Namespace,
 ) -> tuple[Path, bool, Path | None]:
     if args.update_current:
-        return update_target(), True, None
+        target = update_target()
+        return target, True, sibling_claude_link(target)
     if args.repo:
         target, scope_root = repo_target(Path(args.root))
     else:
@@ -420,6 +515,7 @@ def install_from_args(
     core_version, loop_version = install_skill(target, payloads, update)
     if link:
         ensure_claude_link(link, target)
+    record_install(target)
     return target, update, link, core_version, loop_version
 
 
@@ -445,9 +541,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         payloads = download_skill(commit)
         if handoff_needed(args, payloads):
             return run_downloaded_installer(
-                payloads[INSTALLER_FILE], update_target(), commit
+                payloads[INSTALLER_FILE],
+                str(update_flag(args)),
+                update_target(),
+                commit,
             )
-        result = install_from_args(args, payloads)
+        if args.update_all:
+            results = update_registered_installs(payloads)
+        else:
+            results = [install_from_args(args, payloads)]
     except (
         OSError,
         RuntimeError,
@@ -457,7 +559,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
-    print_install_result(*result)
+    for result in results:
+        print_install_result(*result)
     return 0
 
 
