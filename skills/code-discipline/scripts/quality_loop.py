@@ -9,6 +9,7 @@ prevented a complete measurement.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import errno
 import hashlib
 import importlib.util
@@ -539,6 +540,7 @@ def run_locked(args: argparse.Namespace, root: Path) -> int:
     previous_items = previous_item_keys(state_path)
     html_path.write_text(gate.html_report(analysis), encoding="utf-8")
     state = analysis_state(gate, analysis, html_path, state_path, exit_code, run_error)
+    state["report"] = dataclasses.asdict(analysis)
     write_json_atomic(state_path, state)
     print_report(
         gate,

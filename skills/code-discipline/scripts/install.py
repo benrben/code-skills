@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -38,6 +38,7 @@ SKILL_FILES = (
     "scripts/quality_loop.py",
     "scripts/quality_report.py",
     "scripts/quality_charts.py",
+    "scripts/quality_update.py",
     "scripts/quality_items.py",
     "scripts/repo_quality_gate.py",
     "scripts/smoke_check.py",
@@ -47,6 +48,7 @@ PYTHON_FILES = (
     "scripts/quality_loop.py",
     "scripts/quality_report.py",
     "scripts/quality_charts.py",
+    "scripts/quality_update.py",
     "scripts/quality_items.py",
     "scripts/repo_quality_gate.py",
     "scripts/smoke_check.py",
@@ -533,7 +535,7 @@ def print_install_result(
     print(f"Quality engine {core_version}; quality loop {loop_version}")
     if link:
         print(f"Claude link: {link}")
-    print("Repository quality configuration was not overwritten.")
+    print("Repository thresholds, commands, and dependency rules were preserved.")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -552,6 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = update_registered_installs(payloads)
         else:
             results = [install_from_args(args, payloads)]
+        finish_installations(results, commit)
     except (
         OSError,
         RuntimeError,
@@ -561,9 +564,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    return 0
+
+
+def finish_installations(
+    results: Sequence[tuple[Path, bool, Path | None, str, str]], commit: str
+) -> None:
+    print(f"Source commit: {commit}", flush=True)
     for result in results:
         print_install_result(*result)
-    return 0
+        if result[1]:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(result[0] / "scripts/quality_update.py"),
+                    "--skill",
+                    str(result[0]),
+                    "--ref",
+                    commit,
+                ],
+                check=False,
+            )
+            if completed.returncode:
+                raise RuntimeError(
+                    f"Skill updated, but repository refresh failed at {result[0]}; rerun the update after resolving the error above"
+                )
 
 
 if __name__ == "__main__":

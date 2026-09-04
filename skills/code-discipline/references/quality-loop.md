@@ -26,6 +26,13 @@ To update the complete installed skill:
 python3 <skill-directory>/scripts/install.py --update-current [--ref REF]
 ```
 
+Updates also refresh a repository's `.quality/toolchain.json` code-skills pin
+and its clean checkout when present. Existing HTML is rendered again from saved
+measurements without changing their timestamp or pass/fail results. Reports made
+before render snapshots were supported need one quality-loop run first. An active
+run blocks the repository refresh; retry after it finishes. `--update-all` performs
+this for the repositories containing the registered skill installations.
+
 ## Scope
 
 - `--local-changes` selects staged, unstaged, and untracked production files.

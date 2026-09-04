@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import errno
 import http.server
 import importlib.util
@@ -63,6 +64,361 @@ EMPTY_FAILURES: dict[str, list] = {
     "dependencies": [],
     "tool_setup": [],
 }
+
+
+class QualityUpdateTests(unittest.TestCase):
+    def updater(self):
+        return load_script(
+            "quality_update_tests", CORE_SCRIPT.with_name("quality_update.py")
+        )
+
+    def test_update_refreshes_saved_report_without_changing_measurements(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            report = gate.AnalysisReport(
+                root=str(root),
+                generated_at="original measurement",
+                languages=["Python"],
+                gates=[gate.GateResult("quality", "Quality", False, "still failing")],
+                functions=[],
+                mutations=[],
+                dependency_violations=[],
+                tool_setup=[],
+                notes=[],
+                files=[gate.FileLineMetric("sample.py", 12, 600)],
+            )
+            state = quality_file(root, "quality-gate-state.json")
+            state.write_text(json.dumps({"report": dataclasses.asdict(report)}))
+            original = state.read_bytes()
+            html = quality_file(root, "quality-gate-report.html")
+            html.write_text("old layout")
+            updater.refresh_report(root)
+            rendered = html.read_text()
+            self.assertIn('class="nested-arcs"', rendered)
+            self.assertIn("original measurement", rendered)
+            self.assertIn("still failing", rendered)
+            self.assertEqual(state.read_bytes(), original)
+
+    def toolchain_fixture(self, updater, root):
+        source = root / "upstream"
+        source.mkdir()
+        updater.git(source, "init", "--quiet")
+        updater.git(source, "config", "user.name", "Quality test")
+        updater.git(source, "config", "user.email", "quality@example.test")
+        script = source / updater.SKILL_PATH / "scripts/quality_loop.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("print('old engine')\n")
+        updater.git(source, "add", ".")
+        updater.git(source, "commit", "--quiet", "-m", "old engine")
+        old = updater.git(source, "rev-parse", "HEAD")
+        repo = root / "project"
+        manifest = quality_file(repo, "toolchain.json")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "repository": str(source),
+                    "revision": old,
+                    "skillPath": updater.SKILL_PATH,
+                    "custom": "preserved",
+                }
+            )
+        )
+        cache = manifest.with_suffix("")
+        cache.mkdir()
+        with mock.patch.object(updater, "UPSTREAM", str(source)):
+            updater.stage_toolchain(cache, old)
+        script.write_text("print('new engine')\n")
+        updater.git(source, "commit", "--quiet", "-am", "new engine")
+        return source, repo, manifest, cache, updater.git(source, "rev-parse", "HEAD")
+
+    def test_pinned_toolchain_updates_as_clean_checkout_and_keeps_custom_config(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "project").mkdir()
+            source, repo, manifest, cache, commit = self.toolchain_fixture(
+                updater, root
+            )
+            config = quality_file(repo, "quality-gate.json")
+            config.write_text('{"custom": true}')
+            with mock.patch.object(updater, "UPSTREAM", str(source)):
+                updater.update_toolchain(repo, commit)
+                self.assertEqual(updater.git(cache, "rev-parse", "HEAD"), commit)
+                self.assertEqual(updater.git(cache, "status", "--porcelain"), "")
+                self.assertEqual(json.loads(manifest.read_text())["revision"], commit)
+                self.assertEqual(
+                    json.loads(manifest.read_text())["custom"], "preserved"
+                )
+                self.assertEqual(config.read_text(), '{"custom": true}')
+                with mock.patch.object(updater, "stage_toolchain") as stage:
+                    updater.update_toolchain(repo, commit)
+                    stage.assert_not_called()
+                shutil.rmtree(cache)
+                updater.update_toolchain(repo, commit)
+                self.assertEqual(updater.git(cache, "rev-parse", "HEAD"), commit)
+
+    def test_failed_download_or_dirty_cache_keeps_pin_and_engine(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "project").mkdir()
+            source, repo, manifest, cache, commit = self.toolchain_fixture(
+                updater, root
+            )
+            before = manifest.read_bytes()
+            old = updater.git(cache, "rev-parse", "HEAD")
+            with mock.patch.object(updater, "UPSTREAM", str(source)):
+                with self.assertRaisesRegex(RuntimeError, "Git fetch failed"):
+                    updater.update_toolchain(repo, "f" * 40)
+                self.assertEqual(manifest.read_bytes(), before)
+                self.assertEqual(updater.git(cache, "rev-parse", "HEAD"), old)
+                custom = cache / "local-work.txt"
+                custom.write_text("keep me")
+                with self.assertRaisesRegex(ValueError, "local changes"):
+                    updater.update_toolchain(repo, commit)
+                self.assertEqual(custom.read_text(), "keep me")
+                self.assertEqual(manifest.read_bytes(), before)
+
+    def test_failed_manifest_write_rolls_back_cache_and_preserves_pin(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "project").mkdir()
+            source, repo, manifest, cache, commit = self.toolchain_fixture(
+                updater, root
+            )
+            before = manifest.read_bytes()
+            with mock.patch.object(updater, "UPSTREAM", str(source)):
+                with mock.patch.object(
+                    updater.gate, "write_json_atomic", side_effect=OSError("disk full")
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "disk full"):
+                        updater.update_toolchain(repo, commit)
+                self.assertEqual(manifest.read_bytes(), before)
+                self.assertEqual(
+                    updater.git(cache, "rev-parse", "HEAD"),
+                    json.loads(before)["revision"],
+                )
+                shutil.rmtree(cache)
+                with mock.patch.object(
+                    updater.gate, "write_json_atomic", side_effect=OSError("disk full")
+                ):
+                    with self.assertRaises(RuntimeError):
+                        updater.update_toolchain(repo, commit)
+                self.assertFalse(cache.exists())
+
+    def test_failed_cache_move_preserves_previous_checkout(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "project").mkdir()
+            source, repo, manifest, cache, commit = self.toolchain_fixture(
+                updater, root
+            )
+            old = updater.git(cache, "rev-parse", "HEAD")
+            original_rename = Path.rename
+
+            def fail_install(path, destination):
+                if path.name == "next":
+                    raise OSError("cannot move staged checkout")
+                return original_rename(path, destination)
+
+            with (
+                mock.patch.object(updater, "UPSTREAM", str(source)),
+                mock.patch.object(Path, "rename", fail_install),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cannot move staged"):
+                    updater.update_toolchain(repo, commit)
+            self.assertEqual(updater.git(cache, "rev-parse", "HEAD"), old)
+            self.assertEqual(json.loads(manifest.read_text())["revision"], old)
+
+    def test_update_command_refreshes_html_with_real_installed_helper(self):
+        payloads = {
+            name: (INSTALL_SCRIPT.parent.parent / name).read_bytes()
+            for name in installer.SKILL_FILES
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target, _ = installer.repo_target(root)
+            report = gate.AnalysisReport(
+                root=str(root),
+                generated_at="saved measurement",
+                languages=["Python"],
+                gates=[
+                    gate.GateResult("quality", "Quality", False, "existing failure")
+                ],
+                functions=[],
+                mutations=[],
+                dependency_violations=[],
+                tool_setup=[],
+                notes=[],
+                files=[gate.FileLineMetric("app.py", 20, 600)],
+            )
+            state = quality_file(root, "quality-gate-state.json")
+            state.write_text(json.dumps({"report": dataclasses.asdict(report)}))
+            quality_file(root, "quality-gate-report.html").write_text("old design")
+            with (
+                mock.patch.object(
+                    installer, "resolve_reference", return_value="a" * 40
+                ),
+                mock.patch.object(installer, "download_skill", return_value=payloads),
+                mock.patch.object(installer, "update_target", return_value=target),
+                mock.patch.dict(
+                    os.environ, {installer.REGISTRY_ENV: str(root / "registry.json")}
+                ),
+            ):
+                self.assertEqual(installer.main(["--update-current"]), 0)
+            rendered = (root / ".quality/quality-gate-report.html").read_text()
+            self.assertIn('class="nested-arcs"', rendered)
+            self.assertIn("saved measurement", rendered)
+            self.assertIn("existing failure", rendered)
+
+    def test_manifests_and_checkout_identity_are_validated(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "project").mkdir()
+            source, repo, manifest, cache, commit = self.toolchain_fixture(
+                updater, root
+            )
+            original = manifest.read_text()
+            for bad in [
+                [],
+                {},
+                {"repository": "other", "skillPath": updater.SKILL_PATH},
+                {"repository": updater.UPSTREAM, "skillPath": "other"},
+                {
+                    "repository": updater.UPSTREAM,
+                    "skillPath": updater.SKILL_PATH,
+                    "revision": "main",
+                },
+            ]:
+                manifest.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    updater.read_manifest(manifest)
+            manifest.write_text(original)
+            with self.assertRaisesRegex(ValueError, "origin"):
+                updater.validate_cache(cache, commit)
+            with mock.patch.object(updater, "UPSTREAM", str(source)):
+                with self.assertRaisesRegex(ValueError, "revision"):
+                    updater.validate_cache(cache, commit)
+            link = root / "linked-cache"
+            link.symlink_to(cache, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "isolated"):
+                updater.validate_cache(link, commit)
+            with self.assertRaisesRegex(ValueError, "isolated"):
+                updater.validate_cache(root, commit)
+            with mock.patch.object(updater, "git", return_value=str(root)):
+                with self.assertRaisesRegex(ValueError, "root does not match"):
+                    updater.validate_cache(cache, commit)
+            script = cache / updater.SKILL_PATH / "scripts/quality_loop.py"
+            script.unlink()
+            with self.assertRaisesRegex(ValueError, "entry point"):
+                updater.validate_entrypoint(cache)
+            script.symlink_to(source / updater.SKILL_PATH / "scripts/quality_loop.py")
+            with self.assertRaisesRegex(ValueError, "outside"):
+                updater.validate_entrypoint(cache)
+
+    def test_refresh_handles_legacy_state_and_nested_evidence(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            updater.refresh_report(root)
+            updater.update_toolchain(root, "a" * 40)
+            state = quality_file(root, "quality-gate-state.json")
+            state.write_text("{}")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                updater.refresh_report(root)
+            self.assertIn("one quality-loop run", output.getvalue())
+            command = gate.CommandResult(["check"], 1, "original failure output", 0.1)
+            report = gate.AnalysisReport(
+                root=str(root),
+                generated_at="saved date",
+                languages=["Python"],
+                gates=[
+                    gate.GateResult(
+                        "quality",
+                        "Quality",
+                        False,
+                        "failed",
+                        command_results=[command],
+                        prompts=[("fix", "prompt")],
+                    )
+                ],
+                functions=[],
+                mutations=[],
+                dependency_violations=[],
+                tool_setup=[],
+                notes=[],
+                scope=gate.GateScope("local_changes", ("sample.py",)),
+            )
+            state.write_text(json.dumps({"report": dataclasses.asdict(report)}))
+            updater.refresh_report(root)
+            self.assertIn(
+                "original failure output",
+                (root / ".quality/quality-gate-report.html").read_text(),
+            )
+            restored = updater.restore_value(
+                updater.gate.AnalysisReport, dataclasses.asdict(report)
+            )
+            self.assertEqual(restored.scope.paths, ("sample.py",))
+            self.assertEqual(restored.gates[0].prompts, [("fix", "prompt")])
+            self.assertEqual(dataclasses.asdict(restored), dataclasses.asdict(report))
+            report.root = str(root / "other")
+            state.write_text(json.dumps({"report": dataclasses.asdict(report)}))
+            with self.assertRaisesRegex(ValueError, "another repository"):
+                updater.refresh_report(root)
+
+    def test_repository_discovery_and_lock_prevent_overlapping_update(self):
+        updater = self.updater()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target, _ = installer.repo_target(root)
+            self.assertIsNone(updater.repository_root(root))
+            self.assertIsNone(updater.repository_root(target))
+            updater.update_repository(target, "a" * 40)
+            self.assertEqual(
+                updater.main(["--skill", str(target), "--ref", "a" * 40]), 0
+            )
+            quality_file(root, "quality-gate.json").write_text("{}")
+            self.assertEqual(updater.repository_root(target), root)
+            updater.update_repository(target, "a" * 40)
+            with updater.quality_loop.repository_run_lock(root):
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(
+                        updater.main(["--skill", str(target), "--ref", "a" * 40]), 2
+                    )
+                self.assertIn("already running", errors.getvalue())
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    updater.main(["--skill", str(target), "--ref", "main"]), 2
+                )
+
+    def test_installer_finishes_each_update_with_repository_refresh(self):
+        result = (Path("installed"), True, None, "4", "3")
+        with mock.patch.object(
+            installer.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+        ) as run:
+            installer.finish_installations([result], "a" * 40)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                sys.executable,
+                "-B",
+                "installed/scripts/quality_update.py",
+                "--skill",
+                "installed",
+                "--ref",
+                "a" * 40,
+            ],
+        )
+        with mock.patch.object(
+            installer.subprocess, "run", return_value=SimpleNamespace(returncode=2)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "repository refresh failed"):
+                installer.finish_installations([result], "a" * 40)
 
 
 class NestedArcReportTests(unittest.TestCase):
@@ -2789,6 +3145,11 @@ const helper = require('./helper.js')
                     ],
                 ),
                 mock.patch.object(installer, "handoff_needed", return_value=False),
+                mock.patch.object(
+                    installer.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ),
                 contextlib.redirect_stdout(output),
             ):
                 self.assertEqual(installer.main(["--update-all"]), 0)
@@ -3285,7 +3646,17 @@ const helper = require('./helper.js')
             with mock.patch.object(quality_loop, "load_gate_safely", return_value=None):
                 self.assertEqual(quality_loop.run_locked(args, run_root), 2)
 
-            analysis = SimpleNamespace(gates=[])
+            analysis = gate.AnalysisReport(
+                root=str(run_root),
+                generated_at="now",
+                languages=[],
+                gates=[],
+                functions=[],
+                mutations=[],
+                dependency_violations=[],
+                tool_setup=[],
+                notes=[],
+            )
             fake_loaded_gate = SimpleNamespace(
                 bundled_thresholds_path=lambda: run_root / "bundled.json",
                 html_report=lambda value: "<html></html>",
@@ -3424,6 +3795,13 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertEqual(passing_state["status"], "pass")
+            self.assertEqual(
+                passing_state["report"]["generated_at"], passing_state["generated_at"]
+            )
+            self.assertEqual(
+                passing_state["report"]["files"],
+                [{"path": "src/app.py", "lines": 2, "limit": 600}],
+            )
             self.assertEqual(len(passing_state["gates"]), 15)
             self.assertEqual(passing_state["counts"]["checks_applicable"], 13)
             self.assertEqual(passing_state["counts"]["checks_passing"], 13)

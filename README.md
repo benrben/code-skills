@@ -92,7 +92,7 @@ python3 .agents/skills/code-discipline/scripts/install.py --update-all
 The first two update this repository copy and the global one (add `--ref
 TAG_OR_COMMIT` to pin); the third refreshes every copy the installer has
 recorded on this computer and restores each `.claude/skills` link. Restart
-the agents afterwards. Updates keep repository-owned quality configuration and
+the agents afterwards. Updates preserve repository configuration, [refresh pinned toolchains and saved HTML](skills/code-discipline/references/quality-loop.md#entrypoint-and-configuration), and
 run the downloaded installer when it differs (copies before 1.4.0 need
 `scripts/install.py` overwritten from `main` once). Every change under `skills/`
 is also published to GHCR as an OCI Agent Skill package: `skr install oci://ghcr.io/benrben/code-skills.code-discipline:latest`.

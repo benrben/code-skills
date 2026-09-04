@@ -37,6 +37,10 @@
       ]
     },
     {
+      "name": "repository-update",
+      "paths": ["skills/code-discipline/scripts/quality_update.py"]
+    },
+    {
       "name": "smoke-check",
       "paths": [
         "skills/code-discipline/scripts/smoke_check.py"
@@ -59,6 +63,7 @@
       "quality-report"
     ],
     "installer": [],
+    "repository-update": ["quality-engine", "quality-loop"],
     "quality-report": [],
     "report-charts": [],
     "smoke-check": [],
