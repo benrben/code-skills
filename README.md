@@ -146,3 +146,8 @@ The full gate uses the pinned tools in `.venv` and enforces
 in pre-registered blind A/B rounds, loop v3.5 delivered green hand-offs in 3
 of 4 cells where v3.4 delivered 0 of 2, and the fan-out cleared a 95-item
 report that had previously been fatal.
+
+## Architecture diagrams
+
+Repository architecture and command flow are documented in
+[skills/code-discipline/references/architecture-diagrams.md](/Users/benreich/SDLC/.relay/worktrees/416aea1b-80f9-4c56-9a7a-4d455a969f44/1-code-skills/skills/code-discipline/references/architecture-diagrams.md).
