@@ -2597,13 +2597,18 @@ const helper = require('./helper.js')
             )
             analysis = SimpleNamespace(passed=True, rerun_command=None)
             with (
-                mock.patch.object(gate, "load_thresholds", return_value=({}, [])),
+                mock.patch.object(
+                    gate, "sync_thresholds_file", return_value=["synced"]
+                ),
+                mock.patch.object(
+                    gate, "load_thresholds", return_value=({}, ["loaded"])
+                ),
                 mock.patch.object(
                     gate,
                     "load_config",
                     return_value=({"tools": {"auto_install": True}}, []),
                 ),
-                mock.patch.object(gate, "run", return_value=analysis),
+                mock.patch.object(gate, "run", return_value=analysis) as run,
             ):
                 result, exit_code, error = quality_loop.execute_analysis(
                     args,
@@ -2618,10 +2623,16 @@ const helper = require('./helper.js')
             self.assertEqual(exit_code, 0)
             self.assertIsNone(error)
             self.assertEqual(analysis.rerun_command, "rerun")
+            self.assertEqual(run.call_args.args[4], ["synced", "loaded"])
 
             args.no_install = False
             with (
-                mock.patch.object(gate, "load_thresholds", return_value=({}, [])),
+                mock.patch.object(
+                    gate, "sync_thresholds_file", return_value=["synced"]
+                ),
+                mock.patch.object(
+                    gate, "load_thresholds", return_value=({}, ["loaded"])
+                ),
                 mock.patch.object(
                     gate,
                     "load_config",
@@ -2641,8 +2652,11 @@ const helper = require('./helper.js')
             self.assertEqual(exit_code, 0)
             self.assertIsNone(error)
 
-            with mock.patch.object(
-                gate, "load_thresholds", side_effect=ValueError("bad")
+            with (
+                mock.patch.object(gate, "sync_thresholds_file", return_value=[]),
+                mock.patch.object(
+                    gate, "load_thresholds", side_effect=ValueError("bad")
+                ),
             ):
                 result, exit_code, error = quality_loop.execute_analysis(
                     args,
@@ -5636,25 +5650,129 @@ class AdvancedQualityMetricTests(unittest.TestCase):
             )
             self.assertFalse(not_applicable.applicable)
 
-    def test_schema_one_thresholds_are_upgraded_in_memory(self) -> None:
+    def test_thresholds_gain_new_goals_from_the_bundled_defaults(self) -> None:
+        defaults = gate.default_thresholds()
         legacy = gate.default_thresholds()
         legacy["schema_version"] = 1
         legacy["metrics"].pop("branch_coverage_limit")
+        legacy["metrics"]["complexity_limit"] = 4
         legacy.pop("slow_tests")
         legacy.pop("extensibility")
         legacy.pop("error_handling")
 
-        upgraded, changed = gate.upgrade_thresholds(legacy)
+        upgraded, added = gate.upgrade_thresholds(legacy, defaults)
         gate.validate_thresholds(upgraded)
 
-        self.assertTrue(changed)
-        self.assertEqual(upgraded["schema_version"], 2)
-        self.assertEqual(upgraded["metrics"]["branch_coverage_limit"], 100)
-        self.assertEqual(upgraded["slow_tests"]["max_test_seconds"], 5)
         self.assertEqual(
-            upgraded["extensibility"]["max_core_to_extension_dependencies"], 0
+            added,
+            [
+                "metrics.branch_coverage_limit",
+                "slow_tests",
+                "extensibility",
+                "error_handling",
+                "schema_version",
+            ],
         )
-        self.assertEqual(upgraded["error_handling"]["max_silent_handlers"], 0)
+        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["metrics"]["complexity_limit"], 4)
+        self.assertEqual(upgraded["metrics"]["branch_coverage_limit"], 100)
+        self.assertEqual(upgraded["slow_tests"], defaults["slow_tests"])
+        self.assertEqual(upgraded["extensibility"], defaults["extensibility"])
+        self.assertEqual(upgraded["error_handling"], defaults["error_handling"])
+        self.assertEqual(legacy["schema_version"], 1)
+        self.assertNotIn("slow_tests", legacy)
+
+        self.assertEqual(gate.upgrade_thresholds(defaults, defaults), (defaults, []))
+
+        broken = dict(defaults)
+        broken["slow_tests"] = "fast"
+        broken["schema_version"] = "2"
+        untouched, added = gate.upgrade_thresholds(broken, defaults)
+        self.assertEqual(added, [])
+        self.assertEqual(untouched["slow_tests"], "fast")
+        self.assertEqual(untouched["schema_version"], "2")
+        with self.assertRaisesRegex(ValueError, "schema_version must be 2"):
+            gate.validate_thresholds(untouched)
+        untouched["schema_version"] = 2
+        with self.assertRaisesRegex(ValueError, "slow_tests"):
+            gate.validate_thresholds(untouched)
+
+        newer = dict(defaults)
+        newer["schema_version"] = 3
+        self.assertEqual(gate.upgrade_thresholds(newer, defaults)[1], [])
+
+    def test_loading_a_repository_file_applies_new_goals_in_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "quality-thresholds.json"
+            legacy = gate.default_thresholds()
+            legacy["schema_version"] = 1
+            legacy.pop("error_handling")
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            loaded, notes = gate.load_thresholds(path)
+
+            self.assertEqual(loaded["schema_version"], 2)
+            self.assertIn("error_handling", loaded)
+            self.assertEqual(len(notes), 1)
+            self.assertIn("new goals: error_handling, schema_version", notes[0])
+            self.assertEqual(json.loads(path.read_text())["schema_version"], 1)
+
+            bundled, bundled_notes = gate.load_thresholds(
+                gate.bundled_thresholds_path()
+            )
+            self.assertEqual(bundled, gate.default_thresholds())
+            self.assertNotIn("new goals", bundled_notes[0])
+
+            path.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "JSON object"):
+                gate.load_thresholds(path)
+            path.write_text("{", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Cannot read"):
+                gate.load_thresholds(path)
+
+    def test_sync_writes_new_goals_into_the_repository_thresholds_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "quality-thresholds.json"
+            legacy = gate.default_thresholds()
+            legacy["schema_version"] = 1
+            legacy["file_loc"]["max_lines"] = 250
+            legacy.pop("slow_tests")
+            legacy["metrics"].pop("branch_coverage_limit")
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            path.chmod(0o600)
+
+            notes = gate.sync_thresholds_file(path)
+
+            self.assertEqual(len(notes), 1)
+            self.assertIn(str(path), notes[0])
+            self.assertIn(
+                "metrics.branch_coverage_limit, slow_tests, schema_version", notes[0]
+            )
+            written = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(written["schema_version"], 2)
+            self.assertEqual(written["file_loc"]["max_lines"], 250)
+            self.assertEqual(written["metrics"]["branch_coverage_limit"], 100)
+            self.assertEqual(
+                written["slow_tests"], gate.default_thresholds()["slow_tests"]
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(path.read_text(encoding="utf-8").endswith("}\n"))
+            self.assertEqual(gate.sync_thresholds_file(path), [])
+
+            path.write_text(
+                json.dumps({"schema_version": 1, "unknown": {}}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "unknown keys: unknown"):
+                gate.sync_thresholds_file(path)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"schema_version": 1, "unknown": {}},
+            )
+
+        bundled = gate.bundled_thresholds_path()
+        before = bundled.read_bytes()
+        self.assertEqual(gate.sync_thresholds_file(bundled), [])
+        self.assertEqual(bundled.read_bytes(), before)
 
     def test_branch_coverage_is_measured_per_function(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

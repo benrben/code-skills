@@ -39,7 +39,7 @@ from repo_quality_gate import gate_status as gate_status  # noqa: E402
 from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
 from repo_quality_gate import state_status as state_status  # noqa: E402
 
-VERSION = "3.7.0"
+VERSION = "3.8.0"
 QUALITY_DIRECTORY = ".quality"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 CHECK_FLAGS: tuple[tuple[str, str], ...] = (
@@ -448,11 +448,12 @@ def execute_analysis(
     scope = requested_scope(args, gate)
     try:
         scope = selected_scope(args, gate, root)
+        sync_notes = gate.sync_thresholds_file(thresholds_path)
         thresholds, threshold_notes = gate.load_thresholds(thresholds_path)
         config, notes = gate.load_config(
             config_path if config_path.exists() else None, thresholds
         )
-        notes = [*threshold_notes, *notes]
+        notes = [*sync_notes, *threshold_notes, *notes]
         if args.no_install:
             config["tools"]["auto_install"] = False
         analysis = gate.run(

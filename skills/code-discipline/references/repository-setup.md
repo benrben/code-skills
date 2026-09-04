@@ -28,7 +28,9 @@ versions.
    merged through `--merge-lcov`. Mutation testing and flaky detection start
    off; enable them in the configuration or run `--mutation` / `--flaky` when
    asked. Review generated detection; do not treat it as architecture intent.
-   The command prints the first loop command to run.
+   The command prints the first loop command to run. When a skill update adds
+   a goal, the next loop run writes it into `.quality/quality-thresholds.json`
+   with the bundled default and reports it; values already there never change.
 4. Configure non-mutating check commands as JSON argument arrays. Use
    `["bash", "-lc", "..."]` only when a check truly requires pipes, globbing,
    command substitution, or another shell feature.

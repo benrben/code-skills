@@ -41,7 +41,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "4.3.0"
+VERSION = "4.4.0"
 QUALITY_DIRECTORY = ".quality"
 CONFIG_NAME = f"{QUALITY_DIRECTORY}/quality-gate.json"
 THRESHOLDS_NAME = f"{QUALITY_DIRECTORY}/quality-thresholds.json"
@@ -839,29 +839,30 @@ def threshold_number(thresholds: dict[str, Any], section: str, key: str) -> int 
     return value if isinstance(value, (int, float)) else 0
 
 
-def upgrade_thresholds(thresholds: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """Upgrade the original schema without changing repository-owned files."""
-    if thresholds.get("schema_version") != 1:
-        return thresholds, False
+def upgrade_thresholds(
+    thresholds: dict[str, Any], defaults: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """Add goals the file predates from the bundled defaults; keep every owned value."""
     upgraded = dict(thresholds)
-    upgraded["schema_version"] = 2
-    upgraded["metrics"] = {
-        **dict(thresholds.get("metrics", {})),
-        "branch_coverage_limit": 100,
-    }
-    upgraded["slow_tests"] = {
-        "max_test_seconds": 5,
-        "max_suite_seconds": 300,
-    }
-    upgraded["extensibility"] = {
-        "contract_coverage_limit": 100,
-        "max_core_to_extension_dependencies": 0,
-    }
-    upgraded["error_handling"] = {
-        "failure_path_coverage_limit": 100,
-        "max_silent_handlers": 0,
-    }
-    return upgraded, True
+    added: list[str] = []
+    for section, goals in defaults.items():
+        if section == "schema_version":
+            continue
+        current = thresholds.get(section)
+        if section not in thresholds:
+            upgraded[section] = dict(goals)
+            added.append(section)
+            continue
+        if not isinstance(current, dict):
+            continue
+        missing = [key for key in goals if key not in current]
+        upgraded[section] = {**current, **{key: goals[key] for key in missing}}
+        added.extend(f"{section}.{key}" for key in missing)
+    version = thresholds.get("schema_version")
+    if isinstance(version, int) and version < defaults["schema_version"]:
+        upgraded["schema_version"] = defaults["schema_version"]
+        added.append("schema_version")
+    return upgraded, added
 
 
 def validate_thresholds(thresholds: dict[str, Any]) -> None:
@@ -950,23 +951,48 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
             )
 
 
-def load_thresholds(path: Path) -> tuple[dict[str, Any], list[str]]:
+def read_thresholds(path: Path) -> dict[str, Any]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"Cannot read thresholds {path}: {error}") from error
     if not isinstance(loaded, dict):
         raise ValueError(f"Threshold file {path} must contain a JSON object")
-    loaded, upgraded = upgrade_thresholds(loaded)
+    return loaded
+
+
+def is_bundled_thresholds(path: Path) -> bool:
+    return path.resolve() == bundled_thresholds_path().resolve()
+
+
+def load_thresholds(path: Path) -> tuple[dict[str, Any], list[str]]:
+    loaded = read_thresholds(path)
+    added: list[str] = []
+    if not is_bundled_thresholds(path):
+        loaded, added = upgrade_thresholds(loaded, default_thresholds())
     validate_thresholds(loaded)
     note = f"Loaded quality thresholds from {path}"
-    if upgraded:
-        note += " and applied schema 2 defaults in memory"
+    if added:
+        note += " and applied bundled defaults for new goals: " + ", ".join(added)
     return loaded, [note]
 
 
+def sync_thresholds_file(path: Path) -> list[str]:
+    """Write goals a repository file predates into it, so the file is the whole contract."""
+    if is_bundled_thresholds(path):
+        return []
+    upgraded, added = upgrade_thresholds(read_thresholds(path), default_thresholds())
+    if not added:
+        return []
+    validate_thresholds(upgraded)
+    payload = (json.dumps(upgraded, indent=2) + "\n").encode("utf-8")
+    atomic_replace_bytes(path, payload, path.stat().st_mode & 0o777)
+    return [f"Added new quality goals to {path}: {', '.join(added)}"]
+
+
 def default_thresholds() -> dict[str, Any]:
-    thresholds, _ = load_thresholds(bundled_thresholds_path())
+    thresholds = read_thresholds(bundled_thresholds_path())
+    validate_thresholds(thresholds)
     return thresholds
 
 

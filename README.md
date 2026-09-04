@@ -137,7 +137,7 @@ configure this repository's real toolchain, verify both scripts with
 ## Verify and develop
 
 ```bash
-python3 .agents/skills/code-discipline/scripts/quality_loop.py --version   # 3.7.0
+python3 .agents/skills/code-discipline/scripts/quality_loop.py --version   # 3.8.0
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m unittest tests.test_repo_quality_gate
 .venv/bin/python skills/code-discipline/scripts/quality_loop.py --root . --no-install
