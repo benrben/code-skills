@@ -2116,13 +2116,10 @@ const helper = require('./helper.js')
             with self.assertRaisesRegex(RuntimeError, "did not resolve"):
                 installer.resolve_reference("main")
 
-        with (
-            mock.patch.object(installer, "resolve_reference", return_value="a" * 40),
-            mock.patch.object(
-                installer, "download_file", return_value=b"payload"
-            ) as download,
-        ):
-            payloads = installer.download_skill("main")
+        with mock.patch.object(
+            installer, "download_file", return_value=b"payload"
+        ) as download:
+            payloads = installer.download_skill("a" * 40)
         self.assertEqual(set(payloads), set(installer.SKILL_FILES))
         self.assertEqual(download.call_count, len(installer.SKILL_FILES))
 
@@ -2254,9 +2251,20 @@ const helper = require('./helper.js')
 
     def test_installer_main_reports_success_and_failure(self) -> None:
         result = (Path("target"), False, None, "4", "3")
-        with mock.patch.object(installer, "install_from_args", return_value=result):
-            self.assertEqual(installer.main(["--repo"]), 0)
+        payloads = {installer.INSTALLER_FILE: b"fresh"}
         with (
+            mock.patch.object(installer, "resolve_reference", return_value="a" * 40),
+            mock.patch.object(installer, "download_skill", return_value=payloads),
+            mock.patch.object(
+                installer, "install_from_args", return_value=result
+            ) as install,
+        ):
+            self.assertEqual(installer.main(["--repo"]), 0)
+        install.assert_called_once()
+        self.assertIs(install.call_args.args[1], payloads)
+        with (
+            mock.patch.object(installer, "resolve_reference", return_value="a" * 40),
+            mock.patch.object(installer, "download_skill", return_value=payloads),
             mock.patch.object(
                 installer, "install_from_args", side_effect=RuntimeError("broken")
             ),
@@ -2264,6 +2272,64 @@ const helper = require('./helper.js')
         ):
             self.assertEqual(installer.main(["--repo"]), 2)
         self.assertIn("broken", stderr.getvalue())
+
+    def test_installer_update_hands_off_to_the_downloaded_installer(self) -> None:
+        commit = "b" * 40
+        current = installer.current_installer().read_bytes()
+        same = {installer.INSTALLER_FILE: current}
+        newer = {installer.INSTALLER_FILE: current + b"\n# newer\n"}
+        update = SimpleNamespace(update_current=True)
+        fresh = SimpleNamespace(update_current=False)
+        self.assertFalse(installer.handoff_needed(fresh, newer))
+        self.assertFalse(installer.handoff_needed(update, same))
+        self.assertTrue(installer.handoff_needed(update, newer))
+        with mock.patch.dict(os.environ, {installer.HANDOFF_ENV: "1"}):
+            self.assertFalse(installer.handoff_needed(update, newer))
+
+        with mock.patch.dict(os.environ, {installer.UPDATE_TARGET_ENV: "/handed"}):
+            self.assertEqual(installer.update_target(), Path("/handed"))
+        with mock.patch.dict(os.environ, {installer.UPDATE_TARGET_ENV: ""}):
+            self.assertEqual(
+                installer.update_target(), installer.current_installer().parent.parent
+            )
+
+        with (
+            mock.patch.object(installer, "resolve_reference", return_value=commit),
+            mock.patch.object(installer, "download_skill", return_value=newer),
+            mock.patch.object(
+                installer, "run_downloaded_installer", return_value=7
+            ) as handoff,
+            mock.patch.object(installer, "install_from_args") as install,
+        ):
+            self.assertEqual(installer.main(["--update-current"]), 7)
+        install.assert_not_called()
+        handoff.assert_called_once_with(
+            newer[installer.INSTALLER_FILE], installer.update_target(), commit
+        )
+
+    def test_installer_runs_the_downloaded_installer_with_the_update_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            script = (
+                "import json, os, sys\n"
+                f"json.dump({{'argv': sys.argv[1:], 'handoff': "
+                f"os.environ.get({installer.HANDOFF_ENV!r}), 'target': "
+                f"os.environ.get({installer.UPDATE_TARGET_ENV!r})}}, "
+                f"open({str(report)!r}, 'w'))\n"
+                "sys.exit(3)\n"
+            ).encode()
+            code = installer.run_downloaded_installer(
+                script, Path(temporary) / "skill", "c" * 40
+            )
+            self.assertEqual(code, 3)
+            recorded = json.loads(report.read_text())
+        self.assertEqual(recorded["argv"], ["--update-current", "--ref", "c" * 40])
+        self.assertEqual(recorded["handoff"], "1")
+        self.assertEqual(recorded["target"], str(Path(temporary) / "skill"))
+        with self.assertRaises(SyntaxError):
+            installer.run_downloaded_installer(b"def (", Path(temporary), "c" * 40)
 
     def test_quality_loop_platform_lock_and_owner_paths(self) -> None:
         with tempfile.TemporaryFile(mode="w+") as handle:
@@ -2672,17 +2738,13 @@ const helper = require('./helper.js')
                 ),
                 mock.patch.object(installer, "validate_claude_link") as validate,
                 mock.patch.object(
-                    installer, "download_skill", return_value={}
-                ) as download,
-                mock.patch.object(
                     installer, "install_skill", return_value=linked_result
                 ) as install,
                 mock.patch.object(installer, "ensure_claude_link") as ensure,
             ):
-                result = installer.install_from_args(repo_args)
+                result = installer.install_from_args(repo_args, {})
             self.assertEqual(result, (target, False, missing_link, "4", "3"))
             validate.assert_called_once_with(missing_link, target)
-            download.assert_called_once_with("main")
             install.assert_called_once_with(target, {}, False)
             ensure.assert_called_once_with(missing_link, target)
 
@@ -2695,13 +2757,12 @@ const helper = require('./helper.js')
                     "install_destination",
                     return_value=(target, True, None),
                 ),
-                mock.patch.object(installer, "download_skill", return_value={}),
                 mock.patch.object(
                     installer, "install_skill", return_value=linked_result
                 ),
             ):
                 self.assertEqual(
-                    installer.install_from_args(update_args),
+                    installer.install_from_args(update_args, {}),
                     (target, True, None, "4", "3"),
                 )
 
@@ -6049,6 +6110,11 @@ class SmokeWritePathTests(unittest.TestCase):
         assert dead is not None
         self.assertIn("no answer", dead)
         self.assertEqual(smoke_check.probe_errors(base, (), 1), [])
+        with mock.patch.object(
+            smoke_check, "run_probe", side_effect=[None, "probe boom", None]
+        ):
+            collected = smoke_check.probe_errors(base, ("a", "b", "c"), 1)
+        self.assertEqual(collected, ["probe boom"])
 
     def test_health_recheck_reports_a_crashed_application(self) -> None:
         server, base = self.serve()

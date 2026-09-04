@@ -19,11 +19,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
 API_BASE = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+INSTALLER_FILE = "scripts/install.py"
+HANDOFF_ENV = "CODE_DISCIPLINE_INSTALLER_HANDOFF"
+UPDATE_TARGET_ENV = "CODE_DISCIPLINE_UPDATE_TARGET"
 SKILL_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -153,8 +156,7 @@ def resolve_reference(reference: str) -> str:
     return commit
 
 
-def download_skill(reference: str) -> dict[str, bytes]:
-    commit = resolve_reference(reference)
+def download_skill(commit: str) -> dict[str, bytes]:
     return {
         relative: download_file(raw_url(commit, relative)) for relative in SKILL_FILES
     }
@@ -364,11 +366,44 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def current_installer() -> Path:
+    return Path(__file__).resolve()
+
+
+def update_target() -> Path:
+    handed_off = os.environ.get(UPDATE_TARGET_ENV)
+    if handed_off:
+        return Path(handed_off)
+    return current_installer().parent.parent
+
+
+def handoff_needed(args: argparse.Namespace, payloads: Mapping[str, bytes]) -> bool:
+    # A stale installer may reject a newer skill layout (for example a bumped
+    # thresholds schema), so an update runs the downloaded installer instead.
+    if not args.update_current or os.environ.get(HANDOFF_ENV):
+        return False
+    return payloads[INSTALLER_FILE] != current_installer().read_bytes()
+
+
+def run_downloaded_installer(installer: bytes, target: Path, commit: str) -> int:
+    compile(installer, INSTALLER_FILE, "exec")
+    with tempfile.TemporaryDirectory(prefix="code-discipline-installer-") as directory:
+        script = Path(directory) / "install.py"
+        script.write_bytes(installer)
+        environment = {**os.environ, HANDOFF_ENV: "1", UPDATE_TARGET_ENV: str(target)}
+        completed = subprocess.run(
+            [sys.executable, str(script), "--update-current", "--ref", commit],
+            env=environment,
+            check=False,
+        )
+    return completed.returncode
+
+
 def install_destination(
     args: argparse.Namespace,
 ) -> tuple[Path, bool, Path | None]:
     if args.update_current:
-        return Path(__file__).resolve().parent.parent, True, None
+        return update_target(), True, None
     if args.repo:
         target, scope_root = repo_target(Path(args.root))
     else:
@@ -377,12 +412,11 @@ def install_destination(
 
 
 def install_from_args(
-    args: argparse.Namespace,
+    args: argparse.Namespace, payloads: Mapping[str, bytes]
 ) -> tuple[Path, bool, Path | None, str, str]:
     target, update, link = install_destination(args)
     if link:
         validate_claude_link(link, target)
-    payloads = download_skill(args.ref)
     core_version, loop_version = install_skill(target, payloads, update)
     if link:
         ensure_claude_link(link, target)
@@ -407,7 +441,13 @@ def print_install_result(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        result = install_from_args(args)
+        commit = resolve_reference(args.ref)
+        payloads = download_skill(commit)
+        if handoff_needed(args, payloads):
+            return run_downloaded_installer(
+                payloads[INSTALLER_FILE], update_target(), commit
+            )
+        result = install_from_args(args, payloads)
     except (
         OSError,
         RuntimeError,

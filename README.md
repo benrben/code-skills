@@ -91,7 +91,9 @@ python3 "$HOME/.agents/skills/code-discipline/scripts/install.py" --update-curre
 The first updates the repository copy, the second the global one; add
 `--ref TAG_OR_COMMIT` to pin.
 Updates validate a staged copy before atomically replacing the old one and
-never overwrite repository-owned quality configuration. Every change under
+never overwrite repository-owned quality configuration. An update runs the
+downloaded installer when it differs, so old copies follow layout changes; copies
+before 1.4.0 need `scripts/install.py` overwritten from `main` once, then rerun. Every change under
 `skills/` is also published to GHCR as an OCI Agent Skill package:
 `skr install oci://ghcr.io/benrben/code-skills.code-discipline:latest`.
 
