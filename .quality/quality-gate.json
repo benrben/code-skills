@@ -163,7 +163,8 @@
       ".venv/bin/python",
       "-m",
       "unittest",
-      "tests.test_repo_quality_gate"
+      "tests.test_repo_quality_gate",
+      "--failfast"
     ],
     "test_files": [
       "tests/test_repo_quality_gate.py"

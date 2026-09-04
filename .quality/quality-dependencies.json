@@ -25,6 +25,12 @@
       ]
     },
     {
+      "name": "report-charts",
+      "paths": [
+        "skills/code-discipline/scripts/quality_charts.py"
+      ]
+    },
+    {
       "name": "installer",
       "paths": [
         "skills/code-discipline/scripts/install.py"
@@ -47,13 +53,14 @@
     "compatibility-entrypoint": [
       "quality-engine"
     ],
-    "quality-engine": [],
+    "quality-engine": ["report-charts"],
     "quality-loop": [
       "quality-engine",
       "quality-report"
     ],
     "installer": [],
     "quality-report": [],
+    "report-charts": [],
     "smoke-check": [],
     "quality-items": [
       "quality-report"

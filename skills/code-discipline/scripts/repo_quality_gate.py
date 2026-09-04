@@ -41,6 +41,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from quality_charts import CHART_STYLES, health_overview  # noqa: E402
+
 VERSION = "4.4.0"
 QUALITY_DIRECTORY = ".quality"
 CONFIG_NAME = f"{QUALITY_DIRECTORY}/quality-gate.json"
@@ -702,6 +708,25 @@ def install_standalone_release(
     return version
 
 
+def bundle_standalone_charts(runner: bytes, charts: bytes) -> bytes:
+    """Keep legacy single-file updates runnable without the installed skill bundle."""
+    chart_source = charts.decode("utf-8").replace(
+        "from __future__ import annotations\n", ""
+    )
+    runner_source = runner.decode("utf-8")
+    marker = "from quality_charts import CHART_STYLES, health_overview  # noqa: E402"
+    if marker not in runner_source:
+        raise ValueError("The downloaded runner has no chart renderer import to bundle")
+    combined = runner_source.replace(marker, chart_source, 1)
+    try:
+        ast.parse(combined)
+    except SyntaxError as error:
+        raise ValueError(
+            f"The downloaded chart renderer is not valid Python: {error}"
+        ) from error
+    return combined.encode("utf-8")
+
+
 def normalized_git_remote(value: str) -> str:
     normalized = value.strip().removesuffix(".git").removesuffix("/")
     if normalized.startswith("git@github.com:"):
@@ -799,6 +824,13 @@ def update_from_github(runner_path: Path, reference: str) -> int:
     )
     try:
         runner_payload = download_update_file(runner_url, 2_000_000)
+        if b"from quality_charts import" in runner_payload:
+            charts_url = github_raw_url(
+                reference, "skills/code-discipline/scripts/quality_charts.py"
+            )
+            runner_payload = bundle_standalone_charts(
+                runner_payload, download_update_file(charts_url, 1_000_000)
+            )
         thresholds_payload = download_update_file(thresholds_url, 100_000)
         version = install_standalone_release(
             runner_path,
@@ -6842,21 +6874,29 @@ def html_report(report: AnalysisReport) -> str:
             if not report.scope.incremental
             else f"Fast quality check for {report.scope.description}"
         )
+        if report.ready_for_full:
+            page_heading = "Fast checks passed"
         verdict_class = "diagnostic"
     else:
         if report.scope.kind == "commit":
             status = "COMMIT SCOPE PASSED" if report.passed else "COMMIT NEEDS WORK"
-            page_heading = f"Is {report.scope.description} ready?"
+            page_heading = (
+                "Ready to merge" if report.passed else "Changes need attention"
+            )
         elif report.scope.kind == "local_changes":
             status = (
                 "LOCAL CHANGES PASSED" if report.passed else "LOCAL CHANGES NEED WORK"
             )
-            page_heading = "Are local changes ready?"
+            page_heading = (
+                "Ready to merge" if report.passed else "Changes need attention"
+            )
         else:
             status = "READY TO SHIP" if report.passed else "NOT READY YET"
-            page_heading = "Can I ship this?"
+            page_heading = (
+                "Ready to ship" if report.passed else "Changes need attention"
+            )
         verdict_class = "pass" if report.passed else "fail"
-    thresholds = report.thresholds or default_thresholds()
+    thresholds = deep_merge(default_thresholds(), report.thresholds)
     coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
     branch_coverage_limit = threshold_number(
         thresholds, "metrics", "branch_coverage_limit"
@@ -7113,13 +7153,38 @@ def html_report(report: AnalysisReport) -> str:
         "dependencies": f"""<div class="check-detail"><h4>Architecture boundaries</h4><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div></div>""",
         "extensibility": f"""<div class="check-detail"><h4>Extension contracts</h4><div class="table-wrap"><table><thead><tr><th>Scenario</th><th>Duration</th><th>Status</th></tr></thead><tbody>{scenario_rows}</tbody></table></div><h4>Core to extension direction</h4><div class="table-wrap"><table><thead><tr><th>Core source</th><th>Extension target</th></tr></thead><tbody>{extension_dependency_rows}</tbody></table></div></div>""",
     }
-    gate_cards = "".join(
-        gate_card_html(
-            gate,
-            gate_language.get(gate.key, ("•", gate.title, gate.title, gate.summary)),
-            metric_details_by_gate.get(gate.key, ""),
+    gate_groups: dict[str, list[str]] = {"Build": [], "Tests": [], "Architecture": []}
+    build_keys = {"format_lint", "types", "contracts"}
+    test_keys = {
+        "quality",
+        "slow_tests",
+        "error_handling",
+        "test_integrity",
+        "smoke",
+        "flaky",
+        "mutation",
+    }
+    for gate in report.gates:
+        if not gate.applicable:
+            continue
+        group = (
+            "Build"
+            if gate.key in build_keys
+            else ("Tests" if gate.key in test_keys else "Architecture")
         )
-        for gate in report.gates
+        gate_groups[group].append(
+            gate_card_html(
+                gate,
+                gate_language.get(
+                    gate.key, ("•", gate.title, gate.title, gate.summary)
+                ),
+                metric_details_by_gate.get(gate.key, ""),
+            )
+        )
+    gate_cards = "".join(
+        f'<details class="data-section"><summary><span>{group}</span><span>{len(cards)} checks</span></summary><div>{"".join(cards)}</div></details>'
+        for group, cards in gate_groups.items()
+        if cards
     )
     failed_gates = [
         gate
@@ -7128,7 +7193,7 @@ def html_report(report: AnalysisReport) -> str:
     ]
     optional_gates = [gate for gate in report.gates if not gate.applicable]
     repair_action_html = ""
-    if not report.passed:
+    if failed_gates:
         repair_action_html = f"""<button class="copy primary" data-copy="prompt-fix-everything">
           <span aria-hidden="true">▣</span> Copy repair prompt
         </button><pre class="copy-source" id="prompt-fix-everything" hidden>{html.escape(master_fix_prompt(report))}</pre>"""
@@ -7147,13 +7212,13 @@ def html_report(report: AnalysisReport) -> str:
 
     optional_rows = []
     optional_prompts = []
-    for index, gate in enumerate(optional_gates):
+    for index, gate in enumerate(optional_gates if not report.passed else []):
         prompt_id = f"prompt-install-{index}"
         prompt = optional_gate_setup_prompt(report, gate)
         optional_prompts.append(f"## {gate.title}\n\n{prompt}")
         reason = gate.details[0] if gate.details else gate.summary
         optional_rows.append(
-            f"""<div class="optional-row"><span class="na-mark">N/A</span>
+            f"""<div class="optional-row"><span class="na-mark">{gate_outcome(gate).replace("NOT APPLICABLE", "N/A")}</span>
             <div><strong>{html.escape(gate.title)}</strong><p>{html.escape(reason)}</p></div>
             <button class="copy secondary" data-copy="{prompt_id}"><span aria-hidden="true">▣</span> Copy install prompt</button>
             <pre class="copy-source" id="{prompt_id}" hidden>{html.escape(prompt)}</pre></div>"""
@@ -7168,6 +7233,15 @@ def html_report(report: AnalysisReport) -> str:
           <pre class="copy-source" id="prompt-install-all" hidden>{html.escape(all_optional_prompt)}</pre>
           <div class="group-body">{"".join(optional_rows)}</div>
         </details>"""
+    if optional_gates and report.passed:
+        optional_section = (
+            f'<details class="data-section"><summary><span>Not measured for this change ({len(optional_gates)})</span></summary><div class="panel">'
+            + "".join(
+                f"<p><strong>{html.escape(gate.title)}</strong> · {gate_outcome(gate)} · {html.escape(gate.summary)}</p>"
+                for gate in optional_gates
+            )
+            + "</div></details>"
+        )
 
     notes_html = "".join(f"<li>{html.escape(note)}</li>" for note in report.notes)
     language_text = ", ".join(report.languages)
@@ -7183,25 +7257,6 @@ def html_report(report: AnalysisReport) -> str:
         setup_evidence = ""
     total_gates = max(1, len(report.gates))
     failed_count = len(failed_gates)
-    outcome_segments = "".join(
-        f'<span class="segment {state}" style="flex:{count}" title="{count} {label}"></span>'
-        for state, count, label in (
-            ("pass", passed_gates, "passed"),
-            ("fail", failed_count, "failed"),
-            ("deferred", deferred_gates, "deferred"),
-            ("na", not_applicable_gates, "not applicable"),
-        )
-        if count
-    )
-    outcome_legend = "".join(
-        f'<span><i class="{state}"></i><strong>{count}</strong> {label}</span>'
-        for state, count, label in (
-            ("pass", passed_gates, "Passed"),
-            ("fail", failed_count, "Failed"),
-            ("deferred", deferred_gates, "Deferred"),
-            ("na", not_applicable_gates, "Not applicable"),
-        )
-    )
     function_count = len(report.functions)
     file_count = len(report.files)
     average_craap = (
@@ -7267,28 +7322,25 @@ def html_report(report: AnalysisReport) -> str:
       <div class="metric-tile"><strong>{failure_path_coverage:.1f}%</strong><span>Failure-path coverage</span><small>Target {failure_path_limit:g}%</small></div>
       <div class="metric-tile"><strong>{sum(item.silent for item in report.error_paths)}</strong><span>Silent handlers</span><small>Limit ≤ {silent_handler_limit:g}</small></div>
     </div>"""
-    gate_flow_items = []
-    for gate in report.gates:
-        if gate.deferred:
-            state, symbol, state_text = "deferred", "◷", "DEFERRED"
-        elif gate.skipped or gate.off:
-            state, symbol, state_text = "na", "−", gate_outcome(gate)
-        elif not gate.applicable:
-            state, symbol, state_text = "na", "−", "N/A"
-        elif gate.passed:
-            state, symbol, state_text = "pass", "✓", "PASS"
-        else:
-            state, symbol, state_text = "fail", "×", "FAIL"
-        short_title = gate_language.get(
-            gate.key, ("", gate.title, gate.title, gate.summary)
-        )[2]
-        gate_flow_items.append(
-            f"""<div class="flow-item {state}"><span class="flow-symbol">{symbol}</span>
-            <strong>{html.escape(short_title)}</strong><small>{state_text}</small></div>"""
-        )
-    gate_flow = "".join(gate_flow_items)
     thresholds_html = html.escape(json.dumps(thresholds, indent=2))
     repository_name = Path(report.root).name or report.root
+    completion = 100 * passed_gates / max(1, applicable_gates)
+    decision_note = (
+        "No action required" if report.passed else "Review the check details below"
+    )
+    if report.ready_for_full:
+        decision_note = "Run the full quality check before merge"
+    scope_note = (
+        "No production code changed"
+        if report.passed
+        and report.scope.incremental
+        and not report.files
+        and not report.functions
+        else html.escape(report.scope.description)
+    )
+    if report.mode == "fast":
+        scope_note = f"Fast quality check for {html.escape(report.scope.description)}"
+    health_charts = health_overview(report, thresholds)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_heading} — {status}</title>
@@ -7308,18 +7360,29 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
 @media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card,.metrics-wide{{grid-column:auto}}.metrics-wide .metric-grid{{grid-template-columns:1fr 1fr}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
 @media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.metric-tile{{padding:10px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
+{CHART_STYLES}
+body{{background:#f8fafc}}main{{max-width:1440px;padding:24px 28px 40px}}
+.toolbar{{position:static;box-shadow:none;border:0;border-radius:0;background:transparent;backdrop-filter:none;padding:0 0 20px;flex-wrap:wrap}}
+.brand{{font-size:20px;letter-spacing:-.025em}}.repo{{border:0;background:transparent;padding:0;color:var(--secondary)}}
+.hero{{padding:10px 0;align-items:center}}h1{{font-size:28px;line-height:1.2;margin:0 0 6px}}.hero .eyebrow,.hero .meta{{display:none}}
+.verdict{{margin-top:4px}}.accordion{{box-shadow:none;border:1px solid var(--line);background:#fff;backdrop-filter:none;border-radius:14px}}
+.copy{{min-height:44px}}.check-body{{overflow-wrap:anywhere}}.group-section,.data-section{{min-width:0}}
+.additional-metrics{{display:grid;gap:14px}}.additional-metrics h3{{margin:0;font-size:15px}}
+@media(max-width:760px){{main{{padding:18px 14px 30px}}.toolbar{{gap:8px 16px}}.toolbar-meta{{margin-left:0}}.hero{{gap:12px;grid-template-columns:1fr}}.hero h1{{font-size:25px}}.brand{{display:block}}.repo{{max-width:100%;white-space:normal;overflow-wrap:anywhere}}.gate-summary{{align-items:flex-start}}}}
+@media(prefers-reduced-motion:reduce){{*,*::before,*::after{{transition:none!important;animation:none!important}}}}
+@media(prefers-reduced-transparency:reduce){{.toolbar,.accordion,.card,.check-row{{background:#fff;backdrop-filter:none}}}}
+@media(prefers-contrast:more){{:root{{--secondary:#30343b;--line:#8a929e}}}}
 </style></head><body><main>
 <header class="toolbar"><span class="brand">Code Confidence</span><span class="repo">{html.escape(repository_name)} · {html.escape(report.scope.description)}</span>
 <div class="toolbar-meta"><strong>{report.mode.upper()} RUN</strong><span>{html.escape(report.generated_at)}</span></div></header>
 <section class="hero"><div><div class="eyebrow">Repository health · v{VERSION}</div><h1>{page_heading}</h1>
 <div class="meta">{html.escape(report.root)} · {html.escape(language_text)}</div><span class="verdict {verdict_class}">{status}</span></div>{repair_action_html}</section>
-<section class="dashboard"><article class="card"><h2>Gate outcomes</h2><div class="outcome-bar" aria-label="{passed_gates} passed, {failed_count} failed, {deferred_gates} deferred, {not_applicable_gates} not applicable">{outcome_segments}</div><div class="legend">{outcome_legend}</div></article>
-<article class="card"><h2>Code metrics</h2>{metric_tiles}</article>
-<article class="card metrics-wide"><h2>Extended metrics</h2>{extended_metric_tiles}</article>
-<article class="card flow-card"><h2>Quality gates</h2><div class="gate-flow">{gate_flow}</div></article></section>
-<section class="accordion">{fix_section}{optional_section}
+<section class="gate-summary"><div class="chart-ring" style="--gate-completion:{completion:g}%" role="img" aria-label="{passed_gates} of {applicable_gates} applicable checks passed"></div><div><strong>{decision_note}</strong><p>{passed_gates} checks passed · {failed_count} failed · {not_applicable_gates} not applicable · {deferred_gates} deferred</p><p>{scope_note}</p></div></section>
+{health_charts}
+<section class="accordion">{fix_section}
 <div class="checks-list">{gate_cards}</div>
-<details class="data-section"><summary><span>Run details</span><span>{report.mode} mode · {html.escape(report.scope.description)} · {html.escape(language_text)}</span></summary><div class="panel"><h3>Thresholds</h3><pre>{thresholds_html}</pre><h3>Automatic tool setup</h3><p>{html.escape(setup_summary)}</p>{setup_evidence}<h3>Notes</h3><ul>{notes_html}</ul></div></details>
+{optional_section}
+<details class="data-section"><summary><span>View run details</span><span>{report.mode} mode · {html.escape(report.scope.description)}</span></summary><div class="panel"><div class="additional-metrics"><h3>Code health</h3>{metric_tiles}<h3>Test performance · Extension safety · Failure handling</h3>{extended_metric_tiles}</div><h3>Thresholds</h3><pre>{thresholds_html}</pre><h3>Automatic tool setup</h3><p>{html.escape(setup_summary)}</p>{setup_evidence}<h3>Notes</h3><ul>{notes_html}</ul></div></details>
 </section><footer>{applicable_gates} applicable · {deferred_gates} deferred · generated {html.escape(report.generated_at)}</footer>
 </main><script>
 document.querySelectorAll('[data-copy]').forEach(button=>button.addEventListener('click',async()=>{{

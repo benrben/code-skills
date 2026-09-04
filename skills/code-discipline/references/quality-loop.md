@@ -76,7 +76,13 @@ people):
    — printed in every mode; when a run measures nothing it repeats the last
    measurement with its timestamp. Use it to plan tests, not to discover gaps
    at the end.
-4. `Extended metrics` in the HTML shows branch coverage, the slowest test,
+4. `Health overview` in the HTML shows coverage and nested P50/P75/P95 arcs
+   for CRAAP, complexity, function LOC, file LOC, and test duration. Each metric
+   uses one linear scale for its three arcs, with a dashed configured-limit
+   marker. Percentiles use linear interpolation between sorted observations.
+   Badges check every measured value, including outliers above P95. Missing
+   measurements are explicit; function LOC is informational because it has no
+   configured gate. `View run details` also shows branch coverage, the slowest test,
    extension-contract results, core-to-extension dependencies, failure-path
    coverage, and silent handlers. Gate detail tables also show every structured
    smoke probe, catch evidence type, and test-integrity violation. The
