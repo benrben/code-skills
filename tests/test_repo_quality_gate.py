@@ -2151,7 +2151,7 @@ const helper = require('./helper.js')
             with self.assertRaisesRegex(RuntimeError, "thresholds"):
                 installer.validate_staged_thresholds(root)
             (root / "quality-thresholds.json").write_text(
-                '{"schema_version":1}', encoding="utf-8"
+                '{"schema_version":2}', encoding="utf-8"
             )
             installer.validate_staged_thresholds(root)
 
@@ -2553,6 +2553,28 @@ const helper = require('./helper.js')
             self.assertIsNone(error)
             self.assertEqual(analysis.rerun_command, "rerun")
 
+            args.no_install = False
+            with (
+                mock.patch.object(gate, "load_thresholds", return_value=({}, [])),
+                mock.patch.object(
+                    gate,
+                    "load_config",
+                    return_value=({"tools": {"auto_install": True}}, []),
+                ),
+                mock.patch.object(gate, "run", return_value=analysis),
+            ):
+                _, exit_code, error = quality_loop.execute_analysis(
+                    args,
+                    gate,
+                    root,
+                    root / "config.json",
+                    root / "thresholds.json",
+                    root / "report.html",
+                    "rerun",
+                )
+            self.assertEqual(exit_code, 0)
+            self.assertIsNone(error)
+
             with mock.patch.object(
                 gate, "load_thresholds", side_effect=ValueError("bad")
             ):
@@ -2726,6 +2748,11 @@ const helper = require('./helper.js')
                 bundled_thresholds_path=lambda: run_root / "bundled.json",
                 html_report=lambda value: "<html></html>",
             )
+            quality_directory = run_root / ".quality"
+            quality_directory.mkdir(exist_ok=True)
+            (quality_directory / "quality-thresholds.json").write_text(
+                "{}", encoding="utf-8"
+            )
             with (
                 mock.patch.object(
                     quality_loop, "load_gate_safely", return_value=fake_loaded_gate
@@ -2855,9 +2882,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertEqual(passing_state["status"], "pass")
-            self.assertEqual(len(passing_state["gates"]), 11)
-            self.assertEqual(passing_state["counts"]["checks_applicable"], 11)
-            self.assertEqual(passing_state["counts"]["checks_passing"], 11)
+            self.assertEqual(len(passing_state["gates"]), 15)
+            self.assertEqual(passing_state["counts"]["checks_applicable"], 13)
+            self.assertEqual(passing_state["counts"]["checks_passing"], 13)
             self.assertEqual(passing_state["counts"]["mutants_static"], 0)
             self.assertEqual(passing_state["counts"]["files_total"], 1)
             self.assertEqual(passing_state["counts"]["files_failing_loc"], 0)
@@ -2884,7 +2911,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             )
             self.assertIsNone(passing_state["fix_prompt"])
             self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
-            self.assertEqual(passing_html.count('<details class="check-row '), 11)
+            self.assertEqual(passing_html.count('<details class="check-row '), 15)
             self.assertNotIn("9 total ·", passing_html)
 
             fast_html = root / "fast-report.html"
@@ -2975,6 +3002,10 @@ class QualityGateEndToEndTests(unittest.TestCase):
                         "total_lines": 2,
                         "coverage_percent": 100.0,
                         "coverage_measured": True,
+                        "covered_branches": 0,
+                        "total_branches": 0,
+                        "branch_coverage_percent": 100.0,
+                        "branch_coverage_measured": True,
                         "complexity": 1,
                         "craap_score": 1.0,
                         "passed": True,
@@ -3259,7 +3290,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             rendered = report_path.read_text(encoding="utf-8")
             self.assertIn("Can I ship this?", rendered)
             self.assertIn("READY TO SHIP", rendered)
-            self.assertEqual(rendered.count('<details class="check-row '), 11)
+            self.assertEqual(rendered.count('<details class="check-row '), 15)
             self.assertNotIn("9 total ·", rendered)
             self.assertIn("Code metrics", rendered)
             self.assertIn("<strong>1.00</strong><span>Average CRAAP", rendered)
@@ -3271,7 +3302,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertNotIn("Mutations + flaky tests", rendered)
             self.assertNotIn("<span>Evidence</span>", rendered)
             self.assertIn("<span>Run details</span>", rendered)
-            self.assertEqual(rendered.count("data-copy="), 0)
+            self.assertEqual(rendered.count("data-copy="), 3)
             self.assertNotIn("Gherkin", rendered)
             self.assertNotIn("Executable UI", rendered)
             self.assertIn("All 1 mutants were killed", rendered)
@@ -3795,7 +3826,7 @@ class CheckSelectionTests(unittest.TestCase):
             statuses = {item["key"]: item["status"] for item in state["gates"]}
             self.assertEqual(statuses["format_lint"], "pass")
             self.assertEqual(statuses["quality"], "skipped")
-            self.assertEqual(state["counts"]["checks_skipped"], 9)
+            self.assertEqual(state["counts"]["checks_skipped"], 13)
             self.assertIn("mode: partial (--lint --types)", partial.stdout)
             self.assertIn("Coverage today: not measured yet", partial.stdout)
             self.assertIn("does not certify", partial.stdout)
@@ -4035,6 +4066,9 @@ class LoopReportTests(unittest.TestCase):
             "failures": {**EMPTY_FAILURES, "files": many["failures"]["files"][:12]}
         }
         self.assertEqual(len(quality_report.to_fix_lines(twelve)), 12)
+        grouped = quality_report.grouped_fix_lines(quality_report.item_records(twelve))
+        self.assertEqual(len(grouped), 13)
+        self.assertNotIn("more files", grouped[-1])
         self.assertEqual(quality_report.to_fix_lines({"failures": EMPTY_FAILURES}), [])
 
     def test_next_step_lines_cover_every_status(self) -> None:
@@ -4215,8 +4249,11 @@ class SmokeGateTests(unittest.TestCase):
             notes=[],
         )
         prompt = gate.master_fix_prompt(report)
-        self.assertIn("10. The smoke check starts the application", prompt)
-        self.assertIn("11. No production file is hidden from the gate", prompt)
+        self.assertIn("10. Every composed-root test uses real", prompt)
+        self.assertIn(
+            "11. The smoke check proves the configured core user story", prompt
+        )
+        self.assertIn("12. No production file is hidden from the gate", prompt)
 
 
 class ScopeGateTests(unittest.TestCase):
@@ -4998,7 +5035,12 @@ class ReportGroupingTests(unittest.TestCase):
         self.assertEqual(quality_report.function_hint(both, limits).count(";"), 1)
         self.assertEqual(
             quality_report.metric_limits({}),
-            {"coverage_limit": 100.0, "complexity_limit": 6.0, "craap_limit": 6.0},
+            {
+                "coverage_limit": 100.0,
+                "branch_coverage_limit": 100.0,
+                "complexity_limit": 6.0,
+                "craap_limit": 6.0,
+            },
         )
         self.assertEqual(
             quality_report.metric_limits(
@@ -5320,6 +5362,559 @@ class InitGitTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("Initialized an empty git repository", completed.stdout)
             self.assertTrue((root / ".git").is_dir())
+
+
+class AdvancedQualityMetricTests(unittest.TestCase):
+    def test_smoke_story_fails_when_a_json_probe_fails_despite_exit_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "probe.py"
+            script.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "steps = [{'step': f'probe {i}', 'ok': i != 7} for i in range(10)]\n"
+                "Path(sys.argv[1]).write_text(json.dumps({'steps': steps, 'page_errors': []}))\n",
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["smoke"]["story"] = {
+                "name": "whiteboard core user story",
+                "command": [sys.executable, str(script), "{report}"],
+                "report": ".quality/ui-check.json",
+                "format": "steps-json",
+                "minimum_probes": 10,
+                "fail_on_page_errors": True,
+            }
+
+            result = gate.smoke_gate_for_run(
+                root, config, False, gate.gate_selection(["smoke"])
+            )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.smoke_probes), 10)
+        self.assertIn("9/10", result.summary)
+        self.assertIn("probe 7", result.details[0])
+
+    def test_smoke_story_accepts_ten_probes_and_report_dir_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "probe.py"
+            script.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "out = Path(sys.argv[1])\n"
+                "out.mkdir(parents=True, exist_ok=True)\n"
+                "steps = [{'step': f'probe {i}', 'ok': True} for i in range(10)]\n"
+                "(out / 'report.json').write_text(json.dumps({'steps': steps, 'page_errors': []}))\n",
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["smoke"]["story"] = {
+                "name": "core story",
+                "command": [sys.executable, str(script), "{report_dir}"],
+                "report": ".quality/ui-check/report.json",
+                "minimum_probes": 10,
+            }
+
+            result = gate.smoke_gate_for_run(
+                root, config, False, gate.gate_selection(["smoke"])
+            )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(len(result.smoke_probes), 10)
+        self.assertIn("10/10", result.summary)
+
+    def test_smoke_story_rejects_page_errors_and_too_few_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "steps": [{"name": "loads", "ok": True}],
+                        "page_errors": ["paint crashed"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            probes, page_errors = gate.load_smoke_story_report(report, "steps-json")
+
+        self.assertEqual(probes, [gate.SmokeProbe("loads", True, "")])
+        self.assertEqual(page_errors, ["paint crashed"])
+
+    def test_smoke_story_requires_a_steps_array(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text('{"ok": true}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "steps"):
+                gate.load_smoke_story_report(report, "steps-json")
+
+    def test_catch_coverage_prefers_lcov_branch_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src" / "load.ts"
+            source.parent.mkdir()
+            source.write_text(
+                "export function load() {\n"
+                "  try { risky(); }\n"
+                "  catch (error) {\n"
+                "    return fallback();\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            lcov = root / "lcov.info"
+            lcov.write_text(
+                "SF:src/load.ts\nDA:4,0\nBRDA:3,0,0,1\nBRF:1\nBRH:1\nend_of_record\n",
+                encoding="utf-8",
+            )
+
+            coverage = gate.parse_lcov(lcov, root)
+            paths = gate.scan_error_paths(source, root, coverage)
+
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(paths[0].covered)
+        self.assertTrue(paths[0].coverage_measured)
+        self.assertEqual(paths[0].coverage_kind, "branch")
+
+    def test_uncovered_catch_branch_overrides_a_covered_handler_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "load.ts"
+            source.write_text(
+                "function load() {\n"
+                "  try { risky(); }\n"
+                "  catch (error) {\n"
+                "    return fallback();\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            coverage = gate.CoverageData(
+                lines={"load.ts": {4: 1}}, branches={"load.ts": {3: [0]}}
+            )
+
+            paths = gate.scan_error_paths(source, root, coverage)
+
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].covered)
+        self.assertEqual(paths[0].coverage_kind, "branch")
+
+    def test_catch_coverage_falls_back_to_lines_without_branch_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "load.ts"
+            source.write_text(
+                "try { risky(); } catch (error) { recover(); }\n", encoding="utf-8"
+            )
+            coverage = gate.CoverageData(lines={"load.ts": {1: 1}})
+
+            paths = gate.scan_error_paths(source, root, coverage)
+
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(paths[0].covered)
+        self.assertEqual(paths[0].coverage_kind, "line")
+
+    def test_composed_root_rejects_same_package_mock_and_null_canvas(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "packages" / "client"
+            source = package / "src" / "api" / "client.ts"
+            test = package / "test" / "app" / "App.test.tsx"
+            package.mkdir(parents=True)
+            (package / "package.json").write_text('{"name":"client"}', encoding="utf-8")
+            source.parent.mkdir(parents=True)
+            test.parent.mkdir(parents=True)
+            source.write_text("export const load = () => 1;\n", encoding="utf-8")
+            test.write_text(
+                'vi.mock("../../src/api/client.js");\n'
+                "vi.spyOn(HTMLCanvasElement.prototype, 'getContext')\n"
+                "  .mockReturnValue(null);\n",
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["test_integrity"].update(
+                {
+                    "enabled": True,
+                    "required": True,
+                    "composed_root_tests": ["**/App.test.*"],
+                }
+            )
+
+            result, violations = gate.run_test_integrity_gate(
+                root, config, [source], [source, test]
+            )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(
+                {item.kind for item in violations},
+                {"same-package mock", "null render surface"},
+            )
+            self.assertEqual({item.line for item in violations}, {1, 2})
+
+            test.write_text('vi.mock("react");\n', encoding="utf-8")
+            passing, remaining = gate.run_test_integrity_gate(
+                root, config, [source], [source, test]
+            )
+            self.assertTrue(passing.passed)
+            self.assertEqual(remaining, [])
+
+            helper = package / "test" / "helpers" / "Widget.test.tsx"
+            helper.parent.mkdir()
+            helper.write_text('vi.mock("../../src/api/client.js");\n', encoding="utf-8")
+            not_applicable, _ = gate.run_test_integrity_gate(
+                root,
+                {
+                    **config,
+                    "test_integrity": {
+                        **config["test_integrity"],
+                        "required": False,
+                    },
+                },
+                [source],
+                [source, helper],
+            )
+            self.assertFalse(not_applicable.applicable)
+
+    def test_schema_one_thresholds_are_upgraded_in_memory(self) -> None:
+        legacy = gate.default_thresholds()
+        legacy["schema_version"] = 1
+        legacy["metrics"].pop("branch_coverage_limit")
+        legacy.pop("slow_tests")
+        legacy.pop("extensibility")
+        legacy.pop("error_handling")
+
+        upgraded, changed = gate.upgrade_thresholds(legacy)
+        gate.validate_thresholds(upgraded)
+
+        self.assertTrue(changed)
+        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["metrics"]["branch_coverage_limit"], 100)
+        self.assertEqual(upgraded["slow_tests"]["max_test_seconds"], 5)
+        self.assertEqual(
+            upgraded["extensibility"]["max_core_to_extension_dependencies"], 0
+        )
+        self.assertEqual(upgraded["error_handling"]["max_silent_handlers"], 0)
+
+    def test_branch_coverage_is_measured_per_function(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "choose.py"
+            source.write_text(
+                "def choose(flag):\n    if flag:\n        return 1\n    return 0\n",
+                encoding="utf-8",
+            )
+            report = root / "coverage.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "meta": {"branch_coverage": True},
+                        "files": {
+                            str(source): {
+                                "executed_lines": [1, 2, 3, 4],
+                                "missing_lines": [],
+                                "executed_branches": [[2, 3]],
+                                "missing_branches": [[2, 4]],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            coverage = gate.parse_coverage_json(report, root)
+            functions = gate.build_function_metrics(
+                [source],
+                root,
+                coverage,
+                branch_coverage_limit=100,
+                branch_coverage_required=True,
+            )
+
+        self.assertEqual(functions[0].covered_branches, 1)
+        self.assertEqual(functions[0].total_branches, 2)
+        self.assertEqual(functions[0].branch_coverage_percent, 50)
+        self.assertTrue(functions[0].branch_coverage_measured)
+        self.assertFalse(functions[0].passed)
+
+    def test_junit_report_identifies_slow_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            junit = root / "junit.xml"
+            junit.write_text(
+                """<testsuite name="suite" tests="2" time="6.3">
+                <testcase classname="tests.Fast" name="test_fast" file="tests/test_fast.py" time="0.1" />
+                <testcase classname="tests.Slow" name="test_slow" file="tests/test_slow.py" time="6.2" />
+                </testsuite>""",
+                encoding="utf-8",
+            )
+            config = gate.default_config()
+            config["slow_tests"].update(
+                {"report": str(junit), "format": "junit", "max_test_seconds": 5}
+            )
+            baseline = gate.CommandResult(["tests"], 0, "ok", duration_seconds=6.3)
+
+            result, timings = gate.run_slow_test_gate(root, config, baseline, root)
+
+        self.assertFalse(result.passed)
+        self.assertEqual(
+            [item.name for item in timings],
+            ["tests.Slow.test_slow", "tests.Fast.test_fast"],
+        )
+        self.assertIn("test_slow", result.details[0])
+
+    def test_unittest_and_pytest_console_timings_are_supported(self) -> None:
+        timings = gate.console_test_timings(
+            """\
+1.250s     test_slow (tests.test_api.ApiTests.test_slow)
+0.200s call     tests/test_web.py::test_page
+"""
+        )
+
+        self.assertEqual([item.duration_seconds for item in timings], [1.25, 0.2])
+        self.assertEqual(timings[0].path, "tests/test_api.py")
+        self.assertEqual(timings[1].path, "tests/test_web.py")
+
+    def test_requested_extended_metrics_cannot_be_disabled(self) -> None:
+        config = gate.default_config()
+        config["slow_tests"]["enabled"] = False
+        config["extensibility"]["enabled"] = False
+        config["error_handling"]["enabled"] = False
+        baseline = gate.CommandResult(["tests"], 0, "ok", duration_seconds=0.1)
+
+        slow, _ = gate.run_slow_test_gate(Path.cwd(), config, baseline, Path.cwd())
+        extensibility, _, _ = gate.run_extensibility_gate(Path.cwd(), config, [], [])
+        errors = gate.run_error_handling_gate(config, [])
+
+        self.assertFalse(slow.passed)
+        self.assertFalse(extensibility.passed)
+        self.assertFalse(errors.passed)
+
+    def test_extensibility_checks_contracts_and_core_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            core = root / "core" / "service.py"
+            extension = root / "extensions" / "plugin.py"
+            core.parent.mkdir()
+            extension.parent.mkdir()
+            core.write_text("from extensions.plugin import VALUE\n", encoding="utf-8")
+            extension.write_text("VALUE = 1\n", encoding="utf-8")
+            config = gate.default_config()
+            config["extensibility"].update(
+                {
+                    "core": ["core/**"],
+                    "extensions": ["extensions/**"],
+                    "scenarios": [
+                        {
+                            "name": "load a configured plugin",
+                            "command": [sys.executable, "-c", "pass"],
+                        }
+                    ],
+                }
+            )
+
+            result, scenarios, dependencies = gate.run_extensibility_gate(
+                root, config, [core, extension], [core, extension]
+            )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(scenarios[0].passed)
+        self.assertEqual(len(dependencies), 1)
+        self.assertEqual(dependencies[0].source, "core/service.py")
+        self.assertEqual(dependencies[0].target, "extensions/plugin.py")
+
+    def test_error_paths_measure_coverage_and_silent_handlers(self) -> None:
+        source_text = """\
+def ignored():
+    try:
+        risky()
+    except ValueError:
+        pass
+
+def handled():
+    try:
+        risky()
+    except OSError:
+        return None
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "errors.py"
+            source.write_text(source_text, encoding="utf-8")
+            coverage = gate.CoverageData(
+                lines={"errors.py": {5: 1, 11: 0}}, branch_capable=True
+            )
+            paths = gate.scan_error_paths(source, root, coverage)
+            config = gate.default_config()
+            result = gate.run_error_handling_gate(config, paths)
+
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(sum(item.covered for item in paths), 1)
+        self.assertEqual(sum(item.silent for item in paths), 1)
+        self.assertFalse(result.passed)
+        self.assertIn("50% failure-path coverage", result.summary)
+        self.assertIn("1 silent", result.summary)
+
+    def test_normalized_adapter_cannot_hide_an_unreported_error_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "errors.py"
+            source.write_text(
+                "def ignored():\n"
+                "    try:\n"
+                "        risky()\n"
+                "    except ValueError:\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            function = gate.FunctionMetric(
+                "errors.py", "ignored", 1, 5, 2, 3, 3, 100, 2, "adapter"
+            )
+
+            paths = gate.merged_error_paths([source], root, [function])
+            result = gate.run_error_handling_gate(gate.default_config(), paths)
+
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].coverage_measured)
+        self.assertTrue(paths[0].silent)
+        self.assertFalse(result.passed)
+
+    def test_branch_failure_is_actionable_in_terminal_items(self) -> None:
+        item = {
+            "path": "src/app.ts",
+            "line": 4,
+            "name": "choose",
+            "coverage_percent": 100,
+            "branch_coverage_percent": 0,
+            "branch_coverage_measured": False,
+            "complexity": 2,
+            "craap_score": 2,
+        }
+
+        record = quality_report.function_record(
+            item, quality_report.metric_limits({"thresholds": {}})
+        )
+
+        self.assertEqual(record["metric"], "branch coverage")
+        self.assertIn("branch coverage not measured", record["text"])
+        self.assertIn("report branch outcomes", record["hint"])
+
+        limits = quality_report.metric_limits({"thresholds": {}})
+        measured = {
+            **item,
+            "branch_coverage_measured": True,
+            "branch_coverage_percent": 50,
+        }
+        measured_record = quality_report.function_record(measured, limits)
+        self.assertIn("branch coverage 50%", measured_record["text"])
+        self.assertIn("uncovered branch outcomes", measured_record["hint"])
+        self.assertFalse(
+            quality_report.branch_failure(
+                {**measured, "branch_coverage_percent": 100}, limits
+            )
+        )
+        self.assertIsNone(
+            quality_report.branch_hint(
+                {**measured, "branch_coverage_percent": 100}, limits
+            )
+        )
+        self.assertEqual(quality_report.branch_failure_text(item, False), "")
+        self.assertEqual(quality_report.function_metric(True, True), "coverage")
+        self.assertEqual(quality_report.function_metric(False, False), "complexity")
+
+    def test_state_and_html_show_all_six_metrics(self) -> None:
+        function = gate.FunctionMetric(
+            path="app.py",
+            name="choose",
+            start_line=1,
+            end_line=4,
+            complexity=2,
+            covered_lines=4,
+            total_lines=4,
+            coverage_percent=100,
+            craap_score=2,
+            parser="python-ast",
+            covered_branches=2,
+            total_branches=2,
+            branch_coverage_percent=100,
+            branch_coverage_measured=True,
+            branch_coverage_required=True,
+        )
+        timing = gate.TestTiming("suite.test", "tests/test_app.py", 1.25, "passed")
+        scenario = gate.ExtensionScenario("load plugin", True, 0.1, "")
+        error_path = gate.ErrorPath(
+            "app.py", 4, "except ValueError", True, False, "python-ast"
+        )
+        probe = gate.SmokeProbe("draw three shapes", True, "count=3")
+        integrity = gate.TestIntegrityViolation(
+            "tests/App.test.tsx",
+            4,
+            "same-package mock",
+            "src/api.ts",
+            "composed-root test mocks production module src/api.ts",
+        )
+        report = gate.AnalysisReport(
+            root="/tmp/example",
+            generated_at="now",
+            languages=["Python"],
+            gates=[
+                gate.GateResult("quality", "Quality", True, "ok"),
+                gate.GateResult(
+                    "smoke", "Runs (smoke)", True, "1/1", smoke_probes=[probe]
+                ),
+                gate.GateResult("test_integrity", "Test integrity", False, "1"),
+            ],
+            functions=[function],
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+            test_timings=[timing],
+            suite_duration_seconds=1.5,
+            extension_scenarios=[scenario],
+            extension_dependencies=[],
+            error_paths=[error_path],
+            smoke_probes=[probe],
+            test_integrity_violations=[integrity],
+            thresholds=gate.default_thresholds(),
+        )
+
+        rendered = gate.html_report(report)
+        state = gate.analysis_state(
+            gate,
+            report,
+            Path("report.html"),
+            Path("state.json"),
+            0,
+        )
+
+        for label in (
+            "Branch coverage",
+            "Slowest test",
+            "Extension contracts",
+            "Core → extension",
+            "Failure-path coverage",
+            "Silent handlers",
+            "Core user story probes",
+            "Anti-vacuous mock findings",
+        ):
+            with self.subTest(label=label):
+                self.assertIn(label, rendered)
+        self.assertEqual(
+            state["metrics"]["functions"][0]["branch_coverage_percent"], 100
+        )
+        self.assertEqual(state["metrics"]["slow_tests"][0]["duration_seconds"], 1.25)
+        self.assertEqual(
+            state["metrics"]["extensibility"]["contract_coverage_percent"], 100
+        )
+        self.assertEqual(
+            state["metrics"]["error_handling"]["failure_path_coverage_percent"], 100
+        )
+        self.assertEqual(state["metrics"]["smoke_story"][0]["name"], probe.name)
+        self.assertEqual(
+            state["failures"]["test_integrity"][0]["kind"], "same-package mock"
+        )
+        records = quality_report.item_records(state)
+        self.assertIn("tests/App.test.tsx", [item["path"] for item in records])
 
 
 class EmptyScopeAnalysisTests(unittest.TestCase):

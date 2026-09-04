@@ -195,7 +195,7 @@ def validate_staged_thresholds(directory: Path) -> None:
     thresholds = json.loads(
         (directory / "quality-thresholds.json").read_text(encoding="utf-8")
     )
-    if not isinstance(thresholds, dict) or thresholds.get("schema_version") != 1:
+    if not isinstance(thresholds, dict) or thresholds.get("schema_version") != 2:
         raise RuntimeError("downloaded quality-thresholds.json is invalid")
 
 

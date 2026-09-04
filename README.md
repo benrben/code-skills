@@ -22,16 +22,17 @@ flowchart LR
 
 Bootstrap the gate before the first source file, keep every step green, commit
 each green step, and hand off only after the whole-repository ship report —
-which also starts the application once and loads it in a headless browser
-(`smoke.commands`) and rejects `source.exclude` entries that hide production
-files (the `Gate scope` row).
+which also proves the configured core user story from outside the process
+(`smoke.story`; `smoke.commands` remains available for a CLI or library),
+checks composed-root tests for narrow anti-vacuous mocks, and rejects
+`source.exclude` entries that hide production files (the `Gate scope` row).
 
 The nine rules of [SKILL.md](skills/code-discipline/SKILL.md), one line each:
 
 1. Deliverables first, gate before source — `--init` before the first feature.
 2. Read the report, not the state file; fix one file per cycle.
 3. Run the loop in the foreground only; never background it.
-4. The application must run: a configured smoke start is part of the report.
+4. The core user story must run: structured smoke probes are part of the report.
 5. Not finished until the ship report is green; never narrow the gate.
 6. Mutation and flaky testing run only when asked.
 7. Green means hand off now — nothing is added after green.
@@ -104,13 +105,18 @@ python3 .agents/skills/code-discipline/scripts/quality_loop.py --root .   # ship
 ```
 
 Targeted checks combine and never certify: `--lint`, `--types`, `--contracts`,
-`--tests`, `--coverage`, `--complexity`, `--craap`, `--loc`, `--dead-code`,
-`--deps`, `--smoke`, plus `--flaky` and `--mutation` on request. Every run
+`--tests`, `--coverage`, `--branches`, `--slow-tests`,
+`--extension-contracts`, `--extension-deps`, `--failure-paths`,
+`--silent-errors`, `--test-integrity`, `--complexity`, `--craap`, `--loc`,
+`--dead-code`, `--deps`, `--smoke`, plus `--flaky` and `--mutation` on request. Every run
 prints each gate, `Coverage today`, `Since last run: fixed · remaining · new`,
 a `To fix` list grouped by file when it is long, the exact next command, and
 `QUALITY_LOOP=` / `ITEMS_TO_FIX=`. Every run writes `.quality/quality-gate-report.html`
 and `.quality/quality-gate-state.json`; `--html PATH` moves the HTML. Defaults:
-600 lines per file, 100% per-function coverage, complexity and CRAAP at 6. The
+600 lines per file, 100% per-function line and branch coverage, 5 seconds per
+test, 300 seconds per suite, 100% extension contracts, no core-to-extension
+imports, 100% failure-path coverage, no silent handlers, and complexity and
+CRAAP at 6. The
 [setup guide](skills/code-discipline/references/repository-setup.md) documents
 configuration, adapters, and metric formulas; the
 [quality-loop reference](skills/code-discipline/references/quality-loop.md)
@@ -129,7 +135,7 @@ configure this repository's real toolchain, verify both scripts with
 ## Verify and develop
 
 ```bash
-python3 .agents/skills/code-discipline/scripts/quality_loop.py --version   # 3.5.0
+python3 .agents/skills/code-discipline/scripts/quality_loop.py --version   # 3.7.0
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m unittest tests.test_repo_quality_gate
 .venv/bin/python skills/code-discipline/scripts/quality_loop.py --root . --no-install
