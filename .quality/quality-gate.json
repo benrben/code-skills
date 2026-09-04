@@ -17,6 +17,8 @@
       ".venv/bin/python",
       "-m",
       "unittest",
+      "--durations",
+      "0",
       "tests.test_repo_quality_gate"
     ],
     "timeout_seconds": 600
@@ -122,6 +124,36 @@
     "coverage_report": ".quality/coverage.json",
     "coverage_format": "coverage-json",
     "timeout_seconds": 600
+  },
+  "slow_tests": {
+    "enabled": true,
+    "require_individual_timings": true,
+    "timeout_seconds": 600
+  },
+  "extensibility": {
+    "enabled": true,
+    "required": true,
+    "scenarios": [
+      {
+        "name": "normalized metrics adapter accepts a custom language",
+        "command": [
+          ".venv/bin/python",
+          "-m",
+          "unittest",
+          "tests.test_repo_quality_gate.QualityGateEndToEndTests.test_complete_generic_adapter_run_passes_and_writes_html"
+        ]
+      }
+    ],
+    "core": [
+      "skills/code-discipline/scripts/repo_quality_gate.py"
+    ],
+    "extensions": [
+      "skills/code-discipline/scripts/quality_report.py"
+    ],
+    "timeout_seconds": 300
+  },
+  "error_handling": {
+    "enabled": true
   },
   "mutation": {
     "enabled": true,

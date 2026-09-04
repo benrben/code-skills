@@ -41,7 +41,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "4.1.0"
+VERSION = "4.3.0"
 QUALITY_DIRECTORY = ".quality"
 CONFIG_NAME = f"{QUALITY_DIRECTORY}/quality-gate.json"
 THRESHOLDS_NAME = f"{QUALITY_DIRECTORY}/quality-thresholds.json"
@@ -82,8 +82,18 @@ THRESHOLD_KEYS = {
     "metrics": {
         "max_test_failures",
         "coverage_limit",
+        "branch_coverage_limit",
         "complexity_limit",
         "craap_limit",
+    },
+    "slow_tests": {"max_test_seconds", "max_suite_seconds"},
+    "extensibility": {
+        "contract_coverage_limit",
+        "max_core_to_extension_dependencies",
+    },
+    "error_handling": {
+        "failure_path_coverage_limit",
+        "max_silent_handlers",
     },
     "file_loc": {"max_lines"},
     "dead_code": {"max_findings"},
@@ -282,6 +292,26 @@ class CheckCommand:
 
 
 @dataclasses.dataclass
+class CoverageData:
+    lines: dict[str, dict[int, int]] = dataclasses.field(default_factory=dict)
+    branches: dict[str, dict[int, list[int]]] = dataclasses.field(default_factory=dict)
+    branch_files: set[str] = dataclasses.field(default_factory=set)
+    branch_capable: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class ErrorPath:
+    path: str
+    line: int
+    kind: str
+    covered: bool
+    silent: bool
+    parser: str
+    coverage_measured: bool = True
+    coverage_kind: str = "line"
+
+
+@dataclasses.dataclass
 class FunctionMetric:
     path: str
     name: str
@@ -297,13 +327,25 @@ class FunctionMetric:
     complexity_limit: float = 6.0
     craap_limit: float = 6.0
     coverage_measured: bool = True
+    covered_branches: int = 0
+    total_branches: int = 0
+    branch_coverage_percent: float = 100.0
+    branch_coverage_measured: bool = False
+    branch_coverage_limit: float = 100.0
+    branch_coverage_required: bool = False
+    error_paths: list[ErrorPath] = dataclasses.field(default_factory=list)
 
     @property
     def passed(self) -> bool:
         if not self.coverage_measured:
             return self.complexity <= self.complexity_limit
+        branch_coverage_passed = not self.branch_coverage_required or (
+            self.branch_coverage_measured
+            and self.branch_coverage_percent >= self.branch_coverage_limit
+        )
         return (
             self.coverage_percent >= self.coverage_limit
+            and branch_coverage_passed
             and self.complexity <= self.complexity_limit
             and self.craap_score <= self.craap_limit
         )
@@ -356,6 +398,45 @@ class DependencyViolation:
     line: int = 0
 
 
+@dataclasses.dataclass(frozen=True)
+class TestTiming:
+    name: str
+    path: str
+    duration_seconds: float
+    status: str = "passed"
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtensionScenario:
+    name: str
+    passed: bool
+    duration_seconds: float
+    output: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtensionDependency:
+    source: str
+    target: str
+    line: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SmokeProbe:
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class TestIntegrityViolation:
+    path: str
+    line: int
+    kind: str
+    target: str
+    detail: str
+
+
 @dataclasses.dataclass
 class GateResult:
     key: str
@@ -369,6 +450,7 @@ class GateResult:
     deferred: bool = False
     skipped: bool = False
     off: bool = False
+    smoke_probes: list[SmokeProbe] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -428,6 +510,19 @@ class AnalysisReport:
     tool_setup: list[CommandResult]
     notes: list[str]
     files: list[FileLineMetric] = dataclasses.field(default_factory=list)
+    test_timings: list[TestTiming] = dataclasses.field(default_factory=list)
+    suite_duration_seconds: float | None = None
+    extension_scenarios: list[ExtensionScenario] = dataclasses.field(
+        default_factory=list
+    )
+    extension_dependencies: list[ExtensionDependency] = dataclasses.field(
+        default_factory=list
+    )
+    error_paths: list[ErrorPath] = dataclasses.field(default_factory=list)
+    smoke_probes: list[SmokeProbe] = dataclasses.field(default_factory=list)
+    test_integrity_violations: list[TestIntegrityViolation] = dataclasses.field(
+        default_factory=list
+    )
     thresholds: dict[str, Any] = dataclasses.field(default_factory=dict)
     rerun_command: str | None = None
     mode: str = "full"
@@ -736,6 +831,31 @@ def threshold_number(thresholds: dict[str, Any], section: str, key: str) -> int 
     return value if isinstance(value, (int, float)) else 0
 
 
+def upgrade_thresholds(thresholds: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Upgrade the original schema without changing repository-owned files."""
+    if thresholds.get("schema_version") != 1:
+        return thresholds, False
+    upgraded = dict(thresholds)
+    upgraded["schema_version"] = 2
+    upgraded["metrics"] = {
+        **dict(thresholds.get("metrics", {})),
+        "branch_coverage_limit": 100,
+    }
+    upgraded["slow_tests"] = {
+        "max_test_seconds": 5,
+        "max_suite_seconds": 300,
+    }
+    upgraded["extensibility"] = {
+        "contract_coverage_limit": 100,
+        "max_core_to_extension_dependencies": 0,
+    }
+    upgraded["error_handling"] = {
+        "failure_path_coverage_limit": 100,
+        "max_silent_handlers": 0,
+    }
+    return upgraded, True
+
+
 def validate_thresholds(thresholds: dict[str, Any]) -> None:
     expected_root = {"schema_version", *THRESHOLD_KEYS}
     unknown_root = sorted(set(thresholds) - expected_root)
@@ -747,8 +867,8 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
         if unknown_root:
             problems.append(f"unknown keys: {', '.join(unknown_root)}")
         raise ValueError("Invalid threshold file (" + "; ".join(problems) + ")")
-    if thresholds["schema_version"] != 1:
-        raise ValueError("Threshold schema_version must be 1")
+    if thresholds["schema_version"] != 2:
+        raise ValueError("Threshold schema_version must be 2")
     for section, keys in THRESHOLD_KEYS.items():
         value = thresholds.get(section)
         if not isinstance(value, dict):
@@ -771,8 +891,19 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
     coverage = threshold_number(thresholds, "metrics", "coverage_limit")
     if coverage > 100:
         raise ValueError("Threshold metrics.coverage_limit cannot exceed 100")
+    percentage_paths = (
+        ("metrics", "branch_coverage_limit"),
+        ("extensibility", "contract_coverage_limit"),
+        ("error_handling", "failure_path_coverage_limit"),
+    )
+    for section, key in percentage_paths:
+        if threshold_number(thresholds, section, key) > 100:
+            raise ValueError(f"Threshold {section}.{key} cannot exceed 100")
     if threshold_number(thresholds, "file_loc", "max_lines") < 1:
         raise ValueError("Threshold file_loc.max_lines must be at least 1")
+    for key in ("max_test_seconds", "max_suite_seconds"):
+        if threshold_number(thresholds, "slow_tests", key) <= 0:
+            raise ValueError(f"Threshold slow_tests.{key} must be greater than 0")
     if threshold_number(thresholds, "flaky_tests", "runs") < 2:
         raise ValueError("Threshold flaky_tests.runs must be at least 2")
     integer_paths = (
@@ -780,6 +911,8 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
         ("types", "max_errors"),
         ("contracts", "max_violations"),
         ("metrics", "max_test_failures"),
+        ("extensibility", "max_core_to_extension_dependencies"),
+        ("error_handling", "max_silent_handlers"),
         ("file_loc", "max_lines"),
         ("dead_code", "max_findings"),
         ("flaky_tests", "runs"),
@@ -795,6 +928,8 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
         ("types", "max_errors"),
         ("contracts", "max_violations"),
         ("metrics", "max_test_failures"),
+        ("extensibility", "max_core_to_extension_dependencies"),
+        ("error_handling", "max_silent_handlers"),
         ("dead_code", "max_findings"),
         ("flaky_tests", "max_failures"),
         ("mutation", "max_surviving_mutants"),
@@ -814,8 +949,12 @@ def load_thresholds(path: Path) -> tuple[dict[str, Any], list[str]]:
         raise ValueError(f"Cannot read thresholds {path}: {error}") from error
     if not isinstance(loaded, dict):
         raise ValueError(f"Threshold file {path} must contain a JSON object")
+    loaded, upgraded = upgrade_thresholds(loaded)
     validate_thresholds(loaded)
-    return loaded, [f"Loaded quality thresholds from {path}"]
+    note = f"Loaded quality thresholds from {path}"
+    if upgraded:
+        note += " and applied schema 2 defaults in memory"
+    return loaded, [note]
 
 
 def default_thresholds() -> dict[str, Any]:
@@ -880,6 +1019,38 @@ def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
             "coverage_commands": [],
             "coverage_report": None,
             "coverage_format": "auto",
+            "branch_coverage_required": True,
+        },
+        "slow_tests": {
+            "enabled": True,
+            "command": None,
+            "report": None,
+            "format": "auto",
+            "require_individual_timings": False,
+            "timeout_seconds": 600,
+        },
+        "extensibility": {
+            "enabled": "auto",
+            "required": False,
+            "scenarios": [],
+            "core": [],
+            "extensions": [],
+            "timeout_seconds": 300,
+        },
+        "error_handling": {
+            "enabled": True,
+        },
+        "test_integrity": {
+            "enabled": "auto",
+            "required": False,
+            "composed_root_tests": [
+                "**/App.test.*",
+                "**/app.test.*",
+                "**/Root.test.*",
+                "**/root.test.*",
+            ],
+            "forbid_same_package_mocks": True,
+            "forbid_null_render_surfaces": True,
         },
         "mutation": {
             "enabled": True,
@@ -905,6 +1076,7 @@ def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
         "smoke": {
             "enabled": "auto",
             "commands": [],
+            "story": None,
             "timeout_seconds": 300,
         },
         "flaky_tests": {
@@ -2019,8 +2191,15 @@ SELECTABLE_CHECKS: dict[str, str] = {
     "contracts": "contracts",
     "tests": "quality",
     "coverage": "quality",
+    "branches": "quality",
     "complexity": "quality",
     "craap": "quality",
+    "slow-tests": "slow_tests",
+    "extension-contracts": "extensibility",
+    "extension-deps": "extensibility",
+    "failure-paths": "error_handling",
+    "silent-errors": "error_handling",
+    "test-integrity": "test_integrity",
     "loc": "file_loc",
     "dead-code": "dead_code",
     "deps": "dependencies",
@@ -2028,7 +2207,7 @@ SELECTABLE_CHECKS: dict[str, str] = {
     "mutation": "mutation",
     "smoke": "smoke",
 }
-METRIC_FOCUS_PRIORITY = ("craap", "coverage", "complexity", "tests")
+METRIC_FOCUS_PRIORITY = ("craap", "branches", "coverage", "complexity", "tests")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2053,7 +2232,10 @@ class GateSelection:
 def selected_gate_keys(names: Sequence[str]) -> frozenset[str] | None:
     if not names:
         return None
-    return frozenset(SELECTABLE_CHECKS[name] for name in names)
+    keys = {SELECTABLE_CHECKS[name] for name in names}
+    if "failure-paths" in names:
+        keys.add("quality")
+    return frozenset(keys)
 
 
 def metrics_focus(names: Sequence[str]) -> str | None:
@@ -2371,6 +2553,573 @@ def run_flaky_test_gate(
     )
 
 
+def test_timing_status(node: ET.Element) -> str:
+    if node.find("failure") is not None:
+        return "failed"
+    if node.find("error") is not None:
+        return "error"
+    if node.find("skipped") is not None:
+        return "skipped"
+    return "passed"
+
+
+UNITTEST_TIMING = re.compile(r"^([0-9.]+)s\s+(.+?)\s+\(([^)]+)\)$")
+PYTEST_TIMING = re.compile(r"^([0-9.]+)s\s+(?:call|setup|teardown)\s+(.+)$")
+
+
+def console_test_timings(output: str) -> list[TestTiming]:
+    timings: list[TestTiming] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        match = UNITTEST_TIMING.match(stripped)
+        if match:
+            seconds, name, identifier = match.groups()
+            module = identifier.split(".", 2)
+            path = "/".join(module[:2]) + ".py" if len(module) >= 2 else identifier
+            timings.append(TestTiming(f"{name} ({identifier})", path, float(seconds)))
+            continue
+        match = PYTEST_TIMING.match(stripped)
+        if match:
+            seconds, identifier = match.groups()
+            timings.append(
+                TestTiming(identifier, identifier.split("::", 1)[0], float(seconds))
+            )
+    return sorted(timings, key=lambda item: (-item.duration_seconds, item.name))
+
+
+def load_test_timings(
+    path: Path, root: Path, format_name: str = "auto"
+) -> list[TestTiming]:
+    if format_name == "auto":
+        format_name = "junit" if path.suffix.lower() == ".xml" else "json"
+    if format_name == "junit":
+        tree = ET.parse(path)
+        timings = []
+        for node in tree.findall(".//testcase"):
+            name = node.attrib.get("name", "unnamed test")
+            class_name = node.attrib.get("classname", "").strip()
+            qualified_name = f"{class_name}.{name}" if class_name else name
+            file_name = node.attrib.get("file", class_name.replace(".", "/"))
+            timings.append(
+                TestTiming(
+                    qualified_name,
+                    normalize_report_path(file_name, root),
+                    float(node.attrib.get("time", "0")),
+                    test_timing_status(node),
+                )
+            )
+        return sorted(timings, key=lambda item: (-item.duration_seconds, item.name))
+    if format_name == "json":
+        value = json.loads(path.read_text(encoding="utf-8"))
+        rows = value.get("tests", []) if isinstance(value, dict) else []
+        if not isinstance(rows, list):
+            raise ValueError("Slow-test JSON must contain a 'tests' array")
+        timings = [
+            TestTiming(
+                str(row["name"]),
+                normalize_report_path(str(row.get("path", "")), root),
+                float(row["duration_seconds"]),
+                str(row.get("status", "passed")),
+            )
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return sorted(timings, key=lambda item: (-item.duration_seconds, item.name))
+    raise ValueError(f"Unknown slow-test report format: {format_name}")
+
+
+def run_slow_test_gate(
+    root: Path,
+    config: dict[str, Any],
+    baseline: CommandResult | None,
+    workspace: Path,
+) -> tuple[GateResult, list[TestTiming]]:
+    section = config["slow_tests"]
+    if section.get("enabled", True) is False:
+        return GateResult(
+            "slow_tests",
+            "Slow tests",
+            False,
+            "Slow-test detection is disabled; a requested gate cannot be skipped.",
+        ), []
+    if baseline is None:
+        return GateResult(
+            "slow_tests",
+            "Slow tests",
+            True,
+            "Not applicable: no complete test command was available.",
+            applicable=False,
+        ), []
+    if baseline.returncode != 0:
+        return GateResult(
+            "slow_tests",
+            "Slow tests",
+            True,
+            "Not evaluated because the baseline test suite failed.",
+            applicable=False,
+        ), []
+    substitutions = {
+        "root": str(root),
+        "report": str(workspace / "slow-tests.json"),
+    }
+    report_value = section.get("report")
+    report_path = (
+        resolve_config_path(substitute_text(str(report_value), substitutions), root)
+        if report_value
+        else None
+    )
+    before = report_fingerprint(report_path) if report_path else None
+    command = command_list(section.get("command"), substitutions)
+    command_results: list[CommandResult] = []
+    if command:
+        command_result = run_command(
+            command, root, int(section.get("timeout_seconds", 600))
+        )
+        command_results.append(command_result)
+        if command_result.returncode != 0:
+            return GateResult(
+                "slow_tests",
+                "Slow tests",
+                False,
+                "The slow-test timing command failed.",
+                [format_command(command_result)],
+                command_results,
+                [
+                    (
+                        "Repair test timing adapter",
+                        generic_adapter_prompt("slow-test", command_result),
+                    )
+                ],
+            ), []
+        if report_path and not report_was_refreshed(report_path, before):
+            return GateResult(
+                "slow_tests",
+                "Slow tests",
+                False,
+                "The slow-test timing command did not produce a fresh report.",
+                command_results=command_results,
+            ), []
+    timings: list[TestTiming] = []
+    if report_path:
+        if not report_path.exists():
+            return GateResult(
+                "slow_tests",
+                "Slow tests",
+                False,
+                f"Slow-test report not found: {report_path}",
+                command_results=command_results,
+            ), []
+        try:
+            timings = load_test_timings(
+                report_path, root, str(section.get("format", "auto"))
+            )
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            json.JSONDecodeError,
+            ET.ParseError,
+        ) as error:
+            return GateResult(
+                "slow_tests",
+                "Slow tests",
+                False,
+                f"Slow-test report could not be parsed: {error}",
+                command_results=command_results,
+            ), []
+    else:
+        timings = console_test_timings(baseline.stdout)
+    if not timings and section.get("require_individual_timings", False):
+        return GateResult(
+            "slow_tests",
+            "Slow tests",
+            False,
+            "Individual test timing is required, but no slow_tests.report is configured.",
+        ), []
+    max_test = float(section.get("max_test_seconds", 5))
+    max_suite = float(section.get("max_suite_seconds", 300))
+    slow = [item for item in timings if item.duration_seconds > max_test]
+    suite_slow = baseline.duration_seconds > max_suite
+    details = [
+        f"{item.path} {item.name}: {item.duration_seconds:.3f}s (max {max_test:g}s)"
+        for item in slow
+    ]
+    if suite_slow:
+        details.insert(
+            0,
+            f"Complete suite: {baseline.duration_seconds:.3f}s (max {max_suite:g}s)",
+        )
+    if slow or suite_slow:
+        return GateResult(
+            "slow_tests",
+            "Slow tests",
+            False,
+            f"{len(slow)} individual tests exceed {max_test:g}s; suite duration {baseline.duration_seconds:.3f}s (max {max_suite:g}s).",
+            details,
+            command_results,
+        ), timings
+    timing_note = (
+        f"; {len(timings)} individual tests measured"
+        if timings
+        else "; individual timings were not configured"
+    )
+    return GateResult(
+        "slow_tests",
+        "Slow tests",
+        True,
+        f"Suite duration {baseline.duration_seconds:.3f}s is within {max_suite:g}s{timing_note}.",
+        command_results=command_results,
+    ), timings
+
+
+def extension_scenario(
+    root: Path, row: dict[str, Any], timeout: int
+) -> tuple[ExtensionScenario, CommandResult | None]:
+    name = str(row.get("name", "unnamed extension scenario"))
+    command = command_list(row.get("command"))
+    if not command:
+        return ExtensionScenario(name, False, 0.0, "missing command"), None
+    result = run_command(command, root, timeout)
+    return (
+        ExtensionScenario(
+            name,
+            result.returncode == 0,
+            result.duration_seconds,
+            result.stdout,
+        ),
+        result,
+    )
+
+
+def core_extension_dependencies(
+    root: Path,
+    source_files: Sequence[Path],
+    resolution_files: Sequence[Path],
+    core_patterns: Sequence[str],
+    extension_patterns: Sequence[str],
+) -> list[ExtensionDependency]:
+    dependencies: list[ExtensionDependency] = []
+    for source in source_files:
+        relative = normalize_path(source, root)
+        if not matches_any(relative, core_patterns):
+            continue
+        for specifier, line in import_specs(source):
+            target = resolve_import(source, specifier, root, resolution_files)
+            if target and matches_any(target, extension_patterns):
+                dependencies.append(ExtensionDependency(relative, target, line))
+    return dependencies
+
+
+def run_extensibility_gate(
+    root: Path,
+    config: dict[str, Any],
+    source_files: Sequence[Path],
+    resolution_files: Sequence[Path],
+) -> tuple[GateResult, list[ExtensionScenario], list[ExtensionDependency]]:
+    section = config["extensibility"]
+    if section.get("enabled", "auto") is False:
+        return (
+            GateResult(
+                "extensibility",
+                "Extensibility",
+                False,
+                "Extensibility checks are disabled; a requested gate cannot be skipped.",
+            ),
+            [],
+            [],
+        )
+    scenario_rows = section.get("scenarios", [])
+    core_patterns = [str(item) for item in section.get("core", [])]
+    extension_patterns = [str(item) for item in section.get("extensions", [])]
+    if not scenario_rows and not (core_patterns and extension_patterns):
+        required = bool(section.get("required", False))
+        return (
+            GateResult(
+                "extensibility",
+                "Extensibility",
+                not required,
+                "No extension scenarios or core/extension paths are configured.",
+                applicable=required,
+            ),
+            [],
+            [],
+        )
+    if not isinstance(scenario_rows, list):
+        raise ValueError("extensibility.scenarios must be an array")
+    timeout = int(section.get("timeout_seconds", 300))
+    scenarios: list[ExtensionScenario] = []
+    command_results: list[CommandResult] = []
+    for row in scenario_rows:
+        if not isinstance(row, dict):
+            raise ValueError("every extensibility scenario must be an object")
+        scenario, result = extension_scenario(root, row, timeout)
+        scenarios.append(scenario)
+        if result:
+            command_results.append(result)
+    dependencies = core_extension_dependencies(
+        root,
+        source_files,
+        resolution_files,
+        core_patterns,
+        extension_patterns,
+    )
+    contract_percent = (
+        100.0 * sum(item.passed for item in scenarios) / len(scenarios)
+        if scenarios
+        else 100.0
+    )
+    contract_limit = float(section.get("contract_coverage_limit", 100))
+    dependency_limit = int(section.get("max_core_to_extension_dependencies", 0))
+    passed = (
+        contract_percent >= contract_limit and len(dependencies) <= dependency_limit
+    )
+    details = [
+        f"Scenario {item.name}: {'PASS' if item.passed else 'FAIL'} ({item.duration_seconds:.3f}s)"
+        for item in scenarios
+        if not item.passed
+    ]
+    details.extend(
+        f"{item.source}:{item.line} imports extension {item.target}"
+        for item in dependencies
+    )
+    return (
+        GateResult(
+            "extensibility",
+            "Extensibility",
+            passed,
+            f"Extension contracts {contract_percent:g}% (target {contract_limit:g}%); {len(dependencies)} core-to-extension dependencies (max {dependency_limit}).",
+            details,
+            command_results,
+        ),
+        scenarios,
+        dependencies,
+    )
+
+
+def run_error_handling_gate(
+    config: dict[str, Any],
+    paths: Sequence[ErrorPath],
+    measure_failure_paths: bool = True,
+    measure_silent_handlers: bool = True,
+) -> GateResult:
+    section = config["error_handling"]
+    if section.get("enabled", True) is False:
+        return GateResult(
+            "error_handling",
+            "Error handling",
+            False,
+            "Error-handling checks are disabled; a requested gate cannot be skipped.",
+        )
+    measured = [item for item in paths if item.coverage_measured]
+    covered = sum(item.covered for item in paths)
+    coverage_percent = 100.0 * covered / len(paths) if paths else 100.0
+    silent = [item for item in paths if item.silent]
+    coverage_limit = float(section.get("failure_path_coverage_limit", 100))
+    silent_limit = int(section.get("max_silent_handlers", 0))
+    coverage_passed = not measure_failure_paths or (
+        len(measured) == len(paths) and coverage_percent >= coverage_limit
+    )
+    silent_passed = not measure_silent_handlers or len(silent) <= silent_limit
+    details: list[str] = []
+    if measure_failure_paths:
+        details.extend(
+            f"{item.path}:{item.line} {item.kind}: "
+            + ("not covered" if item.coverage_measured else "coverage not measured")
+            for item in paths
+            if not item.covered
+        )
+    if measure_silent_handlers:
+        details.extend(
+            f"{item.path}:{item.line} {item.kind}: silent error handler"
+            for item in silent
+        )
+    summary_parts = []
+    if measure_failure_paths:
+        summary_parts.append(
+            f"{coverage_percent:g}% failure-path coverage (target {coverage_limit:g}%)"
+        )
+    if measure_silent_handlers:
+        summary_parts.append(f"{len(silent)} silent handlers (max {silent_limit})")
+    return GateResult(
+        "error_handling",
+        "Error handling",
+        coverage_passed and silent_passed,
+        "; ".join(summary_parts) + ".",
+        details,
+    )
+
+
+MOCK_CALL_PATTERN = re.compile(
+    r"\b(?:vi|jest)\s*\.\s*mock\s*\(\s*(['\"])(?P<specifier>[^'\"]+)\1"
+)
+NULL_RENDER_SURFACE_PATTERNS = (
+    re.compile(
+        r"(?:vi|jest)\s*\.\s*spyOn\s*\(\s*HTMLCanvasElement\.prototype\s*,\s*"
+        r"['\"]getContext['\"]\s*\)[\s\S]{0,200}?\.mockReturnValue(?:Once)?\s*\(\s*null\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"HTMLCanvasElement\.prototype\.getContext\s*=[\s\S]{0,120}?"
+        r"(?:vi|jest)\.fn\s*\([\s\S]{0,80}?=>\s*null\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bgetContext\s*:\s*(?:\([^)]*\)|[^=,}]*)\s*=>\s*null\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def closest_package_root(path: Path, root: Path) -> Path:
+    for current in path.parents:
+        if current == root.parent:
+            break
+        if (current / "package.json").is_file():
+            return current
+        if current == root:
+            break
+    return root
+
+
+def resolve_mocked_source(
+    test: Path,
+    specifier: str,
+    root: Path,
+    source_files: Sequence[Path],
+) -> Path | None:
+    if not specifier.startswith(("./", "../")):
+        return None
+    base = (test.parent / specifier).resolve()
+    candidates = [base]
+    if base.suffix:
+        candidates.extend(
+            base.with_suffix(extension) for extension in SOURCE_EXTENSIONS
+        )
+    else:
+        candidates.extend(
+            Path(str(base) + extension) for extension in SOURCE_EXTENSIONS
+        )
+        candidates.extend(
+            base / ("index" + extension) for extension in SOURCE_EXTENSIONS
+        )
+    known = {path.resolve(): path for path in source_files}
+    return next(
+        (known[candidate] for candidate in candidates if candidate in known), None
+    )
+
+
+def same_package_mock_violations(
+    root: Path,
+    test: Path,
+    source_files: Sequence[Path],
+) -> list[TestIntegrityViolation]:
+    try:
+        text = test.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    masked = mask_comments(text)
+    violations: list[TestIntegrityViolation] = []
+    for match in MOCK_CALL_PATTERN.finditer(masked):
+        specifier = match.group("specifier")
+        target = resolve_mocked_source(test, specifier, root, source_files)
+        if target is None or closest_package_root(test, root) != closest_package_root(
+            target, root
+        ):
+            continue
+        relative_test = normalize_path(test, root)
+        relative_target = normalize_path(target, root)
+        violations.append(
+            TestIntegrityViolation(
+                relative_test,
+                text.count("\n", 0, match.start()) + 1,
+                "same-package mock",
+                relative_target,
+                f"composed-root test mocks production module {relative_target}",
+            )
+        )
+    return violations
+
+
+def null_render_surface_violations(
+    root: Path, test: Path
+) -> list[TestIntegrityViolation]:
+    try:
+        text = test.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    masked = mask_comments(text)
+    matches = [
+        match
+        for pattern in NULL_RENDER_SURFACE_PATTERNS
+        for match in pattern.finditer(masked)
+    ]
+    return [
+        TestIntegrityViolation(
+            normalize_path(test, root),
+            text.count("\n", 0, match.start()) + 1,
+            "null render surface",
+            "HTMLCanvasElement.getContext",
+            "composed-root test replaces the canvas context with null",
+        )
+        for match in sorted(matches, key=lambda item: item.start())
+    ]
+
+
+def run_test_integrity_gate(
+    root: Path,
+    config: dict[str, Any],
+    source_files: Sequence[Path],
+    repository_files: Sequence[Path],
+) -> tuple[GateResult, list[TestIntegrityViolation]]:
+    section = config["test_integrity"]
+    if section.get("enabled", "auto") is False:
+        return GateResult(
+            "test_integrity",
+            "Test integrity",
+            False,
+            "Test-integrity checks are disabled; a requested gate cannot be skipped.",
+        ), []
+    patterns = [str(item) for item in section.get("composed_root_tests", [])]
+    tests = [
+        path
+        for path in repository_files
+        if matches_any(normalize_path(path, root), patterns)
+    ]
+    if not tests:
+        required = bool(section.get("required", False))
+        return GateResult(
+            "test_integrity",
+            "Test integrity",
+            not required,
+            "No composed-root test files match test_integrity.composed_root_tests.",
+            applicable=required,
+        ), []
+    violations: list[TestIntegrityViolation] = []
+    if section.get("forbid_same_package_mocks", True):
+        violations.extend(
+            item
+            for test in tests
+            for item in same_package_mock_violations(root, test, source_files)
+        )
+    if section.get("forbid_null_render_surfaces", True):
+        violations.extend(
+            item
+            for test in tests
+            for item in null_render_surface_violations(root, test)
+        )
+    details = [
+        f"{item.path}:{item.line} {item.kind}: {item.detail}" for item in violations
+    ]
+    return GateResult(
+        "test_integrity",
+        "Test integrity",
+        not violations,
+        f"Checked {len(tests)} composed-root tests; found {len(violations)} anti-vacuous-mock violations.",
+        details,
+    ), violations
+
+
 def _python_module_available(
     python: str,
     module: str,
@@ -2488,6 +3237,8 @@ def load_normalized_metrics(
     coverage_limit: float = 100.0,
     complexity_limit: float = 6.0,
     craap_limit: float = 6.0,
+    branch_coverage_limit: float = 100.0,
+    branch_coverage_required: bool = False,
 ) -> list[FunctionMetric]:
     value = json.loads(path.read_text(encoding="utf-8"))
     rows = value.get("functions", []) if isinstance(value, dict) else []
@@ -2503,10 +3254,36 @@ def load_normalized_metrics(
         coverage = float(
             row.get("coverage_percent", (100.0 * covered / total) if total else 0.0)
         )
+        relative = normalize_report_path(str(row["path"]), root)
+        branch_covered = int(row.get("covered_branches", 0))
+        branch_total = int(row.get("total_branches", 0))
+        branch_measured = bool(
+            row.get("branch_coverage_measured", branch_total > 0 or complexity <= 1)
+        )
+        branch_percent = float(
+            row.get(
+                "branch_coverage_percent",
+                100.0 * branch_covered / branch_total if branch_total else 100.0,
+            )
+        )
+        error_paths = [
+            ErrorPath(
+                relative,
+                int(item.get("line") or row.get("start_line") or 1),
+                str(item.get("kind", "error path")),
+                bool(item.get("covered", False)),
+                bool(item.get("silent", False)),
+                str(item.get("parser", "adapter")),
+                bool(item.get("coverage_measured", True)),
+                str(item.get("coverage_kind", "adapter")),
+            )
+            for item in row.get("error_paths", [])
+            if isinstance(item, dict)
+        ]
         score = craap_score(complexity, coverage)
         functions.append(
             FunctionMetric(
-                path=normalize_report_path(str(row["path"]), root),
+                path=relative,
                 name=str(row["name"]),
                 start_line=int(row.get("start_line", 1)),
                 end_line=int(row.get("end_line") or row.get("start_line") or 1),
@@ -2519,6 +3296,13 @@ def load_normalized_metrics(
                 coverage_limit=coverage_limit,
                 complexity_limit=complexity_limit,
                 craap_limit=craap_limit,
+                covered_branches=branch_covered,
+                total_branches=branch_total,
+                branch_coverage_percent=branch_percent,
+                branch_coverage_measured=branch_measured,
+                branch_coverage_limit=branch_coverage_limit,
+                branch_coverage_required=branch_coverage_required,
+                error_paths=error_paths,
             )
         )
     return functions
@@ -2531,9 +3315,7 @@ def normalize_report_path(value: str, root: Path) -> str:
     return Path(value).as_posix().lstrip("./")
 
 
-def parse_coverage(
-    path: Path, format_name: str, root: Path
-) -> dict[str, dict[int, int]]:
+def parse_coverage(path: Path, format_name: str, root: Path) -> CoverageData:
     if format_name == "auto":
         name = path.name.lower()
         if name.endswith(".info"):
@@ -2557,25 +3339,45 @@ def parse_coverage(
     raise ValueError(f"Unknown coverage format: {format_name}")
 
 
-def parse_coverage_json(path: Path, root: Path) -> dict[str, dict[int, int]]:
+def parse_coverage_json(path: Path, root: Path) -> CoverageData:
     value = json.loads(path.read_text(encoding="utf-8"))
     files = value.get("files", {}) if isinstance(value, dict) else {}
-    result: dict[str, dict[int, int]] = {}
+    branch_capable = bool(
+        isinstance(value, dict)
+        and isinstance(value.get("meta"), dict)
+        and value["meta"].get("branch_coverage")
+    )
+    result = CoverageData(branch_capable=branch_capable)
     for filename, details in files.items():
+        relative = normalize_report_path(str(filename), root)
         executed = details.get("executed_lines", [])
         missing = details.get("missing_lines", [])
         lines = {int(line): 1 for line in executed}
         lines.update({int(line): 0 for line in missing})
-        result[normalize_report_path(str(filename), root)] = lines
+        result.lines[relative] = lines
+        executed_branches = details.get("executed_branches", [])
+        missing_branches = details.get("missing_branches", [])
+        if branch_capable or executed_branches or missing_branches:
+            result.branch_capable = True
+            result.branch_files.add(relative)
+        for branch, hit in (
+            *((branch, 1) for branch in executed_branches),
+            *((branch, 0) for branch in missing_branches),
+        ):
+            if isinstance(branch, (list, tuple)) and branch:
+                result.branches.setdefault(relative, {}).setdefault(
+                    int(branch[0]), []
+                ).append(hit)
     return result
 
 
-def parse_istanbul_json(path: Path, root: Path) -> dict[str, dict[int, int]]:
+def parse_istanbul_json(path: Path, root: Path) -> CoverageData:
     value = json.loads(path.read_text(encoding="utf-8"))
-    result: dict[str, dict[int, int]] = {}
+    result = CoverageData()
     for filename, details in value.items():
         if not isinstance(details, dict):
             continue
+        relative = normalize_report_path(str(filename), root)
         statement_map = details.get("statementMap", {})
         statement_hits = details.get("s", {})
         lines: dict[int, int] = {}
@@ -2586,39 +3388,98 @@ def parse_istanbul_json(path: Path, root: Path) -> dict[str, dict[int, int]]:
             except (KeyError, TypeError, ValueError):
                 continue
             lines[line] = max(lines.get(line, 0), hit)
-        result[normalize_report_path(str(filename), root)] = lines
+        result.lines[relative] = lines
+        branch_map = details.get("branchMap")
+        branch_hits = details.get("b")
+        if isinstance(branch_map, dict) and isinstance(branch_hits, dict):
+            result.branch_capable = True
+            result.branch_files.add(relative)
+            for branch_id, location in branch_map.items():
+                hits = branch_hits.get(branch_id, [])
+                if not isinstance(hits, list):
+                    continue
+                locations = (
+                    location.get("locations", []) if isinstance(location, dict) else []
+                )
+                fallback = location.get("loc", {}) if isinstance(location, dict) else {}
+                for index, hit in enumerate(hits):
+                    branch_location = (
+                        locations[index] if index < len(locations) else fallback
+                    )
+                    try:
+                        line = int(branch_location["start"]["line"])
+                        count = int(hit)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    result.branches.setdefault(relative, {}).setdefault(
+                        line, []
+                    ).append(count)
     return result
 
 
-def parse_lcov(path: Path, root: Path) -> dict[str, dict[int, int]]:
-    result: dict[str, dict[int, int]] = {}
+def parse_lcov(path: Path, root: Path) -> CoverageData:
+    result = CoverageData()
     current: str | None = None
     for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if raw_line.startswith("SF:"):
             current = normalize_report_path(raw_line[3:], root)
-            result.setdefault(current, {})
+            result.lines.setdefault(current, {})
         elif raw_line.startswith("DA:") and current:
             parts = raw_line[3:].split(",")
             if len(parts) >= 2:
-                result[current][int(parts[0])] = int(parts[1])
+                result.lines[current][int(parts[0])] = int(parts[1])
+        elif raw_line.startswith("BRDA:") and current:
+            parts = raw_line[5:].split(",")
+            if len(parts) >= 4:
+                result.branch_capable = True
+                result.branch_files.add(current)
+                taken = 0 if parts[3] == "-" else int(parts[3])
+                result.branches.setdefault(current, {}).setdefault(
+                    int(parts[0]), []
+                ).append(taken)
+        elif raw_line.startswith("BRF:") and current:
+            result.branch_capable = True
+            result.branch_files.add(current)
     return result
 
 
-def parse_xml_coverage(path: Path, root: Path) -> dict[str, dict[int, int]]:
+def condition_counts(value: str) -> tuple[int, int] | None:
+    match = re.search(r"\((\d+)\s*/\s*(\d+)\)", value)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def add_xml_line_coverage(
+    result: CoverageData, relative: str, line_node: ET.Element, number_key: str
+) -> None:
+    line = int(line_node.attrib[number_key])
+    hits = line_node.attrib.get("hits", line_node.attrib.get("ci", "0"))
+    result.lines.setdefault(relative, {})[line] = int(float(hits))
+    covered = int(line_node.attrib.get("cb", "0"))
+    missed = int(line_node.attrib.get("mb", "0"))
+    condition = condition_counts(line_node.attrib.get("condition-coverage", ""))
+    if condition:
+        covered, total = condition
+        missed = total - covered
+    if line_node.attrib.get("branch") == "true" or covered or missed:
+        result.branch_capable = True
+        result.branch_files.add(relative)
+        result.branches.setdefault(relative, {}).setdefault(line, []).extend(
+            [1] * covered + [0] * missed
+        )
+
+
+def parse_xml_coverage(path: Path, root: Path) -> CoverageData:
     tree = ET.parse(path)
-    result: dict[str, dict[int, int]] = {}
+    result = CoverageData()
     for class_node in tree.findall(".//class"):
         filename = class_node.attrib.get("filename")
         if not filename:
             continue
         relative = normalize_report_path(filename, root)
-        lines = result.setdefault(relative, {})
         for line_node in class_node.findall(".//line"):
             if "number" in line_node.attrib:
-                lines[int(line_node.attrib["number"])] = int(
-                    float(line_node.attrib.get("hits", "0"))
-                )
-    if result:
+                add_xml_line_coverage(result, relative, line_node, "number")
+    if result.lines:
         return result
     # JaCoCo stores package/sourcefile rather than a filename on class nodes.
     for package in tree.findall(".//package"):
@@ -2627,15 +3488,14 @@ def parse_xml_coverage(path: Path, root: Path) -> dict[str, dict[int, int]]:
             filename = "/".join(
                 part for part in (package_name, source.attrib.get("name", "")) if part
             )
-            lines = result.setdefault(normalize_report_path(filename, root), {})
+            relative = normalize_report_path(filename, root)
             for line_node in source.findall("line"):
-                line = int(line_node.attrib["nr"])
-                lines[line] = int(line_node.attrib.get("ci", "0"))
+                add_xml_line_coverage(result, relative, line_node, "nr")
     return result
 
 
-def parse_go_cover(path: Path, root: Path) -> dict[str, dict[int, int]]:
-    result: dict[str, dict[int, int]] = {}
+def parse_go_cover(path: Path, root: Path) -> CoverageData:
+    result = CoverageData()
     for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if raw_line.startswith("mode:") or not raw_line.strip():
             continue
@@ -2644,7 +3504,7 @@ def parse_go_cover(path: Path, root: Path) -> dict[str, dict[int, int]]:
             continue
         filename, start, end, count = match.groups()
         relative = _match_report_suffix(filename, root)
-        lines = result.setdefault(relative, {})
+        lines = result.lines.setdefault(relative, {})
         for line in range(int(start), int(end) + 1):
             lines[line] = max(lines.get(line, 0), int(count))
     return result
@@ -2978,20 +3838,207 @@ def matching_brace(text: str, open_index: int) -> int:
     return -1
 
 
+def coverage_data(value: CoverageData | dict[str, dict[int, int]]) -> CoverageData:
+    return value if isinstance(value, CoverageData) else CoverageData(lines=value)
+
+
+def matching_coverage_entry(relative: str, values: dict[str, Any]) -> Any | None:
+    if relative in values:
+        return values[relative]
+    matches = [
+        item
+        for name, item in values.items()
+        if name.endswith(relative) or relative.endswith(name)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def path_coverage(
+    relative: str,
+    line: int,
+    end_line: int,
+    coverage: CoverageData,
+) -> tuple[bool, bool]:
+    lines = matching_coverage_entry(relative, coverage.lines) or {}
+    relevant = [
+        lines[number] for number in range(line, end_line + 1) if number in lines
+    ]
+    return any(hit > 0 for hit in relevant), bool(relevant)
+
+
+def handler_coverage(
+    relative: str,
+    start_line: int,
+    end_line: int,
+    coverage: CoverageData,
+    prefer_branch: bool,
+) -> tuple[bool, bool, str]:
+    branches = matching_coverage_entry(relative, coverage.branches) or {}
+    outcomes = branches.get(start_line, []) if prefer_branch else []
+    if outcomes:
+        return any(hit > 0 for hit in outcomes), True, "branch"
+    covered, measured = path_coverage(relative, start_line, end_line, coverage)
+    return covered, measured, "line" if measured else "unmeasured"
+
+
+def python_error_paths(
+    path: Path, root: Path, coverage: CoverageData
+) -> list[ErrorPath]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+    relative = normalize_path(path, root)
+    result: list[ErrorPath] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        body = list(node.body)
+        first_line = (
+            int(getattr(body[0], "lineno", node.lineno)) if body else node.lineno
+        )
+        end_line = max(
+            (
+                int(getattr(item, "end_lineno", getattr(item, "lineno", first_line)))
+                for item in body
+            ),
+            default=first_line,
+        )
+        covered, measured, coverage_kind = handler_coverage(
+            relative, first_line, end_line, coverage, False
+        )
+        silent = not body or all(
+            isinstance(item, ast.Pass)
+            or (
+                isinstance(item, ast.Expr)
+                and isinstance(item.value, ast.Constant)
+                and item.value.value is Ellipsis
+            )
+            for item in body
+        )
+        exception = ast.unparse(node.type) if node.type is not None else "all errors"
+        result.append(
+            ErrorPath(
+                relative,
+                first_line,
+                f"except {exception}",
+                covered,
+                silent,
+                "python-ast",
+                measured,
+                coverage_kind,
+            )
+        )
+    return result
+
+
+BRACE_ERROR_PATTERN = re.compile(
+    r"\bcatch\s*(?:\([^)]*\))?\s*\{|\bif\s+[\w.]*err(?:or)?\s*!=\s*nil\s*\{",
+    re.IGNORECASE,
+)
+
+
+def brace_error_paths(
+    path: Path, root: Path, coverage: CoverageData
+) -> list[ErrorPath]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    relative = normalize_path(path, root)
+    masked = mask_strings_and_comments(text)
+    result: list[ErrorPath] = []
+    for match in BRACE_ERROR_PATTERN.finditer(masked):
+        open_brace = masked.find("{", match.start(), match.end())
+        close_brace = matching_brace(masked, open_brace)
+        if open_brace < 0 or close_brace < 0:
+            continue
+        body = masked[open_brace + 1 : close_brace]
+        start_line = text.count("\n", 0, open_brace) + 1
+        end_line = text.count("\n", 0, close_brace) + 1
+        kind = (
+            "catch"
+            if match.group(0).lstrip().lower().startswith("catch")
+            else "error check"
+        )
+        covered, measured, coverage_kind = handler_coverage(
+            relative,
+            start_line,
+            end_line,
+            coverage,
+            kind == "catch",
+        )
+        silent = not body.replace(";", "").strip()
+        result.append(
+            ErrorPath(
+                relative,
+                start_line,
+                kind,
+                covered,
+                silent,
+                "generic-brace",
+                measured,
+                coverage_kind,
+            )
+        )
+    return result
+
+
+def scan_error_paths(path: Path, root: Path, coverage: CoverageData) -> list[ErrorPath]:
+    if path.suffix.lower() in {".py", ".pyi"}:
+        return python_error_paths(path, root, coverage)
+    return brace_error_paths(path, root, coverage)
+
+
+def merged_error_paths(
+    source_files: Sequence[Path],
+    root: Path,
+    functions: Sequence[FunctionMetric],
+) -> list[ErrorPath]:
+    """Keep adapter coverage evidence while always applying built-in silence scans."""
+    adapter_paths = [path for function in functions for path in function.error_paths]
+    adapter_by_location = {(path.path, path.line): path for path in adapter_paths}
+    merged: list[ErrorPath] = []
+    seen: set[tuple[str, int]] = set()
+    for source in source_files:
+        for static in scan_error_paths(source, root, CoverageData()):
+            key = (static.path, static.line)
+            adapter = adapter_by_location.get(key)
+            if adapter:
+                merged.append(
+                    dataclasses.replace(
+                        adapter,
+                        silent=adapter.silent or static.silent,
+                    )
+                )
+            else:
+                merged.append(static)
+            seen.add(key)
+    merged.extend(path for path in adapter_paths if (path.path, path.line) not in seen)
+    return merged
+
+
 def build_function_metrics(
     source_files: Sequence[Path],
     root: Path,
-    coverage: dict[str, dict[int, int]],
+    coverage: CoverageData | dict[str, dict[int, int]],
     coverage_limit: float = 100.0,
     complexity_limit: float = 6.0,
     craap_limit: float = 6.0,
     external_functions: dict[str, list[tuple[str, int, int, int, str]]] | None = None,
+    branch_coverage_limit: float = 100.0,
+    branch_coverage_required: bool = False,
 ) -> list[FunctionMetric]:
+    measured_coverage = coverage_data(coverage)
     external_functions = external_functions or {}
     functions: list[FunctionMetric] = []
     for path in source_files:
         relative = normalize_path(path, root)
-        line_hits = find_coverage_lines(relative, coverage)
+        line_hits = find_coverage_lines(relative, measured_coverage.lines)
+        branch_hits = (
+            matching_coverage_entry(relative, measured_coverage.branches) or {}
+        )
+        all_error_paths = scan_error_paths(path, root, measured_coverage)
         parsed = external_functions.get(relative)
         if parsed is None:
             parsed = parse_functions(path, root)
@@ -3018,6 +4065,40 @@ def build_function_metrics(
             )
             total = len(relevant) if coverage_measured else 0
             percent = (100.0 * covered / total) if total else 0.0
+            relevant_branches = [
+                hit
+                for line, hits in branch_hits.items()
+                if start <= line <= end
+                and not any(
+                    nested_start <= line <= nested_end
+                    for nested_start, nested_end in nested_spans
+                )
+                for hit in hits
+            ]
+            branch_measured = coverage_measured and (
+                complexity <= 1
+                or relative in measured_coverage.branch_files
+                or any(
+                    name.endswith(relative) or relative.endswith(name)
+                    for name in measured_coverage.branch_files
+                )
+            )
+            total_branches = len(relevant_branches) if branch_measured else 0
+            covered_branches = (
+                sum(hit > 0 for hit in relevant_branches) if branch_measured else 0
+            )
+            branch_percent = (
+                100.0 * covered_branches / total_branches if total_branches else 100.0
+            )
+            error_paths = [
+                item
+                for item in all_error_paths
+                if start <= item.line <= end
+                and not any(
+                    nested_start <= item.line <= nested_end
+                    for nested_start, nested_end in nested_spans
+                )
+            ]
             functions.append(
                 FunctionMetric(
                     path=relative,
@@ -3034,6 +4115,13 @@ def build_function_metrics(
                     complexity_limit=complexity_limit,
                     craap_limit=craap_limit,
                     coverage_measured=coverage_measured,
+                    covered_branches=covered_branches,
+                    total_branches=total_branches,
+                    branch_coverage_percent=branch_percent,
+                    branch_coverage_measured=branch_measured,
+                    branch_coverage_limit=branch_coverage_limit,
+                    branch_coverage_required=branch_coverage_required,
+                    error_paths=error_paths,
                 )
             )
     return sorted(functions, key=lambda item: (item.path, item.start_line, item.name))
@@ -3127,13 +4215,20 @@ def find_coverage_lines(
 
 
 def cleaner_prompt(function: FunctionMetric) -> str:
+    branch_line = (
+        f"{function.branch_coverage_percent:.2f}% "
+        f"({function.covered_branches}/{function.total_branches})"
+        if function.branch_coverage_measured
+        else "not measured"
+    )
     return f"""You are the cleaner agent. Fix the CRAAP gate failure in {function.path}:{function.start_line} for `{function.name}`.
 
 Current evidence:
 - line coverage: {function.coverage_percent:.2f}% ({function.covered_lines}/{function.total_lines})
+- branch coverage: {branch_line}
 - cyclomatic complexity: {function.complexity}
 - CRAAP score: {format_craap(function.craap_score)}
-- required: {function.coverage_limit:g}% coverage, complexity <= {function.complexity_limit:g}, and CRAAP <= {function.craap_limit:g}
+- required: {function.coverage_limit:g}% line coverage, {function.branch_coverage_limit:g}% branch coverage, complexity <= {function.complexity_limit:g}, and CRAAP <= {function.craap_limit:g}
 
 Read the function, its callers, and neighboring tests. Add behavior-focused tests for every uncovered path, then simplify control flow without changing behavior until complexity and CRAAP satisfy the threshold. Preserve error paths and public contracts. Run the repository's real coverage command and report the exact before/after metrics; do not exclude lines, weaken assertions, or mock the function under test."""
 
@@ -3214,6 +4309,8 @@ def run_metrics_gate(
 ) -> tuple[GateResult, list[FunctionMetric]]:
     metrics = config["metrics"]
     coverage_limit = float(metrics.get("coverage_limit", 100))
+    branch_coverage_limit = float(metrics.get("branch_coverage_limit", 100))
+    branch_coverage_required = bool(metrics.get("branch_coverage_required", True))
     complexity_limit = float(metrics.get("complexity_limit", 6))
     craap_limit = float(metrics.get("craap_limit", metrics.get("complexity_limit", 6)))
     command_results: list[CommandResult] = []
@@ -3257,6 +4354,8 @@ def run_metrics_gate(
                     coverage_limit,
                     complexity_limit,
                     craap_limit,
+                    branch_coverage_limit,
+                    branch_coverage_required,
                 )
                 selected_paths = {normalize_path(path, root) for path in source_files}
                 functions = [
@@ -3436,6 +4535,8 @@ def run_metrics_gate(
         complexity_limit,
         craap_limit,
         lizard_functions,
+        branch_coverage_limit,
+        branch_coverage_required,
     )
     heuristic_files = sorted(
         normalize_path(path, root)
@@ -3560,6 +4661,7 @@ def finish_metrics_gate(
             ],
         )
     coverage_limit = functions[0].coverage_limit
+    branch_coverage_limit = functions[0].branch_coverage_limit
     complexity_limit = functions[0].complexity_limit
     craap_limit = functions[0].craap_limit
     failures = sorted(
@@ -3572,7 +4674,13 @@ def finish_metrics_gate(
         ),
     )
     details = [
-        f"{function.path}:{function.start_line} {function.name}: coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {format_craap(function.craap_score)}"
+        f"{function.path}:{function.start_line} {function.name}: line coverage {function.coverage_percent:.2f}%, "
+        + (
+            f"branch coverage {function.branch_coverage_percent:.2f}%, "
+            if function.branch_coverage_measured
+            else "branch coverage not measured, "
+        )
+        + f"complexity {function.complexity}, CRAAP {format_craap(function.craap_score)}"
         for function in failures[:100]
     ]
     prompts = [
@@ -3610,7 +4718,7 @@ def finish_metrics_gate(
             "craap",
             "CRAAP: coverage + complexity",
             False,
-            f"{len(failures)} of {len(functions)} functions fail {coverage_limit:g}% coverage, complexity <= {complexity_limit:g}, or CRAAP <= {craap_limit:g}.",
+            f"{len(failures)} of {len(functions)} functions fail {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, or CRAAP <= {craap_limit:g}.",
             details,
             commands,
             prompts,
@@ -3619,7 +4727,7 @@ def finish_metrics_gate(
         "craap",
         "CRAAP: coverage + complexity",
         True,
-        f"All {len(functions)} functions have {coverage_limit:g}% coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.",
+        f"All {len(functions)} functions have {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.",
         [],
         commands,
     )
@@ -3646,9 +4754,9 @@ def normalized_metrics_prompt(reason: str) -> str:
     return f"""Create or repair a language adapter for the repository quality gate. Reason: {reason}.
 
 Configure `metrics.command` to run the language's real coverage and cyclomatic-complexity tools and `metrics.report` to point to normalized JSON with this shape:
-{{"functions":[{{"path":"src/file.ext","name":"functionName","start_line":1,"end_line":10,"complexity":2,"covered_lines":5,"total_lines":5,"coverage_percent":100}}]}}
+{{"functions":[{{"path":"src/file.ext","name":"functionName","start_line":1,"end_line":10,"complexity":2,"covered_lines":5,"total_lines":5,"coverage_percent":100,"covered_branches":2,"total_branches":2,"branch_coverage_percent":100,"branch_coverage_measured":true,"error_paths":[]}}]}}
 
-Include every production function. Use executable-line coverage, not file averages. The gate requires exactly 100% coverage and computes CRAAP as complexity^2 * (1 - coverage/100)^3 + complexity, with a maximum of 6. Do not invent measurements or omit failing functions."""
+Include every production function. Use executable-line and branch-outcome coverage, not file averages. The gate requires exactly 100% line and branch coverage and computes CRAAP as complexity^2 * (1 - coverage/100)^3 + complexity, with a maximum of 6. Do not invent measurements or omit failing functions."""
 
 
 def operator_offsets(
@@ -5160,6 +6268,9 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     full_command = without_fast_flag(rerun_command)
     thresholds = report.thresholds or default_thresholds()
     coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
+    branch_coverage_limit = threshold_number(
+        thresholds, "metrics", "branch_coverage_limit"
+    )
     complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
     craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
     file_loc_limit = threshold_number(thresholds, "file_loc", "max_lines")
@@ -5200,14 +6311,15 @@ Non-negotiable finish conditions:
 1. Every applicable formatter and linter command passes with zero violations.
 2. Every applicable static type checker passes with zero errors.
 3. Every detected or configured contract/schema check passes.
-4. The complete test suite passes; every production function has {coverage_limit:g}% executable-line coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.
+4. The complete test suite passes; every production function has {coverage_limit:g}% executable-line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.
 5. Every production file has at most {file_loc_limit:g} physical lines.
 6. Every applicable dead-code detector reports zero findings.
 7. The complete test suite passes consistently across every configured flaky-test run{off_note(report, "flaky")}.
 8. The complete test suite kills every generated operator mutant; zero survive{off_note(report, "mutation")}.
 9. The dependency checker reports zero ownership or direction-rule violations.
-10. The smoke check starts the application and loads it once with zero errors (a web UI in a headless browser).
-11. No production file is hidden from the gate by source.exclude.
+10. Every composed-root test uses real same-package production modules and a usable render surface.
+11. The smoke check proves the configured core user story from outside the process; every required probe passes and no page error occurs.
+12. No production file is hidden from the gate by source.exclude.
 
 Current gate status:
 {gate_summary}
@@ -5271,6 +6383,14 @@ def function_measurement(function: Any) -> dict[str, Any]:
         "total_lines": function.total_lines,
         "coverage_percent": round(function.coverage_percent, 2),
         "coverage_measured": bool(getattr(function, "coverage_measured", True)),
+        "covered_branches": int(getattr(function, "covered_branches", 0)),
+        "total_branches": int(getattr(function, "total_branches", 0)),
+        "branch_coverage_percent": round(
+            float(getattr(function, "branch_coverage_percent", 100.0)), 2
+        ),
+        "branch_coverage_measured": bool(
+            getattr(function, "branch_coverage_measured", False)
+        ),
         "complexity": function.complexity,
         "craap_score": round(function.craap_score, 8),
         "passed": function.passed,
@@ -5359,11 +6479,94 @@ def quality_gate_for(analysis: Any) -> Any:
     return next((result for result in analysis.gates if result.key == "quality"), None)
 
 
+def test_timing_measurement(item: Any) -> dict[str, Any]:
+    return {
+        "name": item.name,
+        "path": item.path,
+        "duration_seconds": round(item.duration_seconds, 3),
+        "status": item.status,
+    }
+
+
+def extensibility_measurement(analysis: Any) -> dict[str, Any]:
+    scenarios = list(getattr(analysis, "extension_scenarios", []))
+    dependencies = list(getattr(analysis, "extension_dependencies", []))
+    contract_coverage = (
+        100.0 * sum(item.passed for item in scenarios) / len(scenarios)
+        if scenarios
+        else 100.0
+    )
+    return {
+        "contract_coverage_percent": round(contract_coverage, 2),
+        "scenarios": [
+            {
+                "name": item.name,
+                "passed": item.passed,
+                "duration_seconds": round(item.duration_seconds, 3),
+            }
+            for item in scenarios
+        ],
+        "core_to_extension_dependencies": [
+            {"source": item.source, "target": item.target, "line": item.line}
+            for item in dependencies
+        ],
+    }
+
+
+def error_handling_measurement(analysis: Any) -> dict[str, Any]:
+    paths = list(getattr(analysis, "error_paths", []))
+    coverage = (
+        100.0 * sum(item.covered for item in paths) / len(paths) if paths else 100.0
+    )
+    return {
+        "failure_path_coverage_percent": round(coverage, 2),
+        "silent_handlers": sum(item.silent for item in paths),
+        "paths": [
+            {
+                "path": item.path,
+                "line": item.line,
+                "kind": item.kind,
+                "covered": item.covered,
+                "silent": item.silent,
+                "coverage_measured": item.coverage_measured,
+                "coverage_kind": item.coverage_kind,
+                "parser": item.parser,
+            }
+            for item in paths
+        ],
+    }
+
+
 def metrics_state(analysis: Any, quality_gate: Any) -> dict[str, Any]:
     return {
         "certified": bool(analysis.functions and quality_gate and quality_gate.passed),
         "functions": [function_measurement(item) for item in analysis.functions],
         "files": [file_measurement(item) for item in analysis.files],
+        "suite_duration_seconds": (
+            round(analysis.suite_duration_seconds, 3)
+            if getattr(analysis, "suite_duration_seconds", None) is not None
+            else None
+        ),
+        "slow_tests": [
+            test_timing_measurement(item)
+            for item in getattr(analysis, "test_timings", [])
+        ],
+        "extensibility": extensibility_measurement(analysis),
+        "error_handling": error_handling_measurement(analysis),
+        "smoke_story": [
+            {"name": item.name, "passed": item.passed, "detail": item.detail}
+            for item in getattr(analysis, "smoke_probes", [])
+        ],
+        "test_integrity": [
+            {
+                "path": item.path,
+                "line": item.line,
+                "kind": item.kind,
+                "target": item.target,
+                "detail": item.detail,
+            }
+            for item in getattr(analysis, "test_integrity_violations", [])
+        ],
     }
 
 
@@ -5384,6 +6587,19 @@ def count_state(
         "checks_passing": outcomes.count("pass"),
         "functions_total": len(analysis.functions),
         "functions_failing": len(failing_functions),
+        "slow_tests_measured": len(getattr(analysis, "test_timings", [])),
+        "extension_scenarios": len(getattr(analysis, "extension_scenarios", [])),
+        "core_to_extension_dependencies": len(
+            getattr(analysis, "extension_dependencies", [])
+        ),
+        "error_paths": len(getattr(analysis, "error_paths", [])),
+        "silent_error_handlers": sum(
+            item.silent for item in getattr(analysis, "error_paths", [])
+        ),
+        "smoke_story_probes": len(getattr(analysis, "smoke_probes", [])),
+        "test_integrity_violations": len(
+            getattr(analysis, "test_integrity_violations", [])
+        ),
         "files_total": len(analysis.files),
         "files_failing_loc": sum(not item.passed for item in analysis.files),
         "mutants_total": len(analysis.mutations),
@@ -5436,6 +6652,16 @@ def failure_state(
         "files": failed_file_state(analysis.files),
         "surviving_mutants": [mutation_failure(item) for item in survivors[:200]],
         "dependencies": [dependency_failure(item) for item in violations[:200]],
+        "test_integrity": [
+            {
+                "path": item.path,
+                "line": item.line,
+                "kind": item.kind,
+                "target": item.target,
+                "detail": item.detail,
+            }
+            for item in getattr(analysis, "test_integrity_violations", [])[:200]
+        ],
         "tool_setup": failed_tool_state(failed_setup),
     }
 
@@ -5598,8 +6824,25 @@ def html_report(report: AnalysisReport) -> str:
         verdict_class = "pass" if report.passed else "fail"
     thresholds = report.thresholds or default_thresholds()
     coverage_limit = threshold_number(thresholds, "metrics", "coverage_limit")
+    branch_coverage_limit = threshold_number(
+        thresholds, "metrics", "branch_coverage_limit"
+    )
     complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
     craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
+    max_test_seconds = threshold_number(thresholds, "slow_tests", "max_test_seconds")
+    max_suite_seconds = threshold_number(thresholds, "slow_tests", "max_suite_seconds")
+    extension_contract_limit = threshold_number(
+        thresholds, "extensibility", "contract_coverage_limit"
+    )
+    extension_dependency_limit = threshold_number(
+        thresholds, "extensibility", "max_core_to_extension_dependencies"
+    )
+    failure_path_limit = threshold_number(
+        thresholds, "error_handling", "failure_path_coverage_limit"
+    )
+    silent_handler_limit = threshold_number(
+        thresholds, "error_handling", "max_silent_handlers"
+    )
     file_loc_limit = int(threshold_number(thresholds, "file_loc", "max_lines"))
     applicable_gates = sum(
         gate.applicable and not gate.deferred for gate in report.gates
@@ -5632,7 +6875,31 @@ def html_report(report: AnalysisReport) -> str:
             "4",
             "Are all code paths tested?",
             "Tests + coverage + complexity",
-            f"The complete suite must pass, with {coverage_limit:g}% function coverage, complexity {complexity_limit:g} or lower, and CRAAP {craap_limit:g} or lower.",
+            f"The complete suite must pass, with {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity {complexity_limit:g} or lower, and CRAAP {craap_limit:g} or lower.",
+        ),
+        "slow_tests": (
+            "5",
+            "Are tests fast enough?",
+            "Slow tests",
+            f"Each reported test must finish within {max_test_seconds:g}s and the suite within {max_suite_seconds:g}s.",
+        ),
+        "error_handling": (
+            "6",
+            "Are failure paths tested and explicit?",
+            "Error handling",
+            f"Failure paths require {failure_path_limit:g}% coverage and no more than {silent_handler_limit:g} silent handlers.",
+        ),
+        "test_integrity": (
+            "7",
+            "Do composed-root tests use the real subsystem?",
+            "Test integrity",
+            "Composed-root tests may not mock same-package production modules or replace canvas rendering with null.",
+        ),
+        "smoke": (
+            "8",
+            "Does the core user story work outside the process?",
+            "Runs (smoke)",
+            "A configured story probe must exercise the real application and every reported probe must pass.",
         ),
         "file_loc": (
             "5",
@@ -5664,6 +6931,12 @@ def html_report(report: AnalysisReport) -> str:
             "Module boundaries",
             "Imports must follow the dependency rules declared by the project.",
         ),
+        "extensibility": (
+            "10",
+            "Can behavior be extended safely?",
+            "Extensibility",
+            f"Configured extension contracts require {extension_contract_limit:g}% pass coverage and core may have at most {extension_dependency_limit:g} dependencies on extensions.",
+        ),
     }
     ordered_functions = sorted(
         report.functions,
@@ -5680,15 +6953,16 @@ def html_report(report: AnalysisReport) -> str:
             f"""<tr class="{"ok" if function.passed else "bad"}">
           <td><code>{html.escape(function.path)}:{function.start_line}</code></td>
           <td>{html.escape(function.name)}</td><td>{function.coverage_percent:.2f}%</td>
+          <td>{f"{function.branch_coverage_percent:.2f}%" if function.branch_coverage_measured else "not measured"}</td>
           <td>{function.complexity}</td><td>{format_craap(function.craap_score)}</td>
           <td>{html.escape(function.parser)}</td><td>{"PASS" if function.passed else "FAIL"}</td>
         </tr>"""
             for function in shown_functions
         )
-        or '<tr><td colspan="7">No function metrics produced.</td></tr>'
+        or '<tr><td colspan="8">No function metrics produced.</td></tr>'
     )
     if len(ordered_functions) > len(shown_functions):
-        function_rows += f'<tr><td colspan="7">Showing the 200 highest-priority functions out of {len(ordered_functions)}. Fix and rerun to refresh this list.</td></tr>'
+        function_rows += f'<tr><td colspan="8">Showing the 200 highest-priority functions out of {len(ordered_functions)}. Fix and rerun to refresh this list.</td></tr>'
     ordered_files = sorted(
         report.files, key=lambda file: (file.passed, -file.lines, file.path)
     )
@@ -5739,11 +7013,71 @@ def html_report(report: AnalysisReport) -> str:
     )
     if len(report.dependency_violations) > len(shown_dependencies):
         dependency_rows += f'<tr><td colspan="5">Showing 200 violations out of {len(report.dependency_violations)}.</td></tr>'
+    timing_rows = (
+        "".join(
+            f"""<tr class="{"bad" if item.duration_seconds > max_test_seconds else "ok"}">
+        <td><code>{html.escape(item.path)}</code></td><td>{html.escape(item.name)}</td>
+        <td>{item.duration_seconds:.3f}s</td><td>{html.escape(item.status.upper())}</td></tr>"""
+            for item in sorted(
+                report.test_timings,
+                key=lambda timing: (-timing.duration_seconds, timing.name),
+            )[:200]
+        )
+        or '<tr><td colspan="4">Individual test timings were not configured; suite duration is still measured.</td></tr>'
+    )
+    scenario_rows = (
+        "".join(
+            f"""<tr class="{"ok" if item.passed else "bad"}"><td>{html.escape(item.name)}</td>
+        <td>{item.duration_seconds:.3f}s</td><td>{"PASS" if item.passed else "FAIL"}</td></tr>"""
+            for item in report.extension_scenarios
+        )
+        or '<tr><td colspan="3">No extension contract scenarios configured.</td></tr>'
+    )
+    extension_dependency_rows = (
+        "".join(
+            f"""<tr class="bad"><td><code>{html.escape(item.source)}:{item.line}</code></td>
+        <td><code>{html.escape(item.target)}</code></td></tr>"""
+            for item in report.extension_dependencies
+        )
+        or '<tr><td colspan="2">No core-to-extension dependencies found.</td></tr>'
+    )
+    error_path_rows = (
+        "".join(
+            f"""<tr class="{"ok" if item.covered and not item.silent else "bad"}">
+        <td><code>{html.escape(item.path)}:{item.line}</code></td><td>{html.escape(item.kind)}</td>
+        <td>{"YES" if item.covered else "NO"}</td><td>{"YES" if item.silent else "NO"}</td>
+        <td>{html.escape(item.coverage_kind)}</td><td>{html.escape(item.parser)}</td></tr>"""
+            for item in report.error_paths
+        )
+        or '<tr><td colspan="6">No explicit error handlers found.</td></tr>'
+    )
+    smoke_probe_rows = (
+        "".join(
+            f"""<tr class="{"ok" if item.passed else "bad"}"><td>{html.escape(item.name)}</td>
+        <td>{"PASS" if item.passed else "FAIL"}</td><td>{html.escape(item.detail)}</td></tr>"""
+            for item in report.smoke_probes
+        )
+        or '<tr><td colspan="3">No structured core-user-story probes configured.</td></tr>'
+    )
+    test_integrity_rows = (
+        "".join(
+            f"""<tr class="bad"><td><code>{html.escape(item.path)}:{item.line}</code></td>
+        <td>{html.escape(item.kind)}</td><td><code>{html.escape(item.target)}</code></td>
+        <td>{html.escape(item.detail)}</td></tr>"""
+            for item in report.test_integrity_violations
+        )
+        or '<tr><td colspan="4">No anti-vacuous-mock violations found.</td></tr>'
+    )
     metric_details_by_gate = {
-        "quality": f"""<div class="check-detail"><h4>Function metrics</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div>""",
+        "quality": f"""<div class="check-detail"><h4>Function metrics</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Line coverage</th><th>Branch coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div>""",
+        "slow_tests": f"""<div class="check-detail"><h4>Test timings</h4><div class="table-wrap"><table><thead><tr><th>File</th><th>Test</th><th>Duration</th><th>Status</th></tr></thead><tbody>{timing_rows}</tbody></table></div></div>""",
+        "error_handling": f"""<div class="check-detail"><h4>Error paths</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Handler</th><th>Covered</th><th>Silent</th><th>Evidence</th><th>Parser</th></tr></thead><tbody>{error_path_rows}</tbody></table></div></div>""",
+        "test_integrity": f"""<div class="check-detail"><h4>Anti-vacuous mock findings</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Rule</th><th>Target</th><th>Finding</th></tr></thead><tbody>{test_integrity_rows}</tbody></table></div></div>""",
+        "smoke": f"""<div class="check-detail"><h4>Core user story probes</h4><div class="table-wrap"><table><thead><tr><th>Probe</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{smoke_probe_rows}</tbody></table></div></div>""",
         "file_loc": f"""<div class="check-detail"><h4>Measured files</h4><div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div></div>""",
         "mutation": f"""<div class="check-detail"><h4>Mutation evidence</h4><div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></div>""",
         "dependencies": f"""<div class="check-detail"><h4>Architecture boundaries</h4><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div></div>""",
+        "extensibility": f"""<div class="check-detail"><h4>Extension contracts</h4><div class="table-wrap"><table><thead><tr><th>Scenario</th><th>Duration</th><th>Status</th></tr></thead><tbody>{scenario_rows}</tbody></table></div><h4>Core to extension direction</h4><div class="table-wrap"><table><thead><tr><th>Core source</th><th>Extension target</th></tr></thead><tbody>{extension_dependency_rows}</tbody></table></div></div>""",
     }
     gate_cards = "".join(
         gate_card_html(
@@ -5851,6 +7185,14 @@ def html_report(report: AnalysisReport) -> str:
         if function_count
         else "—"
     )
+    measured_branches = [
+        item for item in report.functions if item.branch_coverage_measured
+    ]
+    average_branch_coverage = (
+        f"{sum(item.branch_coverage_percent for item in measured_branches) / len(measured_branches):.1f}%"
+        if measured_branches
+        else "—"
+    )
     mean_file_loc = (
         f"{sum(item.lines for item in report.files) / file_count:.0f}"
         if file_count
@@ -5861,6 +7203,35 @@ def html_report(report: AnalysisReport) -> str:
       <div class="metric-tile"><strong>{mean_file_loc}</strong><span>Mean file LOC</span><small>Limit ≤ {file_loc_limit:,}</small></div>
       <div class="metric-tile"><strong>{average_complexity}</strong><span>Average complexity</span><small>Target ≤ {complexity_limit:g}</small></div>
       <div class="metric-tile"><strong>{average_coverage}</strong><span>Average coverage</span><small>Target {coverage_limit:g}%</small></div>
+    </div>"""
+    slowest_test = max(
+        (item.duration_seconds for item in report.test_timings), default=None
+    )
+    slowest_test_text = f"{slowest_test:.3f}s" if slowest_test is not None else "—"
+    contract_coverage = (
+        100.0
+        * sum(item.passed for item in report.extension_scenarios)
+        / len(report.extension_scenarios)
+        if report.extension_scenarios
+        else None
+    )
+    contract_coverage_text = (
+        f"{contract_coverage:.1f}%" if contract_coverage is not None else "—"
+    )
+    failure_path_coverage = (
+        100.0
+        * sum(item.covered for item in report.error_paths)
+        / len(report.error_paths)
+        if report.error_paths
+        else 100.0
+    )
+    extended_metric_tiles = f"""<div class="metric-grid">
+      <div class="metric-tile"><strong>{average_branch_coverage}</strong><span>Branch coverage</span><small>Target {branch_coverage_limit:g}%</small></div>
+      <div class="metric-tile"><strong>{slowest_test_text}</strong><span>Slowest test</span><small>Limit ≤ {max_test_seconds:g}s</small></div>
+      <div class="metric-tile"><strong>{contract_coverage_text}</strong><span>Extension contracts</span><small>Target {extension_contract_limit:g}%</small></div>
+      <div class="metric-tile"><strong>{len(report.extension_dependencies)}</strong><span>Core → extension</span><small>Limit ≤ {extension_dependency_limit:g}</small></div>
+      <div class="metric-tile"><strong>{failure_path_coverage:.1f}%</strong><span>Failure-path coverage</span><small>Target {failure_path_limit:g}%</small></div>
+      <div class="metric-tile"><strong>{sum(item.silent for item in report.error_paths)}</strong><span>Silent handlers</span><small>Limit ≤ {silent_handler_limit:g}</small></div>
     </div>"""
     gate_flow_items = []
     for gate in report.gates:
@@ -5895,13 +7266,13 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 .hero{{display:grid;grid-template-columns:1fr auto;align-items:end;gap:24px;padding:28px 4px 18px}} .eyebrow{{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--secondary)}} .verdict{{display:inline-flex;margin-top:8px;padding:5px 9px;border-radius:8px;font-size:12px;font-weight:700}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--deferred);background:var(--deferred-soft)}} .meta{{color:var(--secondary)}}
 .copy{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 13px;border-radius:10px;border:1px solid rgba(8,124,255,.48);background:#fff;color:var(--blue);font-weight:650;cursor:pointer}} .copy.primary{{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 5px 14px rgba(8,124,255,.2)}} .copy:hover{{filter:brightness(.97)}} .copy.copied{{background:var(--good);border-color:var(--good);color:#fff}}
 .dashboard{{display:grid;grid-template-columns:1fr 1fr;gap:14px}} .card{{min-width:0;background:var(--card);border:1px solid rgba(255,255,255,.85);border-radius:18px;padding:16px;box-shadow:0 7px 24px rgba(35,45,70,.07)}} .card h2{{margin-bottom:14px}} .outcome-bar{{display:flex;height:22px;overflow:hidden;border-radius:7px;background:#e8ebef}} .segment.pass,.bar-track .pass,.legend i.pass{{background:var(--good)}} .segment.fail,.bar-track .fail,.legend i.fail{{background:var(--bad)}} .segment.deferred,.legend i.deferred{{background:var(--deferred)}} .segment.na,.legend i.na{{background:var(--na)}} .legend{{display:flex;flex-wrap:wrap;gap:20px;margin-top:14px;color:var(--secondary)}} .legend span{{display:flex;align-items:center;gap:6px}} .legend i{{width:10px;height:10px;border-radius:3px}}
-.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .metric-tile{{display:grid;gap:1px;padding:12px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.62)}} .metric-tile strong{{font-size:25px;line-height:1.05;letter-spacing:-.03em}} .metric-tile span{{font-size:12px;font-weight:700}} .metric-tile small{{color:var(--secondary);font-size:10px}}
+.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .metrics-wide{{grid-column:1/-1}} .metrics-wide .metric-grid{{grid-template-columns:repeat(3,1fr)}} .metric-tile{{display:grid;gap:1px;padding:12px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.62)}} .metric-tile strong{{font-size:25px;line-height:1.05;letter-spacing:-.03em}} .metric-tile span{{font-size:12px;font-weight:700}} .metric-tile small{{color:var(--secondary);font-size:10px}}
 .flow-card{{grid-column:1/-1;overflow:hidden}} .gate-flow{{display:grid;grid-template-columns:repeat({total_gates},minmax(94px,1fr));gap:4px;overflow:auto;padding:4px 0}} .flow-item{{position:relative;display:grid;justify-items:center;gap:3px;text-align:center;color:var(--secondary)}} .flow-item:not(:last-child)::after{{content:"";position:absolute;top:16px;left:64%;width:72%;height:1px;background:var(--line)}} .flow-symbol{{position:relative;z-index:1;display:grid;place-items:center;width:34px;height:34px;border:1.5px solid currentColor;border-radius:50%;background:#fff;font-size:19px}} .flow-item strong{{font-size:12px;color:var(--ink);font-weight:600}} .flow-item small{{font-size:10px;font-weight:700}} .flow-item.pass{{color:var(--good)}} .flow-item.fail{{color:var(--bad)}} .flow-item.deferred{{color:var(--deferred)}} .flow-item.na{{color:var(--na)}}
 .accordion{{margin-top:14px;overflow:hidden;border:1px solid rgba(255,255,255,.82);border-radius:18px;background:var(--glass);backdrop-filter:blur(18px) saturate(135%);box-shadow:0 8px 28px rgba(35,45,70,.08)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
 .issue-row,.optional-row{{display:grid;grid-template-columns:94px 1fr auto;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}} .issue-row:last-child,.optional-row:last-child{{border-bottom:0}} .issue-row p,.optional-row p,.optional-heading p{{margin:2px 0 0;color:var(--secondary);font-size:13px}} .state-label{{font-size:12px;font-weight:750}} .state-label.fail{{color:var(--bad)}} .na-mark{{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--na);border-radius:50%;color:var(--na);font-size:10px}} .optional-heading{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}} .optional-heading p{{margin:0}} .panel{{padding:16px;border-top:1px solid var(--line)}}
 .checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.5)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .check-status{{margin-left:auto;margin-right:8px;font-size:11px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .check-detail{{margin-top:16px}} .check-detail h4{{margin:0 0 8px;font-size:13px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
-@media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card{{grid-column:auto}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
+@media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card,.metrics-wide{{grid-column:auto}}.metrics-wide .metric-grid{{grid-template-columns:1fr 1fr}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
 @media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.metric-tile{{padding:10px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
 </style></head><body><main>
 <header class="toolbar"><span class="brand">Code Confidence</span><span class="repo">{html.escape(repository_name)} · {html.escape(report.scope.description)}</span>
@@ -5910,6 +7281,7 @@ main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-t
 <div class="meta">{html.escape(report.root)} · {html.escape(language_text)}</div><span class="verdict {verdict_class}">{status}</span></div>{repair_action_html}</section>
 <section class="dashboard"><article class="card"><h2>Gate outcomes</h2><div class="outcome-bar" aria-label="{passed_gates} passed, {failed_count} failed, {deferred_gates} deferred, {not_applicable_gates} not applicable">{outcome_segments}</div><div class="legend">{outcome_legend}</div></article>
 <article class="card"><h2>Code metrics</h2>{metric_tiles}</article>
+<article class="card metrics-wide"><h2>Extended metrics</h2>{extended_metric_tiles}</article>
 <article class="card flow-card"><h2>Quality gates</h2><div class="gate-flow">{gate_flow}</div></article></section>
 <section class="accordion">{fix_section}{optional_section}
 <div class="checks-list">{gate_cards}</div>
@@ -6067,6 +7439,9 @@ def run(
     languages = detect_languages(root)
     all_source_files = discover_source_files(root, config["source"])
     source_files = discover_source_files(root, config["source"], scope)
+    repository_files = (
+        list(walk_files(root)) if selection.wants("test_integrity") else []
+    )
     notes.append(f"Detected languages: {', '.join(languages)}")
     notes.append(
         f"Selected {len(source_files)} production source files from {scope.description}"
@@ -6155,6 +7530,35 @@ def run(
             test_command,
             test_baseline,
         )
+        slow_tests_gate, test_timings = (
+            run_slow_test_gate(root, config, test_baseline, workspace)
+            if selection.wants("slow_tests")
+            else (skipped_check("slow_tests", "Slow tests"), [])
+        )
+        error_paths = (
+            merged_error_paths(source_files, root, functions)
+            if selection.wants("error_handling")
+            else []
+        )
+        error_handling_gate = (
+            run_error_handling_gate(
+                config,
+                error_paths,
+                measure_failure_paths=(
+                    not selection.partial or selection.forces("failure-paths")
+                ),
+                measure_silent_handlers=(
+                    not selection.partial or selection.forces("silent-errors")
+                ),
+            )
+            if selection.wants("error_handling")
+            else skipped_check("error_handling", "Error handling")
+        )
+        test_integrity_gate, test_integrity_violations = (
+            run_test_integrity_gate(root, config, all_source_files, repository_files)
+            if selection.wants("test_integrity")
+            else (skipped_check("test_integrity", "Test integrity"), [])
+        )
         file_loc_gate, files = run_file_loc_for_selection(
             root, source_files, config["file_loc"], scope, selection
         )
@@ -6189,6 +7593,15 @@ def run(
         dependency_gate, violations = dependency_gate_for_run(
             root, config, source_files, workspace, all_source_files, scope, selection
         )
+        extensibility_gate, extension_scenarios, extension_dependencies = (
+            run_extensibility_gate(root, config, source_files, all_source_files)
+            if selection.wants("extensibility")
+            else (
+                skipped_check("extensibility", "Extensibility"),
+                [],
+                [],
+            )
+        )
         smoke_gate = smoke_gate_for_run(root, config, fast, selection, tools.python_env)
         scope_gate = scope_gate_for_run(root, config, selection)
     analysis = AnalysisReport(
@@ -6200,12 +7613,16 @@ def run(
             types_gate,
             contracts_gate,
             quality_gate,
+            slow_tests_gate,
+            error_handling_gate,
+            test_integrity_gate,
             smoke_gate,
             file_loc_gate,
             dead_code_gate,
             flaky_gate,
             mutation_gate,
             dependency_gate,
+            extensibility_gate,
             scope_gate,
         ],
         functions=functions,
@@ -6214,6 +7631,15 @@ def run(
         tool_setup=tools.setup_results,
         notes=notes,
         files=files,
+        test_timings=test_timings,
+        suite_duration_seconds=(
+            test_baseline.duration_seconds if test_baseline else None
+        ),
+        extension_scenarios=extension_scenarios,
+        extension_dependencies=extension_dependencies,
+        error_paths=error_paths,
+        smoke_probes=smoke_gate.smoke_probes,
+        test_integrity_violations=test_integrity_violations,
         thresholds=thresholds or default_thresholds(),
         mode=run_mode(fast, selection),
         scope=scope,
@@ -6234,7 +7660,11 @@ def run_mode(fast: bool, selection: GateSelection) -> str:
 def selection_needs_test_baseline(selection: GateSelection) -> bool:
     if selection.wants("quality") and selection.focus != "complexity":
         return True
-    return selection.wants("flaky") or selection.wants("mutation")
+    return (
+        selection.wants("flaky")
+        or selection.wants("mutation")
+        or selection.wants("slow_tests")
+    )
 
 
 def run_quality_gate(
@@ -6373,7 +7803,8 @@ def dependency_gate_for_run(
 
 SMOKE_TITLE = "Runs (smoke)"
 SMOKE_GUIDANCE = (
-    "Configure smoke.commands with a command that starts the application and loads it once: "
+    "Configure smoke.story with an outside-process command and a fresh steps-json report "
+    "that proves the core user story, or smoke.commands for a non-interactive entry point: "
     "for a web UI `python3 <skill>/scripts/smoke_check.py --start '<start command>' --browser`; "
     "for a CLI or library, its entry point (`--help` or an import). "
     "A test suite that mocks the network does not prove the application runs."
@@ -6386,6 +7817,125 @@ TOOLING_FILE_PATTERNS = (
     "**/conftest.py",
     "**/setup.py",
 )
+
+
+def load_smoke_story_report(
+    path: Path, format_name: str
+) -> tuple[list[SmokeProbe], list[str]]:
+    if format_name != "steps-json":
+        raise ValueError(f"Unknown smoke story report format: {format_name}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not isinstance(value.get("steps"), list):
+        raise ValueError("Smoke story report must contain a 'steps' array")
+    probes: list[SmokeProbe] = []
+    for index, row in enumerate(value["steps"], 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"Smoke story probe #{index} must be an object")
+        name = str(row.get("step") or row.get("name") or f"probe {index}")
+        detail_value = {
+            str(key): item
+            for key, item in row.items()
+            if key not in {"step", "name", "ok"}
+        }
+        probes.append(
+            SmokeProbe(
+                name,
+                row.get("ok") is True,
+                json.dumps(detail_value, sort_keys=True) if detail_value else "",
+            )
+        )
+    raw_errors = value.get("page_errors", [])
+    if not isinstance(raw_errors, list):
+        raise ValueError("Smoke story page_errors must be an array")
+    return probes, [str(item) for item in raw_errors]
+
+
+def run_smoke_story_gate(
+    root: Path,
+    section: dict[str, Any],
+    story: dict[str, Any],
+    extra_env: dict[str, str] | None,
+) -> GateResult:
+    report_value = story.get("report")
+    if not report_value:
+        raise ValueError("smoke.story.report is required")
+    report_path = resolve_config_path(
+        substitute_text(str(report_value), {"root": str(root)}), root
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    substitutions = {
+        "root": str(root),
+        "report": str(report_path),
+        "report_dir": str(report_path.parent),
+    }
+    command = command_list(story.get("command"), substitutions)
+    if not command:
+        raise ValueError("smoke.story.command is required")
+    before = report_fingerprint(report_path)
+    result = run_command(
+        command,
+        root,
+        int(story.get("timeout_seconds", section.get("timeout_seconds", 300))),
+        extra_env,
+    )
+    if not report_was_refreshed(report_path, before):
+        return GateResult(
+            "smoke",
+            SMOKE_TITLE,
+            False,
+            "The core-user-story command did not produce a fresh probe report.",
+            [format_command(result)],
+            [result],
+        )
+    try:
+        probes, page_errors = load_smoke_story_report(
+            report_path, str(story.get("format", "steps-json"))
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return GateResult(
+            "smoke",
+            SMOKE_TITLE,
+            False,
+            f"The core-user-story report could not be parsed: {error}",
+            command_results=[result],
+        )
+    minimum = int(story.get("minimum_probes", 1))
+    if minimum < 1:
+        raise ValueError("smoke.story.minimum_probes must be at least 1")
+    failed = [probe for probe in probes if not probe.passed]
+    fail_on_page_errors = bool(story.get("fail_on_page_errors", True))
+    passed = (
+        result.returncode == 0
+        and len(probes) >= minimum
+        and not failed
+        and (not fail_on_page_errors or not page_errors)
+    )
+    details = [
+        f"Probe failed: {probe.name}" + (f" — {probe.detail}" if probe.detail else "")
+        for probe in failed
+    ]
+    if len(probes) < minimum:
+        details.append(
+            f"Only {len(probes)} probes were reported; at least {minimum} required."
+        )
+    if result.returncode != 0:
+        details.append(format_command(result))
+    if fail_on_page_errors:
+        details.extend(f"Page error: {error}" for error in page_errors)
+    story_name = str(story.get("name", "Core user story"))
+    summary = (
+        f"{story_name}: {len(probes) - len(failed)}/{len(probes)} probes passed; "
+        f"{len(page_errors)} page errors."
+    )
+    return GateResult(
+        "smoke",
+        SMOKE_TITLE,
+        passed,
+        summary,
+        details,
+        [result],
+        smoke_probes=probes,
+    )
 
 
 def smoke_gate_for_run(
@@ -6405,6 +7955,18 @@ def smoke_gate_for_run(
             "starting the application once is reserved for the ship report; run --smoke to do it now.",
         )
     section = {**config["smoke"], "required": True}
+    if section.get("enabled", "auto") is False:
+        return GateResult(
+            "smoke",
+            SMOKE_TITLE,
+            False,
+            "Runs (smoke) is disabled; a requested gate cannot be skipped.",
+        )
+    story = section.get("story")
+    if story is not None:
+        if not isinstance(story, dict):
+            raise ValueError("smoke.story must be an object")
+        return run_smoke_story_gate(root, section, story, extra_env)
     return run_command_check_gate(
         root, "smoke", SMOKE_TITLE, section, [], SMOKE_GUIDANCE, extra_env
     )
@@ -6520,7 +8082,7 @@ def smoke_template(root: Path) -> dict[str, Any]:
         note = "Generated: starts the application once and loads it. The ship report is red until this runs green."
     else:
         note = "Not detected: add a command that starts the application and loads it once (see references/quality-loop.md). The ship report is red until then."
-    return {"commands": commands, "_note": note}
+    return {"commands": commands, "story": None, "_note": note}
 
 
 def ensure_git_repository(root: Path) -> str | None:

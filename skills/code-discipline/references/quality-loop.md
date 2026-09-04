@@ -41,14 +41,19 @@ whole-repository certification.
 
 | Flags | Runs | Use it when |
 |---|---|---|
-| `--fast` | lint, types, contracts, tests, coverage + CRAAP, file size, dead code; defers flaky and mutation | first look after a change |
+| `--fast` | lint, types, contracts, tests, line/branch coverage, slow tests, extensibility, error handling, test integrity, CRAAP, file size, dead code; defers flaky and mutation | first look after a change |
 | `--lint` · `--types` · `--contracts` | that one check | after an edit, a signature change, a schema change |
 | `--tests` | the complete test suite only | after writing a test |
 | `--coverage` | tests plus per-function coverage; lists every uncovered function in scope | deciding which test to write next |
+| `--branches` | tests plus per-function branch coverage | after adding conditionals or exception branches |
+| `--slow-tests` | complete-suite duration plus individual timings when the runner emits them | when feedback is becoming slow |
+| `--extension-contracts` · `--extension-deps` | configured extension scenarios; forbidden core-to-extension imports | after adding a plug-in point or extension |
+| `--failure-paths` · `--silent-errors` | error-handler coverage; empty or `pass` handlers | after changing recovery or fallback behavior |
+| `--test-integrity` | same-package production mocks and null render surfaces in composed-root tests | after changing an application/root composition test |
 | `--complexity` | static complexity per function, no tests | after a refactor |
 | `--craap` | tests, coverage and complexity, CRAAP per function | before a commit |
 | `--loc` · `--dead-code` · `--deps` | file size, unused code, module boundaries | before handoff, after adding imports |
-| `--smoke` | starts the application once and loads it (`smoke.commands`) | after the app first starts, after changing how it starts |
+| `--smoke` | runs the outside-process core story and parses every probe (`smoke.story`), or runs a CLI/library entry point | after changing the core workflow or startup |
 | *(no check flags)* | **the ship report**: every enabled gate, including Runs (smoke) and Gate scope | before handoff, until it is green |
 | `--flaky` · `--mutation` | 3× repeated suite, mutation testing | only when the user asks |
 
@@ -71,7 +76,13 @@ people):
    — printed in every mode; when a run measures nothing it repeats the last
    measurement with its timestamp. Use it to plan tests, not to discover gaps
    at the end.
-4. `Since last run: fixed n · remaining m · new k` — compared with the
+4. `Extended metrics` in the HTML shows branch coverage, the slowest test,
+   extension-contract results, core-to-extension dependencies, failure-path
+   coverage, and silent handlers. Gate detail tables also show every structured
+   smoke probe, catch evidence type, and test-integrity violation. The
+   responsible function, test, scenario, dependency, handler, or probe remains
+   visible.
+5. `Since last run: fixed n · remaining m · new k` — compared with the
    previous state file, so a cycle's effect is visible without reading twice.
 5. `To fix:` up to twelve items (functions, oversized files, surviving
    mutants, dependency violations, then other failing gates). More than
@@ -146,13 +157,40 @@ the fast run once — that report is the evidence. The same pattern builds a new
 project in parallel: after the skeleton is green, the parent writes the shared
 contracts and their tests, then one sub-agent per directory.
 
-## Runs (smoke): the application must start
+## Runs (smoke): the core user story must work
 
-The ship report has a **Runs (smoke)** row. It executes `smoke.commands` from
-`.quality/quality-gate.json` and is red until a command is configured and
-green — a test suite that mocks the network cannot stand in for it. `--init`
-generates the command when it can (an npm `start` script, a Python package
-import); otherwise add one:
+The ship report has a **Runs (smoke)** row. For an interactive application,
+configure `smoke.story` in `.quality/quality-gate.json`. Its command drives the
+real application from outside the process and writes a fresh JSON report. The
+gate checks the command exit status, minimum probe count, every probe's `ok`
+value, and browser page errors. A command that exits 0 still fails if any probe
+fails. Unit tests or mocked network calls cannot stand in for this check.
+
+```json
+"smoke": {
+  "enabled": true,
+  "story": {
+    "name": "whiteboard core user story",
+    "command": ["python3", "ui_check.py", "http://127.0.0.1:3000", "{report_dir}"],
+    "report": ".quality/ui-check/report.json",
+    "format": "steps-json",
+    "minimum_probes": 10,
+    "fail_on_page_errors": true
+  }
+}
+```
+
+`{root}`, `{report}`, and `{report_dir}` are replaced with absolute paths.
+The report has this generic shape:
+
+```json
+{"steps": [{"step": "draw rectangle", "ok": true}], "page_errors": []}
+```
+
+The probe command owns application startup and cleanup when the app is not
+already running. Install the browser driver required by that script, such as
+Playwright plus Chromium. Use the bundled `smoke_check.py` only for a simpler
+load/readiness story, or `smoke.commands` for a CLI or library entry point:
 
 ```json
 "smoke": {"commands": [["python3", "<skill-directory>/scripts/smoke_check.py",

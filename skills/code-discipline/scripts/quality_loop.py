@@ -39,7 +39,7 @@ from repo_quality_gate import gate_status as gate_status  # noqa: E402
 from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
 from repo_quality_gate import state_status as state_status  # noqa: E402
 
-VERSION = "3.5.0"
+VERSION = "3.7.0"
 QUALITY_DIRECTORY = ".quality"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 CHECK_FLAGS: tuple[tuple[str, str], ...] = (
@@ -48,8 +48,15 @@ CHECK_FLAGS: tuple[tuple[str, str], ...] = (
     ("contracts", "contract/schema validation"),
     ("tests", "the test suite only"),
     ("coverage", "tests plus per-function coverage"),
+    ("branches", "tests plus per-function branch coverage"),
     ("complexity", "static complexity per function, no tests"),
     ("craap", "tests, coverage and complexity (CRAAP per function)"),
+    ("slow-tests", "suite and individual-test duration"),
+    ("extension-contracts", "configured extension scenarios"),
+    ("extension-deps", "core-to-extension dependency direction"),
+    ("failure-paths", "coverage of error-handling paths"),
+    ("silent-errors", "empty or silent error handlers"),
+    ("test-integrity", "vacuous same-package mocks and null render surfaces"),
     ("loc", "file size"),
     ("dead-code", "unused code"),
     ("deps", "module boundaries"),

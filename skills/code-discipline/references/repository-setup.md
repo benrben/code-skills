@@ -84,18 +84,21 @@ normalized `metrics.command` and `metrics.report` containing every production
 function.
 
 The numeric goals live only in `.quality/quality-thresholds.json`:
-`metrics.coverage_limit`, `metrics.complexity_limit`, and
-`metrics.craap_limit`. The default requires 100% executable-line coverage,
-cyclomatic complexity at most 6, and CRAAP at most 6 per function. Do not use
-file-average coverage or omit hard functions from an adapter report.
+`metrics.coverage_limit`, `metrics.branch_coverage_limit`,
+`metrics.complexity_limit`, and `metrics.craap_limit`. The default requires
+100% executable-line and branch coverage, cyclomatic complexity at most 6, and
+CRAAP at most 6 per function. Do not use file-average coverage or omit hard
+functions from an adapter report.
 
 The built-in metrics use these exact rules:
 
 - Function coverage is `covered executable lines / reported executable lines`.
   A line is covered when its hit count is greater than zero. Named nested
   function lines belong only to the nested function, not its parent. This is
-  line coverage; branch data may be collected by the test tool but is not part
-  of this percentage.
+  line coverage. Branch coverage is a separate per-function pass condition:
+  `covered branch outcomes / reported branch outcomes`. A function with no
+  decisions has 100% branch coverage. A function with decisions fails when the
+  configured coverage report does not contain branch data.
 - Python complexity starts at 1. It adds paths for conditionals, loops,
   exceptions, Boolean operators, comprehensions, and non-default `match`
   cases. Each comprehension `for` and filter adds one. Each extra OR-pattern
@@ -120,6 +123,105 @@ With the default 100% coverage limit, every passing function has
 `CRAAP = complexity`. The CRAAP value still ranks failures by risk, but it adds
 an independent pass condition only when a repository chooses a coverage limit
 below 100% or a CRAAP limit different from its complexity limit.
+
+### 4.1 Branch and slow-test adapters
+
+Prefer branch data from the repository's existing coverage tool. Python uses
+Coverage.py with `coverage run --branch` followed by `coverage json`. JavaScript
+and TypeScript use Istanbul JSON or LCOV with branch records. JVM projects use
+Cobertura or JaCoCo XML. Go cover profiles contain line/block coverage only, so
+use a normalized metrics adapter when branch coverage is required. Each
+normalized function may provide `covered_branches`, `total_branches`,
+`branch_coverage_percent`, and `branch_coverage_measured`.
+
+Slow-test detection needs no extra Python package when the runner can print
+timings: add `--durations 0` to `unittest` or `--durations=0` to pytest. For any
+other runner, generate JUnit XML and configure:
+
+```json
+{
+  "slow_tests": {
+    "enabled": true,
+    "report": "build/junit.xml",
+    "format": "junit",
+    "require_individual_timings": true
+  }
+}
+```
+
+The gate also accepts normalized JSON with a `tests` array. Every row contains
+`name`, `path`, `duration_seconds`, and optional `status`. The limits are
+`slow_tests.max_test_seconds` and `slow_tests.max_suite_seconds` in the
+threshold file. When individual timings are unavailable, the complete-suite
+limit is still enforced unless `require_individual_timings` is true.
+
+### 4.2 Extensibility and error handling
+
+Extensibility uses built-in commands and import analysis, so there is no
+required package. Configure one scenario for each supported extension type,
+plus the stable core and replaceable extension paths:
+
+```json
+{
+  "extensibility": {
+    "enabled": true,
+    "required": true,
+    "scenarios": [
+      {"name": "loads a third-party plug-in", "command": ["npm", "run", "test:plugin"]}
+    ],
+    "core": ["src/core/**"],
+    "extensions": ["src/plugins/**"]
+  }
+}
+```
+
+Contract coverage is the percentage of configured scenarios that pass. The
+dependency check fails when stable core files import replaceable extension
+files. Set the goals with `extensibility.contract_coverage_limit` and
+`extensibility.max_core_to_extension_dependencies`.
+
+Error handling is built in. The Python AST scanner finds `except` handlers;
+the generic scanner recognizes brace-style `catch` handlers and Go
+`err != nil` blocks. It reports two independent metrics: coverage of handler
+entry lines, and high-confidence silent handlers whose body is empty or only
+`pass`. For a brace-style `catch`, LCOV `BRDA` evidence on the catch entry has
+priority: the catch is covered only when that branch outcome ran. The scanner
+falls back to covered handler lines when the report has no catch-branch data.
+The HTML labels the evidence as `branch`, `line`, or `unmeasured`. Python
+`except` and Go error blocks use line evidence because their native reports do
+not identify a portable catch outcome. Configure the limits with
+`error_handling.failure_path_coverage_limit` and
+`error_handling.max_silent_handlers`. Failure-path coverage requires the same
+fresh line-coverage report used by the function gate.
+
+### 4.3 Composed-test integrity
+
+The built-in anti-vacuous-mock check needs no package. It applies only to test
+files identified as composed-root tests. Its intentionally narrow rules reject:
+
+- `vi.mock` or `jest.mock` of a relative production module inside the same
+  package; and
+- a canvas/render context replaced with `null`.
+
+External package mocks and lower-level tests outside the configured root-test
+patterns are allowed. Configure the patterns for the repository's application
+shells:
+
+```json
+{
+  "test_integrity": {
+    "enabled": true,
+    "required": true,
+    "composed_root_tests": ["**/App.test.*", "**/Root.test.*"],
+    "forbid_same_package_mocks": true,
+    "forbid_null_render_surfaces": true
+  }
+}
+```
+
+This is a structural guard, not a general mock detector. A composed-root test
+should use the real same-package modules and a usable render surface so it can
+observe repaint, synchronization, and composition failures.
 
 ### 5. Dead code
 
@@ -164,14 +266,23 @@ Prove one deliberately forbidden edge fails before trusting the CI rule.
 
 ### 9. Runs (smoke)
 
-Configure `smoke.commands` with the command that starts the application and
-loads it once; `--init` generates it for an npm `start` script or a Python
-package. For a web UI use the bundled `scripts/smoke_check.py` with
-`--browser` and `--expect-selector` for an element only a working page shows;
-for a CLI or library run its entry point. The ship report is red until this
-command is configured and passes. Install a headless browser when the check
-asks for one (`python3 -m pip install playwright && python3 -m playwright
-install chromium`).
+For an interactive app, configure `smoke.story` with the command that drives
+the complete core workflow from outside the process and writes structured JSON.
+Use `{report_dir}` when the probe accepts an output directory, or `{report}`
+when it accepts the exact file. Set `minimum_probes` to the expected story
+length and keep `fail_on_page_errors` enabled. The report must contain a
+`steps` array whose rows have `step` (or `name`) and Boolean `ok`, plus an
+optional `page_errors` array. The file must be created or changed by the current
+run; stale evidence fails.
+
+Install whatever the repository-owned probe needs. For Playwright this is
+normally the project package and its browser (`npm install -D playwright` and
+`npx playwright install chromium`, or the existing package-manager equivalents).
+The probe must start or attach to the real app, exercise the public UI/API, and
+clean up its process. For a CLI or library, configure `smoke.commands` with its
+real entry point. The simpler bundled `scripts/smoke_check.py` remains suitable
+when loading one page is the complete user story. The ship report is red until
+the configured smoke check passes.
 
 ## File LOC
 

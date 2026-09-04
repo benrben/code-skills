@@ -12,7 +12,12 @@ DETAIL_LIMIT = 8
 FIX_LIMIT = 12
 GAP_LIMIT = 4
 REPOSITORY = "(repository)"
-DEFAULT_LIMITS = {"coverage_limit": 100.0, "complexity_limit": 6.0, "craap_limit": 6.0}
+DEFAULT_LIMITS = {
+    "coverage_limit": 100.0,
+    "branch_coverage_limit": 100.0,
+    "complexity_limit": 6.0,
+    "craap_limit": 6.0,
+}
 HAND_OFF_LINE = (
     "HAND OFF NOW: the next message is the hand-off — list the deliverables (ticked) "
     "and quote the QUALITY_LOOP line. Do not add tools, configs, or checks after green."
@@ -125,14 +130,58 @@ def metric_limits(state: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def branch_failure(item: dict[str, Any], limits: dict[str, float]) -> bool:
+    if "branch_coverage_measured" not in item:
+        return False
+    if not item["branch_coverage_measured"]:
+        return True
+    return (
+        float(item.get("branch_coverage_percent", 100))
+        < limits["branch_coverage_limit"]
+    )
+
+
+def branch_hint(item: dict[str, Any], limits: dict[str, float]) -> str | None:
+    if not branch_failure(item, limits):
+        return None
+    if item["branch_coverage_measured"]:
+        return "add tests for the uncovered branch outcomes"
+    return "configure the coverage adapter to report branch outcomes"
+
+
+def branch_failure_text(item: dict[str, Any], failed: bool) -> str:
+    if not failed:
+        return ""
+    if not item["branch_coverage_measured"]:
+        return ", branch coverage not measured"
+    return f", branch coverage {item.get('branch_coverage_percent', 0):g}%"
+
+
+def function_metric(below_coverage: bool, branch_failed: bool) -> str:
+    if below_coverage:
+        return "coverage"
+    if branch_failed:
+        return "branch coverage"
+    return "complexity"
+
+
+def coverage_hint(item: dict[str, Any], limits: dict[str, float]) -> str | None:
+    if item["coverage_percent"] >= limits["coverage_limit"]:
+        return None
+    missing = item.get("total_lines", 0) - item.get("covered_lines", 0)
+    if missing > 0:
+        return f"add a test that reaches its {missing} uncovered lines"
+    return "add a test that reaches its untested paths"
+
+
 def function_hint(item: dict[str, Any], limits: dict[str, float]) -> str:
     hints: list[str] = []
-    if item["coverage_percent"] < limits["coverage_limit"]:
-        missing = item.get("total_lines", 0) - item.get("covered_lines", 0)
-        where = (
-            f"its {missing} uncovered lines" if missing > 0 else "its untested paths"
-        )
-        hints.append(f"add a test that reaches {where}")
+    coverage = coverage_hint(item, limits)
+    if coverage:
+        hints.append(coverage)
+    branch = branch_hint(item, limits)
+    if branch:
+        hints.append(branch)
     if item["complexity"] > limits["complexity_limit"]:
         hints.append(
             f"complexity {item['complexity']} > {limits['complexity_limit']:g}: "
@@ -148,6 +197,8 @@ def function_hint(item: dict[str, Any], limits: dict[str, float]) -> str:
 
 def function_record(item: dict[str, Any], limits: dict[str, float]) -> dict[str, Any]:
     below_coverage = item["coverage_percent"] < limits["coverage_limit"]
+    branch_failed = branch_failure(item, limits)
+    branch_text = branch_failure_text(item, branch_failed)
     return {
         "kind": "function",
         "path": item["path"],
@@ -155,10 +206,11 @@ def function_record(item: dict[str, Any], limits: dict[str, float]) -> dict[str,
         "key": f"function {item['path']} {item['name']}",
         "text": (
             f"{item['path']}:{item['line']} {item['name']} — "
-            f"coverage {item['coverage_percent']:g}%, complexity {item['complexity']}"
+            f"coverage {item['coverage_percent']:g}%{branch_text}, "
+            f"complexity {item['complexity']}"
         ),
         "hint": function_hint(item, limits),
-        "metric": "coverage" if below_coverage else "complexity",
+        "metric": function_metric(below_coverage, branch_failed),
     }
 
 
@@ -199,6 +251,18 @@ def dependency_record(item: dict[str, Any]) -> dict[str, Any]:
             "in the dependency rules"
         ),
         "metric": "dependency",
+    }
+
+
+def test_integrity_record(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": "test integrity",
+        "path": item["path"],
+        "line": item["line"],
+        "key": f"test integrity {item['path']} {item['line']} {item['kind']}",
+        "text": f"{item['path']}:{item['line']} {item['kind']} — {item['detail']}",
+        "hint": "use the real production subsystem in the composed-root test",
+        "metric": "test integrity",
     }
 
 
@@ -249,6 +313,7 @@ def itemized_gates(failures: dict[str, Any]) -> set[str]:
         ("file_loc", "files"),
         ("mutation", "surviving_mutants"),
         ("dependencies", "dependencies"),
+        ("test_integrity", "test_integrity"),
     )
     return {key for key, field in sources if failures.get(field)}
 
@@ -267,6 +332,9 @@ def item_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     records.extend(file_record(item) for item in failures["files"])
     records.extend(mutant_record(item) for item in failures["surviving_mutants"])
     records.extend(dependency_record(item) for item in failures["dependencies"])
+    records.extend(
+        test_integrity_record(item) for item in failures.get("test_integrity", [])
+    )
     records.extend(check_records(failures["checks"], itemized_gates(failures)))
     return records
 

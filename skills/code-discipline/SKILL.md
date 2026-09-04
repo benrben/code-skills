@@ -33,18 +33,21 @@ completely before running it.
    Never open `.quality/quality-gate-state.json` or the HTML. Run
    `quality_items.py --next` (printed as `Next file:`), fix that one file,
    rerun `--local-changes --fast`. One file per cycle. Add a check flag —
-   `--coverage`, `--craap`, `--lint`, `--types`, `--tests`, `--complexity`,
-   `--dead-code`, `--deps`, `--loc`, `--smoke` (they combine) — only when the
-   report points at one gate. Do not run the test suite by hand between
+   `--coverage`, `--branches`, `--slow-tests`, `--extension-contracts`,
+   `--extension-deps`, `--failure-paths`, `--silent-errors`,
+   `--test-integrity`, `--craap`, `--lint`, `--types`, `--tests`,
+   `--complexity`, `--dead-code`, `--deps`, `--loc`, `--smoke` (they combine) — only when the report points at one
+   gate. Do not run the test suite by hand between
    cycles: the fast run is the test run.
 3. **Foreground only.** Run the loop in the same command whose exit code you
    read. Never run it in the background, never wait for a notification, never
    end a session while a run is in flight.
-4. **The application must run.** The ship report includes **Runs (smoke)**:
-   `smoke.commands` starts the application and loads it once — a web UI in a
-   headless browser with `--expect-selector` for an element only a working
-   page shows. A test suite that mocks the network proves nothing about this.
-   The report is red until that command is configured and green.
+4. **The core user story must run.** The ship report includes **Runs (smoke)**.
+   For a web app, `smoke.story` runs a deterministic outside-process probe and
+   parses its fresh step report; every required probe and page-error check must
+   pass. Use `smoke.commands` only for a CLI or library entry point. A unit test
+   or a one-drag browser check does not prove a composed workflow. The report
+   is red until the configured story is green.
 5. **Not finished until the ship report is green.** Before handoff run the
    ship report — no check flags: `--local-changes` for a change to an
    existing repository, `--root .` alone for a new project. Fix every red

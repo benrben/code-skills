@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "format_lint": {
     "max_violations": 0
   },
@@ -12,8 +12,21 @@
   "metrics": {
     "max_test_failures": 0,
     "coverage_limit": 100,
+    "branch_coverage_limit": 100,
     "complexity_limit": 6,
     "craap_limit": 6
+  },
+  "slow_tests": {
+    "max_test_seconds": 5,
+    "max_suite_seconds": 300
+  },
+  "extensibility": {
+    "contract_coverage_limit": 100,
+    "max_core_to_extension_dependencies": 0
+  },
+  "error_handling": {
+    "failure_path_coverage_limit": 100,
+    "max_silent_handlers": 0
   },
   "file_loc": {
     "max_lines": 600
