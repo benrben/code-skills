@@ -33,7 +33,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+DRAG_NEEDS_PYTHON = "--drag needs Python Playwright (pip install playwright); the node runner cannot drag"
 DEFAULT_TIMEOUT_SECONDS = 60
 POLL_SECONDS = 0.25
 STOP_GRACE_SECONDS = 5
@@ -72,6 +73,8 @@ class PageExpectations:
     selector: str | None = None
     text: str | None = None
     fail_on_text: str | None = DEFAULT_FAIL_PATTERN
+    drag: str | None = None
+    clicks: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,6 +89,7 @@ class SmokeOptions:
     timeout: float
     env: dict[str, str]
     expectations: PageExpectations = PageExpectations()
+    probes: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -209,6 +213,80 @@ def page_expectation_errors(
     return errors
 
 
+def parse_probe(spec: str) -> tuple[str, str, str | None]:
+    """Split "METHOD /path [body]" into its parts; raise ValueError when malformed."""
+    parts = spec.split(maxsplit=2)
+    if len(parts) < 2 or not parts[0].isalpha() or not parts[1].startswith("/"):
+        raise ValueError(f"probe must look like 'POST /path [json]': {spec!r}")
+    return parts[0].upper(), parts[1], parts[2] if len(parts) == 3 else None
+
+
+def run_probe(base_url: str, spec: str, timeout: float) -> str | None:
+    """Issue one write-path request; a 5xx or no answer is a failure."""
+    method, path, body = parse_probe(spec)
+    request = urllib.request.Request(
+        base_url.rstrip("/") + path,
+        data=body.encode() if body else None,
+        method=method,
+        headers={"Content-Type": "application/json"} if body else {},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    except OSError as error:
+        return f"probe {spec!r}: no answer ({error})"
+    if status >= 500:
+        return f"probe {spec!r}: HTTP {status}"
+    return None
+
+
+def probe_errors(base_url: str, probes: Sequence[str], timeout: float) -> list[str]:
+    errors = []
+    for spec in probes:
+        error = run_probe(base_url, spec, timeout)
+        if error is not None:
+            errors.append(error)
+    return errors
+
+
+def health_recheck(url: str, timeout: float) -> str | None:
+    """After the page load, drag, and probes: is the application still answering?"""
+    status = http_status(url, min(timeout, 10))
+    if status is not None and status_ok(status):
+        return None
+    return (
+        "application stopped answering after the smoke interactions "
+        f"(HTTP {status}) — it likely crashed on a write"
+    )
+
+
+def perform_clicks(page: Any, selectors: Sequence[str]) -> str | None:
+    for selector in selectors:
+        try:
+            page.click(selector, timeout=5000)
+        except Exception as error:  # noqa: BLE001 — any click failure fails the smoke
+            return f"click failed on {selector}: {error}"
+    return None
+
+
+def perform_drag(page: Any, selector: str) -> str | None:
+    element = page.query_selector(selector)
+    if element is None:
+        return f"drag target not found: {selector}"
+    box = element.bounding_box()
+    if box is None:
+        return f"drag target has no visible box: {selector}"
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 60, y + 40, steps=4)
+    page.mouse.up()
+    page.wait_for_timeout(1000)
+    return None
+
+
 def collect_page_errors(
     sync_playwright: Any, url: str, timeout: float, expectations: PageExpectations
 ) -> list[str]:
@@ -224,6 +302,14 @@ def collect_page_errors(
             expectations.selector is None
             or page.query_selector(expectations.selector) is not None
         )
+        if expectations.clicks:
+            click_error = perform_clicks(page, expectations.clicks)
+            if click_error is not None:
+                errors.append(click_error)
+        if expectations.drag:
+            drag_error = perform_drag(page, expectations.drag)
+            if drag_error is not None:
+                errors.append(drag_error)
         errors.extend(
             page_expectation_errors(expectations, found, page.inner_text("body"))
         )
@@ -285,6 +371,8 @@ def browser_errors(
     url: str, cwd: Path, timeout: float, expectations: PageExpectations
 ) -> list[str]:
     errors = python_playwright_errors(url, timeout, expectations)
+    if errors is None and (expectations.drag or expectations.clicks):
+        return [DRAG_NEEDS_PYTHON]
     if errors is None:
         errors = node_playwright_errors(url, cwd, timeout, expectations)
     if errors is None:
@@ -299,11 +387,25 @@ def judge(url: str, status: int | None, options: SmokeOptions) -> SmokeOutcome:
         )
     if not status_ok(status):
         return SmokeOutcome(False, url, status, reason=f"HTTP {status}")
-    if not options.browser:
-        return SmokeOutcome(True, url, status)
-    errors = browser_errors(url, options.cwd, options.timeout, options.expectations)
-    reason = "page loaded with errors" if errors else ""
+    errors = interaction_errors(url, options)
+    if not options.browser and not options.probes:
+        return SmokeOutcome(not errors, url, status, errors)
+    reason = "the smoke interactions failed" if errors else ""
     return SmokeOutcome(not errors, url, status, errors, reason)
+
+
+def interaction_errors(url: str, options: SmokeOptions) -> list[str]:
+    errors: list[str] = []
+    if options.browser:
+        errors.extend(
+            browser_errors(url, options.cwd, options.timeout, options.expectations)
+        )
+    errors.extend(probe_errors(url, options.probes, options.timeout))
+    if options.browser or options.probes:
+        after = health_recheck(url, options.timeout)
+        if after is not None:
+            errors.append(after)
+    return errors
 
 
 def build_env(options: SmokeOptions, port: int | None) -> dict[str, str]:
@@ -400,6 +502,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="with --browser: fail when the page text matches (default: error-looking words; pass '' to disable)",
     )
     parser.add_argument(
+        "--click",
+        action="append",
+        default=[],
+        metavar="SELECTOR",
+        help="with --browser: click this element before the drag (e.g. pick a draw tool)",
+    )
+    parser.add_argument(
+        "--drag",
+        metavar="SELECTOR",
+        help="with --browser: press-drag-release on this element (exercises the write path)",
+    )
+    parser.add_argument(
+        "--probe",
+        action="append",
+        default=[],
+        metavar="'METHOD /path [json]'",
+        help="after the load: issue this request; 5xx, no answer, or a crash fails the smoke",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
@@ -430,8 +551,13 @@ def options_from_args(args: argparse.Namespace) -> SmokeOptions:
         timeout=args.timeout,
         env=parse_env(args.env),
         expectations=PageExpectations(
-            args.expect_selector, args.expect_text, args.fail_on_text or None
+            args.expect_selector,
+            args.expect_text,
+            args.fail_on_text or None,
+            args.drag,
+            tuple(args.click),
         ),
+        probes=tuple(args.probe),
     )
 
 

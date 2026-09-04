@@ -39,7 +39,7 @@ from repo_quality_gate import gate_status as gate_status  # noqa: E402
 from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
 from repo_quality_gate import state_status as state_status  # noqa: E402
 
-VERSION = "3.5.0"
+VERSION = "3.7.0"
 QUALITY_DIRECTORY = ".quality"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 CHECK_FLAGS: tuple[tuple[str, str], ...] = (

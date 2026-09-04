@@ -95,8 +95,13 @@ them. Nothing is skipped silently: skipped, deferred, and off gates are listed.
   the full ship report).
 - Exit `1`: read the `To fix` list, run `quality_items.py --next` for the
   items of the first file, fix that file, and rerun the same command. Never
-  open the state file yourself; the items script reads it. In fast mode exit
-  1 may instead mean READY_FOR_FULL: commit the step and continue.
+  open the state file yourself; the items script reads it. Verify a fix with
+  that file's own test only; the suite, coverage, types, and lint all run in
+  the next fast run — one turn instead of four. In fast mode exit 1 may
+  instead mean READY_FOR_FULL: commit the step (the report prints the exact
+  one-line command) and continue. A fast run whose local-changes scope is
+  empty (everything committed) measures nothing and says so; it never prints
+  READY_FOR_FULL.
 - Exit `2`: configuration, an adapter, or the runner failed; repair that
   blocker first — it is an item to fix, not a reason to stop.
 
@@ -165,7 +170,13 @@ import); otherwise add one:
 repository's `node_modules/playwright`) and fails on any page error, console
 error, a missing `--expect-selector`, missing `--expect-text`, or page text
 that looks like a failure (`error`, `exception`, `failed`, `could not`;
-override with `--fail-on-text`). It always stops the process. For a CLI or
+override with `--fail-on-text`). **Exercise one write path**: `--click
+SELECTOR` (repeatable) picks a tool, `--drag SELECTOR` press-drag-releases on
+the working surface (both need Python Playwright) — a drag with the default
+select tool usually writes nothing, so click a drawing tool first — and each
+`--probe 'METHOD /path [json]'` issues a request that must not 5xx; after the drag and probes the server must still answer — an
+application that crashes on its first save fails the smoke. It always stops
+the process. For a CLI or
 library use the entry point itself (`["python3", "-c", "import pkg"]` or
 `--help`). In fast mode the row is deferred; `--smoke` runs it alone.
 

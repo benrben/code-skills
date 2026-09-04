@@ -1,5 +1,6 @@
 import contextlib
 import errno
+import http.server
 import importlib.util
 import io
 import json
@@ -4060,7 +4061,12 @@ class LoopReportTests(unittest.TestCase):
             quality_report.next_step_lines(
                 {**state, "status": "ready_for_full"}, SimpleNamespace(mode="fast")
             ),
-            [quality_report.COMMIT_LINE, "  full"],
+            [
+                quality_report.COMMIT_LINE,
+                quality_report.COMMIT_COMMAND,
+                quality_report.CONTINUE_LINE,
+                "  full",
+            ],
         )
         self.assertEqual(
             quality_report.next_step_lines(
@@ -4477,11 +4483,43 @@ class FakeProcess:
         return self.output, None
 
 
+class FakeElement:
+    def __init__(self, box: dict[str, float] | None) -> None:
+        self.box = box
+
+    def bounding_box(self) -> dict[str, float] | None:
+        return self.box
+
+
+class FakeMouse:
+    def __init__(self) -> None:
+        self.actions: list[str] = []
+
+    def move(self, x: float, y: float, steps: int = 1) -> None:
+        self.actions.append(f"move {x:g},{y:g}")
+
+    def down(self) -> None:
+        self.actions.append("down")
+
+    def up(self) -> None:
+        self.actions.append("up")
+
+
 class FakePage:
     def __init__(self, events: list[tuple[str, Any]]) -> None:
         self.handlers: dict[str, Any] = {}
         self.events = events
         self.visited: list[str] = []
+        self.clicked: list[str] = []
+        self.mouse = FakeMouse()
+        self.boxes: dict[str, dict[str, float] | None] = {
+            "canvas": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 60.0}
+        }
+
+    def click(self, selector: str, timeout: int = 0) -> None:
+        if "missing" in selector:
+            raise RuntimeError("not found")
+        self.clicked.append(selector)
 
     def on(self, name: str, handler: Any) -> None:
         self.handlers[name] = handler
@@ -4495,7 +4533,9 @@ class FakePage:
         return None
 
     def query_selector(self, selector: str) -> Any:
-        return object() if selector == "canvas" else None
+        if selector in self.boxes:
+            return FakeElement(self.boxes[selector])
+        return object() if selector == "canvas#extra" else None
 
     def inner_text(self, _selector: str) -> str:
         return "Whiteboard ready"
@@ -4592,20 +4632,24 @@ class SmokeCheckTests(unittest.TestCase):
         self.assertEqual(missing.reason, "no HTTP answer within 3s")
         self.assertEqual(smoke_check.judge("u", 500, options).reason, "HTTP 500")
         self.assertTrue(smoke_check.judge("u", 200, options).passed)
-        with mock.patch.object(smoke_check, "browser_errors", lambda *a: []):
+        health_ok = mock.patch.object(smoke_check, "health_recheck", lambda *a: None)
+        with health_ok, mock.patch.object(smoke_check, "browser_errors", lambda *a: []):
             clean = smoke_check.judge("u", 200, smoke_options(browser=True))
         self.assertTrue(clean.passed)
-        with mock.patch.object(
-            smoke_check, "browser_errors", lambda *a: ["console: boom"]
+        with (
+            health_ok,
+            mock.patch.object(
+                smoke_check, "browser_errors", lambda *a: ["console: boom"]
+            ),
         ):
             broken = smoke_check.judge("u", 200, smoke_options(browser=True))
         self.assertFalse(broken.passed)
-        self.assertEqual(broken.reason, "page loaded with errors")
+        self.assertEqual(broken.reason, "the smoke interactions failed")
         self.assertEqual(
             broken.lines(),
             [
                 "SMOKE=FAIL url=u http=200",
-                "reason: page loaded with errors",
+                "reason: the smoke interactions failed",
                 "  console: boom",
             ],
         )
@@ -5034,8 +5078,44 @@ class ReportGroupingTests(unittest.TestCase):
             "full_rerun_command": "f",
         }
         lines = quality_report.next_step_lines(state, SimpleNamespace(mode="fast"))
-        self.assertEqual(lines, [quality_report.COMMIT_LINE, "  f"])
-        self.assertIn("Commit this step (git commit), then continue", lines[0])
+        self.assertEqual(
+            lines,
+            [
+                quality_report.COMMIT_LINE,
+                quality_report.COMMIT_COMMAND,
+                quality_report.CONTINUE_LINE,
+                "  f",
+            ],
+        )
+        self.assertIn("git add -A && git commit -m", lines[1])
+
+    def test_empty_incremental_scope_never_reads_as_certification(self) -> None:
+        state = {
+            "status": "fail",
+            "rerun_command": "r",
+            "full_rerun_command": "python3 loop.py --root . --local-changes",
+            "scope": {"kind": "local_changes", "reference": None, "changed_files": []},
+        }
+        self.assertTrue(quality_report.empty_incremental_scope(state))
+        lines = quality_report.next_step_lines(state, SimpleNamespace(mode="fast"))
+        self.assertEqual(lines[0], quality_report.EMPTY_SCOPE_LINE)
+        self.assertEqual(lines[1], "Run the whole-repository ship report:")
+        self.assertEqual(lines[2], "  python3 loop.py --root .")
+        self.assertEqual(
+            quality_report.whole_repository_command(
+                "l.py --root . --commit HEAD --fast"
+            ),
+            "l.py --root . --fast",
+        )
+        state["scope"] = {"kind": "local_changes", "changed_files": ["a.ts"]}
+        self.assertFalse(quality_report.empty_incremental_scope(state))
+        self.assertEqual(
+            quality_report.next_step_lines(state, SimpleNamespace(mode="fast"))[0],
+            "Fix the items above, then rerun:",
+        )
+        self.assertFalse(quality_report.empty_incremental_scope({"status": "fail"}))
+        commit_scope = {"kind": "commit", "reference": "HEAD", "changed_files": []}
+        self.assertTrue(quality_report.empty_incremental_scope({"scope": commit_scope}))
 
     def test_report_prints_delta_and_next_file(self) -> None:
         analysis = SimpleNamespace(
@@ -5240,3 +5320,267 @@ class InitGitTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("Initialized an empty git repository", completed.stdout)
             self.assertTrue((root / ".git").is_dir())
+
+
+class EmptyScopeAnalysisTests(unittest.TestCase):
+    def analysis(self, scope: object) -> object:
+        passing = SimpleNamespace(passed=True, skipped=False, deferred=False)
+        return gate.AnalysisReport(
+            root=".",
+            generated_at="now",
+            languages=[],
+            gates=[passing],
+            functions=[],
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+            mode="fast",
+            scope=scope,
+        )
+
+    def test_empty_local_changes_scope_never_passes_or_readies(self) -> None:
+        empty = gate.GateScope("local_changes", ())
+        report = self.analysis(empty)
+        self.assertTrue(report.scope_is_empty)
+        self.assertFalse(report.passed)
+        self.assertFalse(report.ready_for_full)
+        self.assertEqual(gate.state_status(report, None), "fail")
+
+    def test_populated_and_repository_scopes_still_certify(self) -> None:
+        populated = self.analysis(gate.GateScope("local_changes", ("a.ts",)))
+        self.assertFalse(populated.scope_is_empty)
+        self.assertTrue(populated.ready_for_full)
+        self.assertTrue(populated.selected_passed)
+        whole = self.analysis(gate.repository_scope())
+        whole.mode = "full"
+        self.assertFalse(whole.scope_is_empty)
+        self.assertTrue(whole.passed)
+        empty_commit = self.analysis(gate.GateScope("commit", (), "HEAD"))
+        empty_commit.mode = "full"
+        self.assertFalse(empty_commit.passed)
+        self.assertFalse(empty_commit.selected_passed)
+
+
+class InitScaleMessageTests(unittest.TestCase):
+    def seeded_root(self, temporary: str, files: int) -> Path:
+        root = Path(temporary)
+        for index in range(files):
+            (root / f"module_{index}.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return root
+
+    def test_small_repositories_get_no_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.seeded_root(temporary, 3)
+            self.assertIsNone(gate.init_scale_message(root, {}))
+
+    def test_new_project_with_many_files_gets_the_rule_1_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.seeded_root(temporary, 11)
+            message = gate.init_scale_message(root, {})
+            assert message is not None
+            self.assertIn("WARNING: 11 source files", message)
+            self.assertIn("Rule 1", message)
+            self.assertIn("rule 9", message)
+
+    def test_repository_with_history_gets_the_adoption_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.seeded_root(temporary, 12)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            git = ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+            subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+            subprocess.run(
+                [*git, "commit", "-qm", "one"], check=True, capture_output=True
+            )
+            (root / "extra.py").write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+            subprocess.run(
+                [*git, "commit", "-qm", "two"], check=True, capture_output=True
+            )
+            self.assertEqual(gate.commit_count(root), 2)
+            message = gate.init_scale_message(root, {})
+            assert message is not None
+            self.assertIn("Existing repository: 13 source files", message)
+            self.assertIn("quality_items.py", message)
+
+    def test_commit_count_is_zero_without_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(gate.commit_count(Path(temporary)), 0)
+
+
+class ProbeHandler(http.server.BaseHTTPRequestHandler):
+    def _answer(self) -> None:
+        status = 500 if "boom" in self.path else 200
+        self.send_response(status)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_GET(self) -> None:
+        self._answer()
+
+    def do_POST(self) -> None:
+        self._answer()
+
+    def log_message(self, *args: Any) -> None:
+        return None
+
+
+class SmokeWritePathTests(unittest.TestCase):
+    def serve(self) -> tuple[Any, str]:
+        server = http.server.HTTPServer(("127.0.0.1", 0), ProbeHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_port}"
+
+    def test_parse_probe_accepts_method_path_and_optional_body(self) -> None:
+        self.assertEqual(
+            smoke_check.parse_probe("post /api/x {}"), ("POST", "/api/x", "{}")
+        )
+        self.assertEqual(smoke_check.parse_probe("GET /"), ("GET", "/", None))
+        for bad in ("nope", "POST api", "1 /x"):
+            with self.assertRaises(ValueError):
+                smoke_check.parse_probe(bad)
+
+    def test_run_probe_flags_5xx_and_no_answer_only(self) -> None:
+        server, base = self.serve()
+        try:
+            self.assertIsNone(smoke_check.run_probe(base, "POST /api/ok {}", 5))
+            error = smoke_check.run_probe(base, "POST /api/boom {}", 5)
+            assert error is not None
+            self.assertIn("HTTP 500", error)
+        finally:
+            server.shutdown()
+        dead = smoke_check.run_probe("http://127.0.0.1:9", "GET /", 0.3)
+        assert dead is not None
+        self.assertIn("no answer", dead)
+        self.assertEqual(smoke_check.probe_errors(base, (), 1), [])
+
+    def test_health_recheck_reports_a_crashed_application(self) -> None:
+        server, base = self.serve()
+        try:
+            self.assertIsNone(smoke_check.health_recheck(base + "/", 5))
+        finally:
+            server.shutdown()
+        message = smoke_check.health_recheck("http://127.0.0.1:9/", 0.3)
+        assert message is not None
+        self.assertIn("stopped answering after the smoke interactions", message)
+        self.assertIn("crashed on a write", message)
+
+    def test_judge_fails_when_the_app_dies_after_the_probes(self) -> None:
+        options = smoke_check.SmokeOptions(
+            start=None,
+            cwd=Path("."),
+            url="http://127.0.0.1:9/",
+            path="/",
+            port=None,
+            port_env="PORT",
+            browser=False,
+            timeout=0.3,
+            env={},
+            probes=("GET /",),
+        )
+        outcome = smoke_check.judge("http://127.0.0.1:9/", 200, options)
+        self.assertFalse(outcome.passed)
+        joined = " ".join(outcome.errors)
+        self.assertIn("no answer", joined)
+        self.assertIn("stopped answering", joined)
+        self.assertEqual(outcome.reason, "the smoke interactions failed")
+
+    def test_perform_drag_drives_the_mouse_or_reports_the_target(self) -> None:
+        page = FakePage([])
+        self.assertIsNone(smoke_check.perform_drag(page, "canvas"))
+        self.assertEqual(
+            page.mouse.actions, ["move 60,50", "down", "move 120,90", "up"]
+        )
+        self.assertEqual(
+            smoke_check.perform_drag(page, "#missing"),
+            "drag target not found: #missing",
+        )
+        page.boxes["#flat"] = None
+        self.assertEqual(
+            smoke_check.perform_drag(page, "#flat"),
+            "drag target has no visible box: #flat",
+        )
+
+    def test_collect_page_errors_runs_clicks_then_the_drag(self) -> None:
+        page = FakePage([])
+        playwright = FakePlaywright(page)
+        expectations = smoke_check.PageExpectations(
+            selector="canvas",
+            fail_on_text=None,
+            drag="canvas",
+            clicks=("button.rect",),
+        )
+        errors = smoke_check.collect_page_errors(
+            playwright, "http://x/", 1, expectations
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(page.clicked, ["button.rect"])
+        self.assertIn("down", page.mouse.actions)
+        bad = smoke_check.PageExpectations(
+            fail_on_text=None, clicks=("button.missing",)
+        )
+        errors = smoke_check.collect_page_errors(playwright, "http://x/", 1, bad)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("click failed on button.missing", errors[0])
+        self.assertIsNone(smoke_check.perform_clicks(page, ()))
+        bad_drag = smoke_check.PageExpectations(fail_on_text=None, drag="#gone")
+        errors = smoke_check.collect_page_errors(playwright, "http://x/", 1, bad_drag)
+        self.assertEqual(errors, ["drag target not found: #gone"])
+
+    def test_drag_without_python_playwright_is_an_explicit_error(self) -> None:
+        expectations = smoke_check.PageExpectations(drag="canvas")
+        with mock.patch.object(
+            smoke_check, "python_playwright_errors", return_value=None
+        ):
+            errors = smoke_check.browser_errors("http://x/", Path("."), 1, expectations)
+        self.assertEqual(errors, [smoke_check.DRAG_NEEDS_PYTHON])
+
+    def test_parse_args_wires_probe_and_drag(self) -> None:
+        args = smoke_check.parse_args(
+            [
+                "--url",
+                "http://x/",
+                "--drag",
+                "canvas",
+                "--click",
+                "button.rect",
+                "--probe",
+                "POST /a {}",
+                "--probe",
+                "GET /b",
+            ]
+        )
+        options = smoke_check.options_from_args(args)
+        self.assertEqual(options.probes, ("POST /a {}", "GET /b"))
+        self.assertEqual(options.expectations.drag, "canvas")
+        self.assertEqual(options.expectations.clicks, ("button.rect",))
+
+
+class InitScaleThresholdTests(unittest.TestCase):
+    def test_threshold_scales_with_package_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(gate.init_scale_threshold(root), 10)
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            for name in ("a", "b"):
+                package = root / "packages" / name
+                package.mkdir(parents=True)
+                (package / "package.json").write_text("{}", encoding="utf-8")
+            nested = root / "node_modules" / "x"
+            nested.mkdir(parents=True)
+            (nested / "package.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(gate.package_manifest_count(root), 3)
+            self.assertEqual(gate.init_scale_threshold(root), 20)
+            for index in range(15):
+                (root / f"module_{index}.py").write_text(
+                    "VALUE = 1\n", encoding="utf-8"
+                )
+            self.assertIsNone(gate.init_scale_message(root, {}))
+            for index in range(15, 25):
+                (root / f"module_{index}.py").write_text(
+                    "VALUE = 1\n", encoding="utf-8"
+                )
+            message = gate.init_scale_message(root, {})
+            assert message is not None
+            self.assertIn("source files exist", message)

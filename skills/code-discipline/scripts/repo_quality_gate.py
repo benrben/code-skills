@@ -439,6 +439,7 @@ class AnalysisReport:
     def passed(self) -> bool:
         return (
             self.mode == "full"
+            and not self.scope_is_empty
             and bool(self.gates)
             and all(gate.passed for gate in self.gates)
         )
@@ -446,18 +447,25 @@ class AnalysisReport:
     @property
     def selected_passed(self) -> bool:
         """True when every gate this run actually executed passed (partial runs never certify)."""
+        if self.scope_is_empty:
+            return False
         executed = [
             gate for gate in self.gates if not gate.skipped and not gate.deferred
         ]
         return bool(executed) and all(gate.passed for gate in executed)
 
     @property
+    def scope_is_empty(self) -> bool:
+        """An incremental scope with no files measures nothing and must never certify."""
+        return self.scope.incremental and not self.scope.paths
+
+    @property
     def ready_for_full(self) -> bool:
-        executed = [gate for gate in self.gates if not gate.deferred]
         return (
             self.mode == "fast"
-            and bool(executed)
-            and all(gate.passed for gate in executed)
+            and not self.scope_is_empty
+            and bool(gates := [gate for gate in self.gates if not gate.deferred])
+            and all(gate.passed for gate in gates)
         )
 
 
@@ -6523,6 +6531,45 @@ def smoke_template(root: Path) -> dict[str, Any]:
     return {"commands": commands, "_note": note}
 
 
+def commit_count(root: Path) -> int:
+    completed = subprocess.run(
+        ["git", "-C", str(root), "rev-list", "--count", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return int(completed.stdout.strip()) if completed.returncode == 0 else 0
+
+
+def package_manifest_count(root: Path) -> int:
+    return sum(
+        1
+        for path in walk_files(root)
+        if path.name == "package.json" and "node_modules" not in path.parts
+    )
+
+
+def init_scale_threshold(root: Path) -> int:
+    """A multi-package skeleton legitimately has more files before the first feature."""
+    return 10 + 5 * max(0, package_manifest_count(root) - 1)
+
+
+def init_scale_message(root: Path, source_config: dict[str, Any]) -> str | None:
+    """Warn at --init when the gate arrives after the code did (SKILL.md rule 1)."""
+    sources = len(discover_source_files(root, source_config))
+    if sources <= init_scale_threshold(root):
+        return None
+    if commit_count(root) <= 1:
+        return (
+            f"WARNING: {sources} source files exist and the gate is only now being "
+            "initialized. Rule 1 puts the gate before the first feature; expect a "
+            "large first report and fan it out per rule 9."
+        )
+    return (
+        f"Existing repository: {sources} source files enter the gate now. Expect a "
+        "large first report; work it with quality_items.py and rule 9's fan-out."
+    )
+
+
 def ensure_git_repository(root: Path) -> str | None:
     """Create a git repository at ``root`` when none exists; returns the line to print."""
     if (root / ".git").exists():
@@ -6538,8 +6585,12 @@ def ensure_git_repository(root: Path) -> str | None:
 
 def smoke_init_message(commands: Sequence[Sequence[str]]) -> str:
     if commands:
-        return f"Runs (smoke): the ship report starts the application with {shlex.join(commands[0])}; adjust smoke.commands if that is not how it starts."
-    return "Runs (smoke): no start command detected. Add smoke.commands (start the application and load it once); the ship report is red until it is green."
+        return (
+            f"Runs (smoke): the ship report starts the application with {shlex.join(commands[0])}; adjust smoke.commands if that is not how it starts. "
+            "Give the browser check --expect-selector for an element only a working page shows, and exercise one write path "
+            "(--drag <selector> on the working surface, or --probe 'POST /api/... {}'): a page that only loads proves nothing about saving."
+        )
+    return "Runs (smoke): no start command detected. Add smoke.commands (start the application, load it once, and exercise one write path with --drag or --probe); the ship report is red until it is green."
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -6668,6 +6719,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         git_line = ensure_git_repository(root)
         if git_line:
             print(git_line)
+        scale_line = init_scale_message(root, config_template(root).get("source", {}))
+        if scale_line:
+            print(scale_line)
         print(
             "Review source, format/lint, types, contracts, tests, metrics, dead-code, and dependency settings before the first enforcing run."
         )

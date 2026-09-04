@@ -1,6 +1,6 @@
 ---
 name: code-discipline
-description: Engineering discipline for any programming language. Use whenever code is written, reviewed, refactored, debugged, tested, or designed. Enforces behavior-preserving changes, regression tests, explicit failure behavior, readable design, and the bundled incremental quality loop when a repository has configured it.
+description: Engineering discipline for any programming language. Use whenever code is written, reviewed, refactored, debugged, tested, or designed — including quick fixes, new projects started from scratch, and any task that ends with code being handed off, even when nobody says the word quality. Enforces behavior-preserving changes, regression tests, explicit failure behavior, readable design, and the bundled incremental quality loop (bootstrap it before the first source file in new projects; run it wherever .quality/ exists). Work is finished only when the ship report is green and the application has survived one real interaction.
 ---
 
 # The Zen of Modern Development
@@ -35,16 +35,26 @@ completely before running it.
    rerun `--local-changes --fast`. One file per cycle. Add a check flag —
    `--coverage`, `--craap`, `--lint`, `--types`, `--tests`, `--complexity`,
    `--dead-code`, `--deps`, `--loc`, `--smoke` (they combine) — only when the
-   report points at one gate. Do not run the test suite by hand between
-   cycles: the fast run is the test run.
+   report points at one gate. Verify a fix with that file's own test only
+   (for example `npx vitest run path/to/x.test.ts`); scoped, single-file
+   tool runs are fine while iterating, but repository-wide suites, coverage,
+   type checking, and lint belong to the fast run, which does them all in
+   one turn — never re-run those by hand. Trust your writes:
+   re-read a file only after an error or before editing one you did not just
+   write.
 3. **Foreground only.** Run the loop in the same command whose exit code you
    read. Never run it in the background, never wait for a notification, never
    end a session while a run is in flight.
-4. **The application must run.** The ship report includes **Runs (smoke)**:
-   `smoke.commands` starts the application and loads it once — a web UI in a
-   headless browser with `--expect-selector` for an element only a working
-   page shows. A test suite that mocks the network proves nothing about this.
-   The report is red until that command is configured and green.
+4. **The application must run — and survive one write.** The ship report
+   includes **Runs (smoke)**: `smoke.commands` starts the application, loads
+   it once (a web UI in a headless browser with `--expect-selector` for an
+   element only a working page shows), and exercises one write path —
+   `--click` a tool then `--drag` the working surface, or
+   `--probe 'POST /api/... {}'` — then
+   re-checks the server still answers. An application that crashes on its
+   first save fails this row, as it should. A test suite that mocks the
+   network proves nothing about any of this. The report is red until the
+   command is configured and green.
 5. **Not finished until the ship report is green.** Before handoff run the
    ship report — no check flags: `--local-changes` for a change to an
    existing repository, `--root .` alone for a new project. Fix every red
@@ -59,13 +69,16 @@ completely before running it.
 7. **Green means hand off now.** The message after `QUALITY_LOOP=PASS` is the
    hand-off: the deliverables, ticked, and the report's status line. Do not
    add tools, configs, or checks after green.
-8. **Commit each green step.** When the fast run prints READY_FOR_FULL,
-   commit the step locally (`git add -A && git commit -m …`); `--init`
-   creates the repository when there is none. The next step's fast run then
-   measures only what changed. Never push, amend, or rewrite history unless
-   the user asks.
-9. **Fan out, measure once.** When the report lists items in more than one
-   file, or a feature splits into independent directories, use sub-agents
+8. **Commit each green step, one feature at a time.** A step is a feature,
+   not a micro-edit: one fast run when the feature's tests and code exist,
+   one more before the commit at most. At READY_FOR_FULL commit in a single
+   command (`git add -A && git commit -m "…"` — the report prints it);
+   `--init` creates the repository when there is none. The next step's fast
+   run then measures only what changed. An empty local-changes run certifies
+   nothing. Never push, amend, or rewrite history unless the user asks.
+9. **Fan out, measure once.** When the report lists more than 12 items
+   across more than 3 files, or a feature splits into independent
+   directories, use sub-agents
    (the Agent tool): one per production file plus its test file, or one per
    directory, at most four at once, all in the foreground.
    `quality_items.py --briefs 4` prints the briefs. You keep the gate,
@@ -132,6 +145,9 @@ rewriting history needs the user.
 - When asked to go fast, name what you're cutting — never silently drop
   error handling on money, auth, or data, or tests on the riskiest logic.
   Record every deferral as a TODO with its reason.
+- A client that talks to a server must detect disconnection, surface it to
+  the user, and reconnect or say it cannot; edits made while offline are
+  either queued or visibly refused — never silently dropped.
 
 ## Duplication is cheaper than the wrong abstraction.
 

@@ -17,9 +17,12 @@ HAND_OFF_LINE = (
     "HAND OFF NOW: the next message is the hand-off — list the deliverables (ticked) "
     "and quote the QUALITY_LOOP line. Do not add tools, configs, or checks after green."
 )
-COMMIT_LINE = (
-    "Fast checks are green. Commit this step (git commit), then continue. "
-    "Before hand-off run the full ship report:"
+COMMIT_LINE = "Fast checks are green. Commit this step in one command:"
+COMMIT_COMMAND = '  git add -A && git commit -m "<one line: what this step did>"'
+CONTINUE_LINE = "Then continue; before hand-off run the full ship report:"
+EMPTY_SCOPE_LINE = (
+    "Local-changes scope is empty: everything is committed and nothing was "
+    "measured — this is not a certification."
 )
 MORE_FILES_HINT = "quality_items.py --summary lists them"
 
@@ -351,6 +354,22 @@ def next_file_line(state_path: Path) -> str:
     return f"Next file:  python3 {script} --state {state_path} --next"
 
 
+def whole_repository_command(command: str) -> str:
+    """Strip incremental-scope flags so the suggestion certifies the whole repository."""
+    parts = [part for part in command.split() if part != "--local-changes"]
+    if "--commit" in parts:
+        index = parts.index("--commit")
+        del parts[index : index + 2]
+    return " ".join(parts)
+
+
+def empty_incremental_scope(state: dict[str, Any]) -> bool:
+    scope = state.get("scope") or {}
+    return scope.get("kind") in ("local_changes", "commit") and not scope.get(
+        "changed_files"
+    )
+
+
 def next_step_lines(state: dict[str, Any], analysis: Any) -> list[str]:
     if state["status"] == "pass" and analysis.mode != "full":
         return [
@@ -358,7 +377,18 @@ def next_step_lines(state: dict[str, Any], analysis: Any) -> list[str]:
             f"  {state['full_rerun_command']}",
         ]
     if state["status"] == "ready_for_full":
-        return [COMMIT_LINE, f"  {state['full_rerun_command']}"]
+        return [
+            COMMIT_LINE,
+            COMMIT_COMMAND,
+            CONTINUE_LINE,
+            f"  {state['full_rerun_command']}",
+        ]
+    if empty_incremental_scope(state):
+        return [
+            EMPTY_SCOPE_LINE,
+            "Run the whole-repository ship report:",
+            f"  {whole_repository_command(state['full_rerun_command'])}",
+        ]
     if state["status"] == "pass":
         return [
             "Ship report is green: every executed check passed.",
