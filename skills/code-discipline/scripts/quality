@@ -1,0 +1,223 @@
+#!/bin/sh
+
+# Portable entry point for the code-discipline quality loop.  It uses a
+# suitable interpreter already on PATH when possible.  Its fallback installs
+# only the launcher's own uv and Python runtimes in the user's cache.
+
+set -u
+
+UV_VERSION="0.11.15"
+MANAGED_PYTHON_VERSION="${QUALITY_MANAGED_PYTHON_VERSION:-3.10}"
+
+fail() {
+    printf 'quality: %s\n' "$*" >&2
+    exit 2
+}
+
+command_path() {
+    command -v "$1" 2>/dev/null
+}
+
+compatible_python() {
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+        >/dev/null 2>&1
+}
+
+find_existing_python() {
+    if [ "${QUALITY_PYTHON+x}" = x ]; then
+        if [ -n "${QUALITY_PYTHON}" ] && compatible_python "${QUALITY_PYTHON}"; then
+            printf '%s\n' "${QUALITY_PYTHON}"
+            return 0
+        fi
+        return 1
+    fi
+
+    for candidate in python3 python python3.14 python3.13 python3.12 python3.11 python3.10; do
+        candidate_path=$(command_path "$candidate") || continue
+        if compatible_python "$candidate_path"; then
+            printf '%s\n' "$candidate_path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+sha256_file() {
+    file=$1
+    if sha256sum_path=$(command_path sha256sum); then
+        hash_output=$($sha256sum_path "$file") || return 1
+    elif shasum_path=$(command_path shasum); then
+        hash_output=$($shasum_path -a 256 "$file") || return 1
+    else
+        return 1
+    fi
+    printf '%s\n' "${hash_output%% *}"
+}
+
+download_file() {
+    url=$1
+    destination=$2
+    if curl_path=$(command_path curl); then
+        "$curl_path" --proto '=https' --tlsv1.2 --fail --location \
+            --silent --show-error --output "$destination" "$url"
+        return $?
+    fi
+    if wget_path=$(command_path wget); then
+        "$wget_path" --https-only --quiet --output-document="$destination" "$url"
+        return $?
+    fi
+    fail "cannot download uv: install curl or wget, or set QUALITY_UV_BINARY"
+}
+
+select_uv_asset() {
+    # Published in uv 0.11.15's official release manifest, sha256.sum.
+    case "$HOST_OS:$HOST_ARCH" in
+        Darwin:x86_64)
+            UV_TARGET=x86_64-apple-darwin
+            UV_SHA256=42bca7cc879d117ed7139a0e26de8cab0b6f033ad439a32144f324d1f8580d8c
+            ;;
+        Darwin:arm64|Darwin:aarch64)
+            UV_TARGET=aarch64-apple-darwin
+            UV_SHA256=7e5b336108f8576eda1939920ca0a805b4a9a3c3d3eb2f6140e38b7092fbe4f3
+            ;;
+        Linux:x86_64|Linux:amd64)
+            UV_TARGET=x86_64-unknown-linux-gnu
+            UV_SHA256=b03e572f010bea94a4a52d42671ba72981e12894f71576181a1d26ff68546da7
+            if ldd_path=$(command_path ldd); then
+                if "$ldd_path" --version 2>&1 | grep -qi musl; then
+                    UV_TARGET=x86_64-unknown-linux-musl
+                    UV_SHA256=200ccf2f351849c5d6698714e7e7eb9ead1e8c097dbdbb43730e1a4e059ceb87
+                fi
+            fi
+            ;;
+        Linux:arm64|Linux:aarch64)
+            UV_TARGET=aarch64-unknown-linux-gnu
+            UV_SHA256=21a7dd1a03ea17ac0366887455dab15d215b31dba0870dcd65d3714e22f46c81
+            if ldd_path=$(command_path ldd); then
+                if "$ldd_path" --version 2>&1 | grep -qi musl; then
+                    UV_TARGET=aarch64-unknown-linux-musl
+                    UV_SHA256=6505075cec3f551fad4fe9026922967ff9c895c9f513c97682b24e7a1c9becd3
+                fi
+            fi
+            ;;
+        Darwin:*|Linux:*)
+            fail "unsupported architecture '$HOST_ARCH' on $HOST_OS; supported: x86_64 and arm64"
+            ;;
+        *)
+            fail "unsupported operating system '$HOST_OS'; supported: Darwin and Linux"
+            ;;
+    esac
+    UV_ASSET="uv-$UV_TARGET.tar.gz"
+}
+
+bootstrap_uv() {
+    if [ "${QUALITY_UV_BINARY+x}" = x ]; then
+        [ -n "${QUALITY_UV_BINARY}" ] || fail "QUALITY_UV_BINARY is empty"
+        [ -x "${QUALITY_UV_BINARY}" ] || \
+            fail "QUALITY_UV_BINARY is not executable: ${QUALITY_UV_BINARY}"
+        printf '%s\n' "${QUALITY_UV_BINARY}"
+        return 0
+    fi
+
+    uv_install_dir="$CACHE_ROOT/uv/$UV_VERSION/$UV_TARGET"
+    uv_binary="$uv_install_dir/uv"
+    if [ -x "$uv_binary" ]; then
+        printf '%s\n' "$uv_binary"
+        return 0
+    fi
+
+    tar_path=$(command_path tar) || \
+        fail "cannot extract uv: install tar, or set QUALITY_UV_BINARY"
+    if ! command_path curl >/dev/null && ! command_path wget >/dev/null; then
+        fail "cannot download uv: install curl or wget, or set QUALITY_UV_BINARY"
+    fi
+    if ! command_path sha256sum >/dev/null && ! command_path shasum >/dev/null; then
+        fail "cannot verify uv: install sha256sum or shasum"
+    fi
+
+    bootstrap_dir="$CACHE_ROOT/.uv-bootstrap.$$"
+    (umask 077 && mkdir "$bootstrap_dir") || \
+        fail "cannot create temporary cache directory: $bootstrap_dir"
+    trap 'rm -rf "$bootstrap_dir"' 0
+    trap 'exit 2' 1 2 15
+
+    archive="$bootstrap_dir/$UV_ASSET"
+    url="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$UV_ASSET"
+    download_file "$url" "$archive" || fail "failed to download pinned uv $UV_VERSION"
+
+    actual_sha256=$(sha256_file "$archive") || fail "failed to calculate uv SHA-256"
+    [ "$actual_sha256" = "$UV_SHA256" ] || \
+        fail "uv archive checksum mismatch for $UV_ASSET"
+
+    extract_dir="$bootstrap_dir/extracted"
+    mkdir "$extract_dir" || fail "cannot create extraction directory: $extract_dir"
+    "$tar_path" -xzf "$archive" -C "$extract_dir" || fail "failed to extract $UV_ASSET"
+    extracted_uv="$extract_dir/uv-$UV_TARGET/uv"
+    [ -f "$extracted_uv" ] || fail "verified uv archive did not contain uv-$UV_TARGET/uv"
+
+    mkdir -p "$uv_install_dir" || fail "cannot create uv cache: $uv_install_dir"
+    staged_uv="$uv_install_dir/.uv.$$"
+    mv "$extracted_uv" "$staged_uv" || fail "cannot stage uv in its cache"
+    chmod 700 "$staged_uv" || fail "cannot make cached uv executable"
+    mv "$staged_uv" "$uv_binary" || fail "cannot finish cached uv installation"
+    rm -rf "$bootstrap_dir"
+    trap - 0 1 2 15
+    printf '%s\n' "$uv_binary"
+}
+
+case $0 in
+    */*) launcher_path=$0 ;;
+    *) launcher_path=$(command_path "$0") || fail "cannot locate launcher" ;;
+esac
+launcher_dir=$(CDPATH= cd "$(dirname "$launcher_path")" 2>/dev/null && pwd -P) || \
+    fail "cannot locate quality-loop scripts"
+quality_loop="$launcher_dir/quality_loop.py"
+[ -f "$quality_loop" ] || fail "quality-loop script is missing: $quality_loop"
+
+HOST_OS=$(uname -s 2>/dev/null) || fail "cannot identify operating system"
+HOST_ARCH=$(uname -m 2>/dev/null) || fail "cannot identify machine architecture"
+select_uv_asset
+
+if python_path=$(find_existing_python); then
+    exec "$python_path" "$quality_loop" "$@"
+    fail "failed to start quality loop with $python_path"
+fi
+
+if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    CACHE_ROOT=$XDG_CACHE_HOME/code-discipline
+elif [ -n "${HOME:-}" ]; then
+    CACHE_ROOT=$HOME/.cache/code-discipline
+else
+    fail "cannot choose a user cache: set XDG_CACHE_HOME or HOME"
+fi
+mkdir -p "$CACHE_ROOT" || fail "cannot create tool cache: $CACHE_ROOT"
+
+uv_path=$(bootstrap_uv) || exit $?
+python_install_dir="$CACHE_ROOT/python"
+python_bin_dir="$CACHE_ROOT/python-bin"
+uv_cache_dir="$CACHE_ROOT/uv-cache"
+mkdir -p "$python_install_dir" "$python_bin_dir" "$uv_cache_dir" || \
+    fail "cannot create managed Python cache"
+
+find_managed_python() {
+    UV_CACHE_DIR="$uv_cache_dir" UV_PYTHON_BIN_DIR="$python_bin_dir" \
+        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        "$uv_path" python find --quiet --no-project --managed-python \
+        --no-python-downloads --no-config "$MANAGED_PYTHON_VERSION"
+}
+
+if ! managed_python=$(find_managed_python 2>/dev/null); then
+    UV_CACHE_DIR="$uv_cache_dir" UV_PYTHON_BIN_DIR="$python_bin_dir" \
+        UV_PYTHON_INSTALL_DIR="$python_install_dir" \
+        "$uv_path" python install --no-config "$MANAGED_PYTHON_VERSION" || \
+        fail "uv could not install managed Python $MANAGED_PYTHON_VERSION"
+    managed_python=$(find_managed_python) || \
+        fail "uv installed Python but could not locate it"
+fi
+
+[ -x "$managed_python" ] || fail "uv returned a non-executable Python: $managed_python"
+compatible_python "$managed_python" || \
+    fail "uv-managed Python is older than 3.10: $managed_python"
+
+exec "$managed_python" "$quality_loop" "$@"
+fail "failed to start quality loop with uv-managed Python"

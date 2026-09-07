@@ -1,0 +1,196 @@
+{
+  "dimensions": {
+    "data_safety": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Data recovery.",
+      "status": "not_applicable"
+    },
+    "governance": {
+      "applicable": true,
+      "missing_context": [],
+      "reason": "Ownership and release policy.",
+      "status": "ready"
+    },
+    "infrastructure": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Deployment policy.",
+      "status": "not_applicable"
+    },
+    "integration": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "API and service contracts.",
+      "status": "not_applicable"
+    },
+    "language_semantics": {
+      "applicable": true,
+      "missing_context": [],
+      "reason": "Language-aware analysis.",
+      "status": "ready"
+    },
+    "observability": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Runtime signals.",
+      "status": "not_applicable"
+    },
+    "operations": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Operational recovery.",
+      "status": "not_applicable"
+    },
+    "performance": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Measure-only until budgets exist.",
+      "status": "not_applicable"
+    },
+    "product": {
+      "applicable": true,
+      "missing_context": [],
+      "reason": "Critical behavior and acceptance.",
+      "status": "ready"
+    },
+    "reliability": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Startup and recovery.",
+      "status": "not_applicable"
+    },
+    "security": {
+      "applicable": true,
+      "missing_context": [],
+      "reason": "Risk-based security.",
+      "status": "ready"
+    },
+    "supply_chain": {
+      "applicable": true,
+      "missing_context": [],
+      "reason": "Dependencies and provenance.",
+      "status": "ready"
+    },
+    "ui_accessibility": {
+      "applicable": false,
+      "missing_context": [],
+      "reason": "Browser accessibility.",
+      "status": "not_applicable"
+    }
+  },
+  "facts": {
+    "api_specs": {
+      "confidence": 0.95,
+      "source": "detected",
+      "status": "ready",
+      "value": []
+    },
+    "ci": {
+      "confidence": 0.95,
+      "source": "detected",
+      "status": "ready",
+      "value": [
+        "GitHub Actions"
+      ]
+    },
+    "critical_user_stories": {
+      "confidence": 1.0,
+      "source": "confirmed",
+      "status": "ready",
+      "value": [
+        "Install and run portable repository quality checks"
+      ]
+    },
+    "data_safety": {
+      "confidence": 1,
+      "source": "default",
+      "status": "not_applicable",
+      "value": null
+    },
+    "databases": {
+      "confidence": 0.85,
+      "source": "detected",
+      "status": "ready",
+      "value": []
+    },
+    "deployment_targets": {
+      "confidence": 0.8,
+      "source": "detected",
+      "status": "ready",
+      "value": [
+        "Package registry"
+      ]
+    },
+    "entrypoints": {
+      "confidence": 0.85,
+      "source": "detected",
+      "status": "ready",
+      "value": []
+    },
+    "frameworks": {
+      "confidence": 0.95,
+      "source": "detected",
+      "status": "ready",
+      "value": []
+    },
+    "infrastructure": {
+      "confidence": 0.95,
+      "source": "detected",
+      "status": "ready",
+      "value": []
+    },
+    "languages": {
+      "confidence": 0.95,
+      "source": "detected",
+      "status": "ready",
+      "value": [
+        "Python"
+      ]
+    },
+    "observability": {
+      "confidence": 0.85,
+      "source": "detected",
+      "status": "ready",
+      "value": []
+    },
+    "observability_requirements": {
+      "confidence": 0,
+      "source": "missing",
+      "status": "needs_context",
+      "value": null
+    },
+    "performance": {
+      "confidence": 1,
+      "source": "default",
+      "status": "ready",
+      "value": {
+        "mode": "measure_only"
+      }
+    },
+    "project_type": {
+      "confidence": 0.8,
+      "source": "detected",
+      "status": "ready",
+      "value": [
+        "library"
+      ]
+    },
+    "security_level": {
+      "confidence": 1.0,
+      "source": "confirmed",
+      "status": "ready",
+      "value": "No sensitive data"
+    },
+    "test_commands": {
+      "confidence": 0.95,
+      "source": "detected",
+      "status": "ready",
+      "value": [
+        "python3 -m unittest discover"
+      ]
+    }
+  },
+  "questions": [],
+  "schema_version": 1
+}

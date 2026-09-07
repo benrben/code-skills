@@ -14,7 +14,7 @@
     "coverage_limit": 100,
     "branch_coverage_limit": 100,
     "complexity_limit": 6,
-    "craap_limit": 6
+    "crap_limit": 6
   },
   "slow_tests": {
     "max_test_seconds": 5,
@@ -43,5 +43,17 @@
   },
   "dependencies": {
     "max_violations": 0
+  },
+  "test_execution": {
+    "min_executed": 1,
+    "max_skipped": 0
+  },
+  "portable_analysis": {
+    "max_cognitive_complexity": 15,
+    "max_nesting_depth": 4,
+    "max_duplication_percent": 5,
+    "max_dependency_cycles": 0,
+    "max_secret_findings": 0,
+    "max_known_vulnerabilities": 0
   }
 }

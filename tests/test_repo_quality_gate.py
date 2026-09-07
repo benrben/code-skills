@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from tests.gherkin_fixture import acceptance_config, add_acceptance_config
+
 ROOT = Path(__file__).resolve().parents[1]
 CORE_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "repo_quality_gate.py"
 LOOP_SCRIPT = ROOT / "skills" / "code-discipline" / "scripts" / "quality_loop.py"
@@ -95,7 +97,7 @@ class QualityUpdateTests(unittest.TestCase):
             html.write_text("old layout")
             updater.refresh_report(root)
             rendered = html.read_text()
-            self.assertIn('class="nested-arcs"', rendered)
+            self.assertIn('class="bullet-chart"', rendered)
             self.assertIn("original measurement", rendered)
             self.assertIn("still failing", rendered)
             self.assertEqual(state.read_bytes(), original)
@@ -270,7 +272,7 @@ class QualityUpdateTests(unittest.TestCase):
             ):
                 self.assertEqual(installer.main(["--update-current"]), 0)
             rendered = (root / ".quality/quality-gate-report.html").read_text()
-            self.assertIn('class="nested-arcs"', rendered)
+            self.assertIn('class="bullet-chart"', rendered)
             self.assertIn("saved measurement", rendered)
             self.assertIn("existing failure", rendered)
 
@@ -421,7 +423,7 @@ class QualityUpdateTests(unittest.TestCase):
                 installer.finish_installations([result], "a" * 40)
 
 
-class NestedArcReportTests(unittest.TestCase):
+class BulletChartReportTests(unittest.TestCase):
     def charts(self):
         return load_script(
             "quality_charts_test_module", CORE_SCRIPT.with_name("quality_charts.py")
@@ -436,35 +438,29 @@ class NestedArcReportTests(unittest.TestCase):
         self.assertEqual(charts.percentiles((2,)), (2, 2, 2))
         self.assertEqual(charts.percentiles(()), ())
 
-    def test_arcs_share_a_scale_and_draw_the_limit_at_its_true_angle(self) -> None:
+    def test_bars_share_a_scale_and_draw_the_limit_at_its_position(self) -> None:
         charts = self.charts()
         metric = charts.DistributionMetric("Complexity", (2, 4, 6, 8), 8)
         document = ET.fromstring(charts.distribution_card(metric))
-        arcs = document.findall(".//path[@class='percentile-arc']")
-        self.assertEqual(len(arcs), 3)
+        tracks = document.findall(".//div[@class='bullet-track']")
+        self.assertEqual(len(tracks), 4)
         self.assertEqual(
-            [arc.attrib["d"] for arc in arcs],
-            [
-                "M 70 156 A 62 62 0 0 1 194 156",
-                "M 49 156 A 83 83 0 0 1 215 156",
-                "M 28 156 A 104 104 0 0 1 236 156",
-            ],
+            [float(track.attrib["aria-valuenow"]) for track in tracks],
+            [5, 6.5, 7.7, 8],
         )
-        self.assertEqual(
-            [arc.attrib["data-percentile"] for arc in arcs], ["P50", "P75", "P95"]
-        )
-        for arc, value in zip(arcs, (5, 6.5, 7.7), strict=True):
-            self.assertEqual(float(arc.attrib["aria-valuenow"]), value)
-            self.assertEqual(float(arc.attrib["aria-valuemax"]), 10)
+        for track, value in zip(tracks, (5, 6.5, 7.7, 8), strict=True):
+            self.assertEqual(float(track.attrib["aria-valuemax"]), 10)
+            fill = track.find("span")
+            self.assertIsNotNone(fill)
             self.assertAlmostEqual(
-                float(arc.attrib["stroke-dasharray"].split()[0]), value * 10
+                float(fill.attrib["style"].removeprefix("width:").removesuffix("%")),
+                value * 10,
             )
-        marker = document.find(".//line[@class='arc-limit']")
-        self.assertIsNotNone(marker)
-        self.assertAlmostEqual(float(marker.attrib["x1"]), 172.451, places=2)
-        self.assertAlmostEqual(float(marker.attrib["y1"]), 126.611, places=2)
-        self.assertAlmostEqual(float(marker.attrib["x2"]), 225.846, places=2)
-        self.assertAlmostEqual(float(marker.attrib["y2"]), 87.817, places=2)
+        markers = document.findall(".//i[@class='bullet-limit']")
+        self.assertEqual(len(markers), 4)
+        self.assertTrue(
+            all("left:80.00000%" in item.attrib["style"] for item in markers)
+        )
         self.assertIn("PASS", "".join(document.itertext()))
 
     def test_a_worst_case_outlier_fails_even_when_p95_passes(self) -> None:
@@ -474,30 +470,25 @@ class NestedArcReportTests(unittest.TestCase):
         text = "".join(document.itertext())
         self.assertIn("FAIL", text)
         self.assertIn("Max 2s", text)
-        self.assertEqual(
-            document.find(".//path[@data-percentile='P95']").attrib["aria-valuenow"],
-            "0.1",
-        )
+        tracks = document.findall(".//div[@class='bullet-track']")
+        self.assertEqual(tracks[2].attrib["aria-valuenow"], "0.1")
+        self.assertEqual(tracks[3].attrib["aria-valuenow"], "2")
+        rows = document.findall(".//div[@class='bullet-row over-limit']")
+        self.assertEqual(rows[-1].find("span").text, "MAX")
 
-    def test_exceeded_arcs_show_only_the_segment_past_the_limit(self) -> None:
+    def test_exceeded_bars_mark_every_value_past_the_limit(self) -> None:
         charts = self.charts()
         metric = charts.DistributionMetric("Test speed", (2, 2, 2), 1, "s")
         document = ET.fromstring(charts.distribution_card(metric))
-        segments = document.findall(".//path[@class='arc-over-limit']")
-        self.assertEqual(len(segments), 3)
-        for segment in segments:
-            self.assertAlmostEqual(
-                float(segment.attrib["stroke-dasharray"].split()[0]), 100 / 3, places=3
-            )
-            self.assertAlmostEqual(
-                float(segment.attrib["stroke-dashoffset"]), -100 / 3, places=3
-            )
+        rows = document.findall(".//div[@class='bullet-row over-limit']")
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all("2s" in "".join(row.itertext()) for row in rows))
 
     def test_empty_partial_zero_and_unconfigured_metrics_are_honest(self) -> None:
         charts = self.charts()
         for metric, status in (
-            (charts.DistributionMetric("CRAAP", (), 6), "NOT MEASURED"),
-            (charts.DistributionMetric("CRAAP", (2,), 6, missing=1), "PARTIAL"),
+            (charts.DistributionMetric("CRAP", (), 6), "NOT MEASURED"),
+            (charts.DistributionMetric("CRAP", (2,), 6, missing=1), "PARTIAL"),
             (charts.DistributionMetric("Function LOC", (18, 72), None), "INFO"),
             (charts.DistributionMetric("Complexity", (0,), 0), "PASS"),
         ):
@@ -507,13 +498,14 @@ class NestedArcReportTests(unittest.TestCase):
                 self.assertNotIn("nan", rendered)
                 self.assertNotIn('aria-valuenow="inf"', rendered)
         self.assertNotIn(
-            'class="percentile-arc"',
-            charts.distribution_card(charts.DistributionMetric("CRAAP", (), 6)),
+            'class="bullet-track"',
+            charts.distribution_card(charts.DistributionMetric("CRAP", (), 6)),
         )
         zero = charts.distribution_card(
             charts.DistributionMetric("Complexity", (0,), 0)
         )
-        self.assertIn('stroke-linecap="butt"', zero)
+        self.assertIn('style="width:0.00000%"', zero)
+        self.assertIn('style="left:0.00000%"', zero)
 
     def test_report_renders_five_distributions_and_preserves_missing_coverage(
         self,
@@ -538,7 +530,7 @@ class NestedArcReportTests(unittest.TestCase):
         metrics = self.charts().distributions(report, gate.default_thresholds())
         self.assertEqual(metrics[2].values, (18,))
         self.assertEqual(metrics[0].missing, 1)
-        for label in ("CRAAP", "Complexity", "Function LOC", "File LOC", "Test speed"):
+        for label in ("CRAP", "Complexity", "Function LOC", "File LOC", "Test speed"):
             self.assertIn(f'data-metric="{label}"', rendered)
         self.assertIn("P50", rendered)
         self.assertIn("P75", rendered)
@@ -603,7 +595,7 @@ class NestedArcReportTests(unittest.TestCase):
             2,
         )
 
-    def test_fully_measured_craap_distribution_is_not_partial(self) -> None:
+    def test_fully_measured_crap_distribution_is_not_partial(self) -> None:
         charts = self.charts()
         functions = [
             gate.FunctionMetric("app.py", "choose", 1, 3, 2, 3, 3, 100, 2, "python")
@@ -618,6 +610,25 @@ class NestedArcReportTests(unittest.TestCase):
         payload = gate.bundle_standalone_charts(
             CORE_SCRIPT.read_bytes(),
             CORE_SCRIPT.with_name("quality_charts.py").read_bytes(),
+        )
+        payload = gate.bundle_standalone_portable_analysis(
+            payload, CORE_SCRIPT.with_name("portable_analysis.py").read_bytes()
+        )
+        payload = gate.bundle_standalone_portable_graph(
+            payload, CORE_SCRIPT.with_name("portable_graph.py").read_bytes()
+        )
+        payload = gate.bundle_standalone_vulnerability_analysis(
+            payload,
+            CORE_SCRIPT.with_name("portable_vulnerabilities.py").read_bytes(),
+        )
+        payload = gate.bundle_standalone_project_quality(
+            payload, CORE_SCRIPT.with_name("project_quality.py").read_bytes()
+        )
+        payload = gate.bundle_standalone_gherkin(
+            payload, CORE_SCRIPT.with_name("gherkin_check.py").read_bytes()
+        )
+        payload = gate.bundle_standalone_gherkin_yaml(
+            payload, CORE_SCRIPT.with_name("gherkin_yaml.py").read_bytes()
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -641,6 +652,313 @@ class NestedArcReportTests(unittest.TestCase):
             gate.bundle_standalone_charts(b"VERSION = '1'", b"pass")
         with self.assertRaisesRegex(ValueError, "not valid Python"):
             gate.bundle_standalone_charts(CORE_SCRIPT.read_bytes(), b"def (")
+
+
+class ProjectQualityReportUxTests(unittest.TestCase):
+    def test_panel_separates_required_optional_unsupported_and_na_evidence(self):
+        metric = sys.modules["project_quality"].MetricEvidence
+        dimension = gate.QualityDimension
+        product = dimension(
+            "product",
+            "Product behavior",
+            "product",
+            "confirmed",
+            "one connected",
+            (
+                metric(
+                    "story",
+                    "Core story",
+                    "confirmed",
+                    ["Publish report"],
+                    "profile",
+                    "Protects behavior",
+                    priority="required",
+                ),
+                metric(
+                    "acceptance",
+                    "Acceptance",
+                    "not_configured",
+                    None,
+                    "missing",
+                    "Proves behavior",
+                    "Connect acceptance results.",
+                    "recommended",
+                ),
+            ),
+        )
+        security = dimension(
+            "security",
+            "Security",
+            "security",
+            "needs_context",
+            "missing",
+            (
+                metric(
+                    "risk",
+                    "Risk",
+                    "needs_context",
+                    "Internal",
+                    "profile",
+                    "Selects controls",
+                    "Confirm risk.",
+                    "required",
+                ),
+            ),
+        )
+        supply = dimension(
+            "supply_chain",
+            "Supply chain",
+            "security",
+            "measured",
+            "optional",
+            (
+                metric(
+                    "sbom",
+                    "SBOM",
+                    "not_configured",
+                    None,
+                    "missing",
+                    "Tracks inputs",
+                    priority="recommended",
+                ),
+            ),
+        )
+        code = dimension(
+            "language_semantics",
+            "Code semantics",
+            "code",
+            "measured",
+            "measured",
+            (
+                metric(
+                    "fan",
+                    "Fan in/out",
+                    "measured",
+                    {"fan_in": 2},
+                    "gate",
+                    "Shows coupling",
+                    priority="recommended",
+                ),
+                metric(
+                    "npath",
+                    "NPath",
+                    "unsupported",
+                    None,
+                    "missing",
+                    "Shows paths",
+                    priority="optional",
+                ),
+            ),
+        )
+        deployment = dimension(
+            "infrastructure",
+            "Infrastructure",
+            "deployment",
+            "not_applicable",
+            "not applicable",
+            (),
+        )
+        report = gate.AnalysisReport(
+            root=".",
+            generated_at="now",
+            languages=["Python"],
+            gates=[gate.GateResult("quality", "Quality", True, "pass")],
+            functions=[],
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+            quality_dimensions=(product, security, supply, code, deployment),
+            certifications={
+                "repository": {"status": "certified", "dimensions": []},
+                "product": {"status": "certified", "dimensions": ["product"]},
+                "security": {
+                    "status": "needs_context",
+                    "dimensions": ["security", "supply_chain"],
+                },
+                "deployment": {"status": "not_applicable", "dimensions": []},
+                "operations": {"status": "not_applicable", "dimensions": []},
+                "code": {
+                    "status": "certified",
+                    "dimensions": ["language_semantics"],
+                },
+                "full_profile": {"status": "needs_context", "dimensions": []},
+            },
+        )
+
+        rendered = gate.html_report(report)
+
+        for text in (
+            "Health overview",
+            "Project evidence",
+            "NEEDS CONTEXT",
+            "Required",
+            "1/2 complete · 1 need setup",
+            "1 connected · 2 need setup · 0 unavailable",
+            "0 connected · 0 available · 1 unavailable",
+            "1 required measurement need setup before certification.",
+            "View all project metric evidence",
+            "NOT CONNECTED",
+            "Not applicable to this project",
+            "Publish report",
+            "<caption>Product behavior metric evidence</caption>",
+            'data-label="Priority"',
+            'data-label="Availability"',
+            'data-label="Next action"',
+            'class="report-nav"',
+            'id="project-evidence"',
+            'id="repository-checks"',
+            "prefers-color-scheme:dark",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, rendered)
+        for text in (
+            "Quality coverage by dimension",
+            'class="project-coverage',
+            'class="domain-card',
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(text, rendered)
+        self.assertLess(
+            rendered.index('class="coverage-overview"'),
+            rendered.index('id="project-evidence"'),
+        )
+        self.assertLess(
+            rendered.index('id="project-evidence"'),
+            rendered.index('class="distribution-grid"'),
+        )
+        self.assertEqual(rendered.count('class="dimension-chip not_applicable"'), 1)
+        self.assertIn(
+            "CORE PROFILE COMPLETE",
+            gate.certification_text("full_profile", "certified", [product], report)[0],
+        )
+        partial = dataclasses.replace(report, mode="partial")
+        self.assertEqual(
+            gate.certification_text("repository", "needs_work", [], partial)[0],
+            "FULL RUN REQUIRED",
+        )
+        self.assertEqual(
+            gate.certification_text(
+                "full_profile", "needs_context", [product], partial
+            )[0],
+            "FULL RUN REQUIRED",
+        )
+        self.assertEqual(
+            gate.certification_text("operations", "certified", [supply], report)[0],
+            "NO REQUIRED EVIDENCE",
+        )
+        self.assertEqual(
+            gate.project_quality_panel(SimpleNamespace(quality_dimensions=())), ""
+        )
+
+    def test_evidence_and_metric_formatters_cover_complete_and_plural_states(self):
+        metric = sys.modules["project_quality"].MetricEvidence
+        dimension = gate.QualityDimension(
+            "product",
+            "Product",
+            "product",
+            "measured",
+            "ready",
+            (
+                metric(
+                    "x",
+                    "X",
+                    "measured",
+                    7,
+                    "gate",
+                    "Why",
+                    priority="required",
+                ),
+            ),
+        )
+        self.assertIn("1/1 complete", gate.evidence_summary_html((dimension,)))
+        self.assertIn(
+            "No additional setup is required to pass.",
+            gate.evidence_summary_html((dimension,)),
+        )
+        missing = metric(
+            "x",
+            "X",
+            "needs_context",
+            None,
+            "missing",
+            "Why",
+            priority="required",
+        )
+        needs = dataclasses.replace(dimension, metrics=(missing, missing))
+        self.assertIn(
+            "0/2 complete · 2 need setup", gate.evidence_summary_html((needs,))
+        )
+        self.assertEqual(gate.metric_value_html(None), "—")
+        self.assertEqual(gate.metric_value_html(7), "7")
+        action = lambda **values: SimpleNamespace(  # noqa: E731
+            **(
+                {
+                    "key": "metric",
+                    "label": "Metric",
+                    "status": "not_configured",
+                    "action": "old",
+                }
+                | values
+            )
+        )
+        self.assertEqual(gate.metric_setup_action(action(action=None)), "—")
+        self.assertIn(
+            "No compatible",
+            gate.metric_setup_action(action(status="unsupported")),
+        )
+        self.assertTrue(
+            gate.metric_setup_action(action(key="ownership_coverage")).startswith(
+                "Add or connect"
+            )
+        )
+        self.assertTrue(
+            gate.metric_setup_action(action(key="mutation_score")).startswith(
+                "Configure"
+            )
+        )
+        self.assertTrue(gate.metric_setup_action(action()).startswith("Connect"))
+        self.assertEqual(
+            gate.metric_availability_label("confirmed"), "CONNECTED · CONFIRMED"
+        )
+        self.assertEqual(
+            gate.metric_availability_label("not_configured"), "NEEDS SETUP"
+        )
+        self.assertEqual(gate.metric_availability_label("unsupported"), "UNAVAILABLE")
+        self.assertEqual(gate.metric_availability_label("custom"), "CUSTOM")
+
+    def test_green_report_limits_large_function_tables_to_highest_risk_rows(self):
+        functions = [
+            gate.FunctionMetric(
+                "app.py",
+                f"function_{index}",
+                index + 1,
+                index + 1,
+                1,
+                1,
+                1,
+                100,
+                1,
+                "python",
+            )
+            for index in range(30)
+        ]
+        report = gate.AnalysisReport(
+            root=".",
+            generated_at="now",
+            languages=["Python"],
+            gates=[gate.GateResult("quality", "Quality", True, "pass")],
+            functions=functions,
+            mutations=[],
+            dependency_violations=[],
+            tool_setup=[],
+            notes=[],
+        )
+
+        rendered = gate.html_report(report)
+
+        self.assertIn("Showing the 25 highest-risk functions out of 30", rendered)
+        self.assertIn("saved JSON state retains the complete measurement", rendered)
 
 
 class QualityGateUnitTests(unittest.TestCase):
@@ -853,7 +1171,7 @@ class QualityGateUnitTests(unittest.TestCase):
         self.assertEqual(config["file_loc"]["max_lines"], 600)
         self.assertEqual(config["metrics"]["coverage_limit"], 100)
         self.assertEqual(config["metrics"]["complexity_limit"], 6)
-        self.assertEqual(config["metrics"]["craap_limit"], 6)
+        self.assertEqual(config["metrics"]["crap_limit"], 6)
         self.assertEqual(config["flaky_tests"]["runs"], 3)
         self.assertIn(str(thresholds_path), notes[0])
 
@@ -944,11 +1262,11 @@ class QualityGateUnitTests(unittest.TestCase):
                 covered_lines=5,
                 total_lines=5,
                 coverage_percent=100,
-                craap_score=3,
+                crap_score=3,
                 parser="python-ast",
                 coverage_limit=config["metrics"]["coverage_limit"],
                 complexity_limit=config["metrics"]["complexity_limit"],
-                craap_limit=config["metrics"]["craap_limit"],
+                crap_limit=config["metrics"]["crap_limit"],
             )
 
             self.assertEqual(config["file_loc"]["max_lines"], 25)
@@ -1195,7 +1513,7 @@ class QualityGateUnitTests(unittest.TestCase):
             "| python3 - --global",
             "scripts/install.py --update-current",
             '"$HOME/.agents/skills/code-discipline/scripts/install.py" --update-current',
-            ".agents/skills/code-discipline/scripts/quality_loop.py --root .",
+            ".agents/skills/code-discipline/scripts/quality --root .",
             "Every run writes `.quality/quality-gate-report.html`",
         ):
             with self.subTest(command_fragment=command_fragment):
@@ -1247,7 +1565,7 @@ class QualityGateUnitTests(unittest.TestCase):
             covered_lines=4,
             total_lines=6,
             coverage_percent=66.67,
-            craap_score=16.72,
+            crap_score=16.72,
             parser="python-ast",
         )
         mutation = gate.Mutation(
@@ -1276,8 +1594,8 @@ class QualityGateUnitTests(unittest.TestCase):
             languages=["Python"],
             gates=[
                 gate.GateResult(
-                    "craap",
-                    "CRAAP analysis",
+                    "crap",
+                    "CRAP analysis",
                     False,
                     "One function failed.",
                     prompts=[("Fix choose", "Repair choose and add tests.")],
@@ -1391,12 +1709,12 @@ class QualityGateUnitTests(unittest.TestCase):
         for text in (
             "Ready to merge",
             "No action required",
-            "11 checks passed",
+            "11/11",
             "0 failed",
             "4 not applicable",
             "No production code changed",
             "Health overview",
-            'class="chart-ring"',
+            'class="gate-score pass"',
             'aria-label="11 of 11 applicable checks passed"',
             "Build",
             "Tests",
@@ -1755,7 +2073,9 @@ class QualityGateUnitTests(unittest.TestCase):
             self.assertIn("pip", install_command)
             self.assertIn("lizard", install_command)
 
-    def test_bootstrap_installs_matching_vitest_coverage_without_saving(self) -> None:
+    def test_bootstrap_does_not_install_missing_vitest_coverage_in_project(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "app.ts"
@@ -1793,18 +2113,15 @@ class QualityGateUnitTests(unittest.TestCase):
             ):
                 tools = gate.bootstrap_tools(root, config, [source])
 
-            coverage_installs = [
-                result
-                for result in tools.setup_results
-                if any("@vitest/coverage-v8" in item for item in result.command)
-            ]
-            self.assertEqual(len(coverage_installs), 1)
-            command = coverage_installs[0].command
-            self.assertIn("--no-save", command)
-            self.assertIn("--package-lock=false", command)
-            self.assertIn("@vitest/coverage-v8@4.1.11", command)
+            self.assertFalse(
+                any(
+                    "@vitest/coverage-v8" in item
+                    for result in tools.setup_results
+                    for item in result.command
+                )
+            )
 
-    def test_bootstrap_auto_installs_native_vitest_mutation_runner(self) -> None:
+    def test_bootstrap_does_not_install_native_mutation_runner_in_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "app.ts"
@@ -1842,13 +2159,8 @@ class QualityGateUnitTests(unittest.TestCase):
             ):
                 tools = gate.bootstrap_tools(root, config, [source])
 
-            install_command = runner.call_args.args[0]
-            self.assertIn("@stryker-mutator/core@9.6.1", install_command)
-            self.assertIn("@stryker-mutator/vitest-runner@9.6.1", install_command)
-            self.assertIn("--no-save", install_command)
-            self.assertEqual(
-                tools.stryker_command, [str(root / "node_modules/.bin/stryker")]
-            )
+            runner.assert_not_called()
+            self.assertIsNone(tools.stryker_command)
 
     def test_stryker_config_is_incremental_and_safe_inside_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2124,13 +2436,13 @@ class QualityGateUnitTests(unittest.TestCase):
             ["tool", "--output=/tmp/report.json", "print({'value': 1})"],
         )
 
-    def test_craap_uses_standard_formula(self) -> None:
-        self.assertEqual(gate.craap_score(6, 100), 6)
-        self.assertEqual(gate.craap_score(4, 0), 20)
-        self.assertAlmostEqual(gate.craap_score(4, 50), 6)
+    def test_crap_uses_standard_formula(self) -> None:
+        self.assertEqual(gate.crap_score(6, 100), 6)
+        self.assertEqual(gate.crap_score(4, 0), 20)
+        self.assertAlmostEqual(gate.crap_score(4, 50), 6)
 
-    def test_craap_state_keeps_enough_precision_to_explain_failure(self) -> None:
-        score = gate.craap_score(6, 99.9)
+    def test_crap_state_keeps_enough_precision_to_explain_failure(self) -> None:
+        score = gate.crap_score(6, 99.9)
         function = gate.FunctionMetric(
             path="app.py",
             name="almost_covered",
@@ -2140,15 +2452,15 @@ class QualityGateUnitTests(unittest.TestCase):
             covered_lines=999,
             total_lines=1000,
             coverage_percent=99.9,
-            craap_score=score,
+            crap_score=score,
             parser="python-ast",
         )
 
         self.assertGreater(score, 6)
         self.assertFalse(function.passed)
-        self.assertGreater(gate.function_measurement(function)["craap_score"], 6)
+        self.assertGreater(gate.function_measurement(function)["crap_score"], 6)
 
-    def test_normalized_adapter_cannot_override_craap_formula(self) -> None:
+    def test_normalized_adapter_cannot_override_crap_formula(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             report = root / "metrics.json"
@@ -2161,7 +2473,7 @@ class QualityGateUnitTests(unittest.TestCase):
                                 "name": "choose",
                                 "complexity": 4,
                                 "coverage_percent": 50,
-                                "craap_score": 999,
+                                "crap_score": 999,
                             }
                         ]
                     }
@@ -2171,7 +2483,7 @@ class QualityGateUnitTests(unittest.TestCase):
 
             functions = gate.load_normalized_metrics(report, root)
 
-        self.assertEqual(functions[0].craap_score, 6)
+        self.assertEqual(functions[0].crap_score, 6)
 
     def test_lizard_adapter_normalizes_multilanguage_functions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3316,7 +3628,7 @@ const helper = require('./helper.js')
             total_lines=1,
             coverage_percent=0.0,
             complexity=1,
-            craap_score=2.0,
+            crap_score=2.0,
             passed=False,
         )
         file_metric = SimpleNamespace(path="a.py", lines=2, limit=1, passed=False)
@@ -3694,7 +4006,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 "def is_one(value):\n    return value == 1\n", encoding="utf-8"
             )
             (root / "check.py").write_text(
-                "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\n",
+                "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\nprint('Ran 2 tests in 0.001s\\nOK')\n",
                 encoding="utf-8",
             )
             (root / "metrics.json").write_text(
@@ -3770,6 +4082,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            add_acceptance_config(root, [sys.executable, "check.py"])
             artifacts = root / "artifacts"
             command = [
                 sys.executable,
@@ -3802,9 +4115,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 passing_state["report"]["files"],
                 [{"path": "src/app.py", "lines": 2, "limit": 600}],
             )
-            self.assertEqual(len(passing_state["gates"]), 15)
-            self.assertEqual(passing_state["counts"]["checks_applicable"], 13)
-            self.assertEqual(passing_state["counts"]["checks_passing"], 13)
+            self.assertEqual(len(passing_state["gates"]), 23)
+            self.assertEqual(passing_state["counts"]["checks_applicable"], 19)
+            self.assertEqual(passing_state["counts"]["checks_passing"], 19)
             self.assertEqual(passing_state["counts"]["mutants_static"], 0)
             self.assertEqual(passing_state["counts"]["files_total"], 1)
             self.assertEqual(passing_state["counts"]["files_failing_loc"], 0)
@@ -3831,8 +4144,8 @@ class QualityGateEndToEndTests(unittest.TestCase):
             )
             self.assertIsNone(passing_state["fix_prompt"])
             self.assertIn("--mutation-workers auto", passing_state["rerun_command"])
-            self.assertEqual(passing_html.count('<details class="check-row '), 13)
-            self.assertIn("Not measured for this change (2)", passing_html)
+            self.assertEqual(passing_html.count('<details class="check-row '), 19)
+            self.assertIn("Not measured for this change (4)", passing_html)
             self.assertNotIn("9 total ·", passing_html)
 
             fast_html = root / "fast-report.html"
@@ -3870,10 +4183,11 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertEqual(fast_state["mode"], "fast")
             self.assertFalse(fast_state["certified"])
             self.assertTrue(fast_state["ready_for_full"])
-            self.assertEqual(fast_state["counts"]["checks_deferred"], 3)
+            self.assertEqual(fast_state["counts"]["checks_deferred"], 4)
+            self.assertEqual(fast_statuses["gherkin"], "deferred")
             self.assertEqual(fast_statuses["flaky"], "deferred")
             self.assertEqual(fast_statuses["mutation"], "deferred")
-            self.assertEqual(len(fast_test_commands), 1)
+            self.assertEqual(len(fast_test_commands), 2)
             self.assertIn("--fast", fast_state["rerun_command"])
             self.assertNotIn("--fast", fast_state["full_rerun_command"])
             self.assertTrue(fast_html.exists())
@@ -3928,7 +4242,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                         "branch_coverage_percent": 100.0,
                         "branch_coverage_measured": True,
                         "complexity": 1,
-                        "craap_score": 1.0,
+                        "crap_score": 1.0,
                         "passed": True,
                     }
                 ],
@@ -3969,7 +4283,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
             unchanged = root / "src" / "unchanged.py"
             changed.write_text("def changed():\n    return 1\n", encoding="utf-8")
             unchanged.write_text("def unchanged():\n    return 2\n", encoding="utf-8")
-            (root / "check.py").write_text("pass\n", encoding="utf-8")
+            (root / "check.py").write_text(
+                "print('Ran 1 test in 0.001s\\nOK')\n", encoding="utf-8"
+            )
             (root / "metrics.json").write_text(
                 json.dumps(
                     {
@@ -4022,6 +4338,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            add_acceptance_config(root, [sys.executable, "check.py"])
             git("add", ".")
             git("commit", "-qm", "base")
             changed.write_text("def changed():\n    return 3\n", encoding="utf-8")
@@ -4147,7 +4464,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                 "def is_one(value):\n    return value == 1\n", encoding="utf-8"
             )
             (root / "check.py").write_text(
-                "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\n",
+                "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\nprint('Ran 2 tests in 0.001s\\nOK')\n",
                 encoding="utf-8",
             )
             metrics = {
@@ -4202,6 +4519,7 @@ class QualityGateEndToEndTests(unittest.TestCase):
                     },
                 },
             )
+            config["gherkin"] = acceptance_config(root, passing_command)
             report_path = root / "report.html"
 
             report = gate.run(root, config, report_path, cli_max_mutants=None, notes=[])
@@ -4211,22 +4529,27 @@ class QualityGateEndToEndTests(unittest.TestCase):
             rendered = report_path.read_text(encoding="utf-8")
             self.assertIn("Ready to ship", rendered)
             self.assertIn("READY TO SHIP", rendered)
-            self.assertEqual(rendered.count('<details class="check-row '), 13)
+            self.assertEqual(rendered.count('<details class="check-row '), 19)
             self.assertNotIn("9 total ·", rendered)
             self.assertIn("Health overview", rendered)
             self.assertIn("<strong>1.00</strong>", rendered)
-            self.assertIn("<span>Average CRAAP</span>", rendered)
+            self.assertIn("<span>Average CRAP</span>", rendered)
             self.assertIn("<strong>2</strong>", rendered)
             self.assertIn("<span>Mean file LOC</span>", rendered)
             self.assertNotIn("<h2>File size</h2>", rendered)
             self.assertEqual(rendered.count("<th>Physical LOC</th>"), 1)
-            self.assertEqual(rendered.count("<th>CRAAP</th>"), 1)
+            self.assertEqual(rendered.count("<th>CRAP</th>"), 1)
             self.assertEqual(rendered.count("<th>Static</th>"), 1)
+            self.assertIn("Native test summary", rendered)
+            self.assertIn("Cognitive complexity and nesting", rendered)
+            self.assertIn("Duplicate blocks", rendered)
+            self.assertIn("Module coupling", rendered)
+            self.assertIn("Secret locations", rendered)
             self.assertNotIn("Mutations + flaky tests", rendered)
             self.assertNotIn("<span>Evidence</span>", rendered)
             self.assertIn("<span>View run details</span>", rendered)
             self.assertEqual(rendered.count("data-copy="), 0)
-            self.assertNotIn("Gherkin", rendered)
+            self.assertIn("Gherkin acceptance", rendered)
             self.assertNotIn("Executable UI", rendered)
             self.assertIn("All 1 mutants were killed", rendered)
 
@@ -4242,7 +4565,7 @@ def fixture_repository(root: Path, mutation_enabled: bool = True) -> Path:
         "def is_one(value):\n    return value == 1\n", encoding="utf-8"
     )
     (root / "check.py").write_text(
-        "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\n",
+        "from src.app import is_one\nassert is_one(1)\nassert not is_one(2)\nprint('Ran 2 tests in 0.001s\\nOK')\n",
         encoding="utf-8",
     )
     (root / "metrics.json").write_text(
@@ -4300,6 +4623,7 @@ def fixture_repository(root: Path, mutation_enabled: bool = True) -> Path:
         ),
         encoding="utf-8",
     )
+    add_acceptance_config(root, [sys.executable, "check.py"])
     return config_path
 
 
@@ -4332,7 +4656,7 @@ class CheckSelectionTests(unittest.TestCase):
             gate.selected_gate_keys(["lint", "coverage", "dead-code"]),
             frozenset({"format_lint", "quality", "dead_code"}),
         )
-        self.assertEqual(gate.metrics_focus(["coverage", "complexity"]), "craap")
+        self.assertEqual(gate.metrics_focus(["coverage", "complexity"]), "crap")
         self.assertEqual(gate.metrics_focus(["tests", "coverage"]), "coverage")
         self.assertEqual(gate.metrics_focus(["complexity", "lint"]), "complexity")
         self.assertEqual(gate.metrics_focus(["tests"]), "tests")
@@ -4582,7 +4906,7 @@ class CheckSelectionTests(unittest.TestCase):
             passed=False, mode="partial", selected_passed=True, ready_for_full=False
         )
         self.assertTrue(gate.partial_run_passed(partial))
-        self.assertEqual(gate.state_status(partial, None), "pass")
+        self.assertEqual(gate.state_status(partial, None), "selected_pass")
         self.assertIsNone(gate.state_fix_prompt(SimpleNamespace(), partial))
         partial.selected_passed = False
         self.assertFalse(gate.partial_run_passed(partial))
@@ -4660,7 +4984,7 @@ class CheckSelectionTests(unittest.TestCase):
             self.assertEqual(coverage["coverage_format"], "lcov")
             self.assertEqual(len(coverage["coverage_commands"]), 3)
             self.assertEqual(
-                coverage["coverage_commands"][0][3:5], ["--root", "packages/server"]
+                coverage["coverage_commands"][0][4:6], ["--root", "packages/server"]
             )
             self.assertEqual(coverage["coverage_commands"][-1][2], "--merge-lcov")
             self.assertEqual(gate.workspace_coverage_template(root / "packages"), {})
@@ -4744,12 +5068,14 @@ class CheckSelectionTests(unittest.TestCase):
             self.assertEqual(partial.returncode, 0, partial.stdout + partial.stderr)
             self.assertEqual(state["mode"], "partial")
             self.assertEqual(state["selection"], ["lint", "types"])
-            self.assertEqual(state["status"], "pass")
+            self.assertEqual(state["status"], "selected_pass")
+            self.assertIn("QUALITY_LOOP=SELECTED_PASS", partial.stdout)
+            self.assertNotIn("QUALITY_LOOP=PASS", partial.stdout)
             self.assertFalse(state["certified"])
             statuses = {item["key"]: item["status"] for item in state["gates"]}
             self.assertEqual(statuses["format_lint"], "pass")
             self.assertEqual(statuses["quality"], "skipped")
-            self.assertEqual(state["counts"]["checks_skipped"], 13)
+            self.assertEqual(state["counts"]["checks_skipped"], len(state["gates"]) - 2)
             self.assertIn("mode: partial (--lint --types)", partial.stdout)
             self.assertIn("Coverage today: not measured yet", partial.stdout)
             self.assertIn("does not certify", partial.stdout)
@@ -4790,8 +5116,8 @@ class LoopReportTests(unittest.TestCase):
         self.assertEqual(quality_loop.selection_names(args), ("coverage", "dead-code"))
         self.assertEqual(quality_loop.selection_names(quality_loop.parse_args([])), ())
         command: list[str] = []
-        quality_loop.append_rerun_execution(command, [], False, False, None, ("craap",))
-        self.assertEqual(command, ["--craap"])
+        quality_loop.append_rerun_execution(command, [], False, False, None, ("crap",))
+        self.assertEqual(command, ["--crap"])
 
     def test_run_passed_and_header(self) -> None:
         scope = SimpleNamespace(description="local changes")
@@ -5001,7 +5327,9 @@ class LoopReportTests(unittest.TestCase):
             "full_rerun_command": "full",
         }
         self.assertEqual(
-            quality_report.next_step_lines(state, SimpleNamespace(mode="partial")),
+            quality_report.next_step_lines(
+                {**state, "status": "selected_pass"}, SimpleNamespace(mode="partial")
+            ),
             [
                 "Selected checks are green. This does not certify: run the full ship report:",
                 "  full",
@@ -5943,18 +6271,18 @@ class ReportGroupingTests(unittest.TestCase):
         self.assertEqual(records[3]["hint"], "src/b.ts:3 TS2322")
         self.assertEqual(records[3]["details"], ["src/b.ts:3 TS2322"])
 
-    def test_function_hint_covers_craap_and_the_fallback(self) -> None:
-        limits = {"coverage_limit": 100.0, "complexity_limit": 6.0, "craap_limit": 6.0}
-        item = {"coverage_percent": 100.0, "complexity": 1, "craap_score": 7.5}
+    def test_function_hint_covers_crap_and_the_fallback(self) -> None:
+        limits = {"coverage_limit": 100.0, "complexity_limit": 6.0, "crap_limit": 6.0}
+        item = {"coverage_percent": 100.0, "complexity": 1, "crap_score": 7.5}
         self.assertEqual(
             quality_report.function_hint(item, limits),
-            "CRAAP 7.5 > 6: cover it or simplify it",
+            "CRAP 7.5 > 6: cover it or simplify it",
         )
         item = {"coverage_percent": 100.0, "complexity": 1}
         self.assertEqual(
             quality_report.function_hint(item, limits), "cover it or simplify it"
         )
-        both = {"coverage_percent": 10.0, "complexity": 7, "craap_score": 1}
+        both = {"coverage_percent": 10.0, "complexity": 7, "crap_score": 1}
         self.assertEqual(quality_report.function_hint(both, limits).count(";"), 1)
         self.assertEqual(
             quality_report.metric_limits({}),
@@ -5962,13 +6290,13 @@ class ReportGroupingTests(unittest.TestCase):
                 "coverage_limit": 100.0,
                 "branch_coverage_limit": 100.0,
                 "complexity_limit": 6.0,
-                "craap_limit": 6.0,
+                "crap_limit": 6.0,
             },
         )
         self.assertEqual(
             quality_report.metric_limits(
-                {"thresholds": {"metrics": {"craap_limit": 3}}}
-            )["craap_limit"],
+                {"thresholds": {"metrics": {"crap_limit": 3}}}
+            )["crap_limit"],
             3.0,
         )
 
@@ -6814,7 +7142,7 @@ def handled():
             "branch_coverage_percent": 0,
             "branch_coverage_measured": False,
             "complexity": 2,
-            "craap_score": 2,
+            "crap_score": 2,
         }
 
         record = quality_report.function_record(
@@ -6858,7 +7186,7 @@ def handled():
             covered_lines=4,
             total_lines=4,
             coverage_percent=100,
-            craap_score=2,
+            crap_score=2,
             parser="python-ast",
             covered_branches=2,
             total_branches=2,

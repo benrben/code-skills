@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "1.6.0"
+VERSION = "3.0.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -40,19 +40,20 @@ SKILL_FILES = (
     "scripts/quality_charts.py",
     "scripts/quality_update.py",
     "scripts/quality_items.py",
+    "scripts/portable_analysis.py",
+    "scripts/portable_graph.py",
+    "scripts/portable_vulnerabilities.py",
+    "scripts/project_profile.py",
+    "scripts/project_setup.py",
+    "scripts/project_quality.py",
+    "scripts/quality",
     "scripts/repo_quality_gate.py",
     "scripts/smoke_check.py",
+    "scripts/gherkin_check.py",
+    "scripts/gherkin_yaml.py",
 )
-PYTHON_FILES = (
-    "scripts/install.py",
-    "scripts/quality_loop.py",
-    "scripts/quality_report.py",
-    "scripts/quality_charts.py",
-    "scripts/quality_update.py",
-    "scripts/quality_items.py",
-    "scripts/repo_quality_gate.py",
-    "scripts/smoke_check.py",
-)
+PYTHON_FILES = tuple(path for path in SKILL_FILES if path.endswith(".py"))
+EXECUTABLE_FILES = (*PYTHON_FILES, "scripts/quality")
 
 
 def validate_ref(reference: str) -> str:
@@ -185,7 +186,7 @@ def write_staged_skill(directory: Path, payloads: Mapping[str, bytes]) -> None:
         destination = directory / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(payload)
-        if relative in PYTHON_FILES:
+        if relative in EXECUTABLE_FILES:
             destination.chmod(0o755)
 
 

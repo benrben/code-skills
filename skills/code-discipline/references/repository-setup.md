@@ -2,50 +2,68 @@
 
 Use this guide when the user asks to prepare, bootstrap, or harden a repository
 for the complete quality loop. Preserve the repository's existing runtime,
-package manager, lockfile, commands, and CI conventions. Add tools as development
-dependencies through that package manager so local and CI runs use the same
-versions.
+package manager, lockfile, commands, and CI conventions. Quality tools belong
+to the skill cache. The gate never adds project development dependencies,
+restores dependency trees, rewrites manifests or lockfiles, or runs an install
+script. An existing native project tool may be used read-only when already
+available.
 
 ## Bootstrap
 
 1. Inspect manifests, lockfiles, existing scripts, formatter/linter/type/test
    configuration, coverage output, schemas, and module layout. Record existing
    worktree changes before editing.
-2. Restore the repository's dependencies and prove its baseline test command can
-   run in the current environment. A quality-tool setup is not valid while the
-   repository runtime or ordinary dependencies are missing.
-3. From the repository root, generate the control files:
+2. Inspect whether the repository's runtime and dependencies are already
+   available. Do not restore them. A missing runtime, incomplete offline cache,
+   or absent dependency produces `BLOCKED` evidence with the missing
+   prerequisite. Ask the repository owner to prepare dependencies outside the
+   quality run if they want those project-native checks to execute.
+3. From the repository root, start progressive setup:
 
    ```bash
-   python3 <skill-directory>/scripts/repo_quality_gate.py --root . --init
+   <skill-directory>/scripts/quality --root . --init
    ```
 
-   `--init` creates `.quality/quality-gate.json` for commands/adapters,
+   The command first performs a read-only scan. It then creates
+   `.quality/project-profile.json` for detected facts and confirmed product
+   intent, `.quality/quality-gate.json` for commands/adapters,
    `.quality/quality-thresholds.json` for every numeric quality goal, and a
    generated `.quality/quality-dependencies.json` skeleton (workspace packages
    become modules with the directions their manifests declare; otherwise one
    module). For npm workspaces it writes per-package Vitest coverage commands
    merged through `--merge-lcov`. Mutation testing and flaky detection start
    off; enable them in the configuration or run `--mutation` / `--flaky` when
-   asked. Review generated detection; do not treat it as architecture intent.
-   The command prints the first loop command to run. When a skill update adds
+   asked. It runs and prints the baseline before asking at most three product,
+   runtime, or risk questions. Detection is evidence, not architecture intent.
+   In CI or an agent workflow use `--non-interactive`; answer printed questions
+   with repeatable `--answer KEY=VALUE` arguments. Use `--setup product`,
+   `--setup runtime`, or `--setup risk` to resume one group, and
+   `--show-profile` for a read-only preview. When a skill update adds
    a goal, the next loop run writes it into `.quality/quality-thresholds.json`
    with the bundled default and reports it; values already there never change.
-4. Configure non-mutating check commands as JSON argument arrays. Use
+4. Configure non-mutating, non-installing check commands as JSON argument arrays. Use
    `["bash", "-lc", "..."]` only when a check truly requires pipes, globbing,
    command substitution, or another shell feature.
 5. Run `--fast` until every executed check is green, then run without `--fast`.
    Put that exact full command in CI. Never make CI and local development use
    different thresholds.
 
+The project profile covers product behavior, integration, performance,
+reliability, UI/accessibility, security, supply chain, infrastructure, data
+safety, observability, operations, governance, and language semantics. Static
+and repository metrics run immediately. Production and organization metrics
+need confirmed values or adapter commands. A missing value stays visible as
+`NEEDS CONTEXT`, `NOT CONFIGURED`, or `UNSUPPORTED`; the report never replaces
+it with a guessed number.
+
 ## Configure each quality area
 
 ### 1. Formatter and lint
 
-Install the repository's formatter and linter as pinned development tools. Add
-check-mode commands under `format_lint.commands`; commands must report drift and
-must not rewrite files. Prefer existing project scripts when they already cover
-the full production scope.
+Use the repository's already installed formatter and linter, or the skill's
+isolated pinned analyzer. Add check-mode commands under `format_lint.commands`;
+commands must report drift and must not rewrite files or dependencies. Prefer
+existing project scripts when they already cover the full production scope.
 
 - Python: Ruff (`ruff format --check .`, `ruff check .`) or the repository's
   established Black/isort/linter combination.
@@ -79,17 +97,20 @@ when compatibility is the actual promise.
 ### 4. Tests, coverage, and complexity
 
 Set `test.command` to one deterministic command that runs the complete required
-suite and exits nonzero on any failure. Install the coverage provider that
-matches the test runner. Prefer a supported report (Coverage.py JSON, Istanbul
+suite, prints a supported native test-count summary, and exits nonzero on any
+failure. Use a coverage provider already present in the project or installed in
+the skill cache. Prefer a supported report (Coverage.py JSON, Istanbul
 JSON, LCOV, Cobertura/JaCoCo XML, or Go cover profile); otherwise configure a
 normalized `metrics.command` and `metrics.report` containing every production
-function.
+function. Inferred Go tests use `go test -json ./...` so individual pass, fail,
+and skip events remain machine-verifiable without another tool.
 
 The numeric goals live only in `.quality/quality-thresholds.json`:
 `metrics.coverage_limit`, `metrics.branch_coverage_limit`,
-`metrics.complexity_limit`, and `metrics.craap_limit`. The default requires
+`metrics.complexity_limit`, and `metrics.crap_limit`. Legacy `craap_limit` and
+`--craap` are accepted as aliases; new configuration and reports use CRAP. The default requires
 100% executable-line and branch coverage, cyclomatic complexity at most 6, and
-CRAAP at most 6 per function. Do not use file-average coverage or omit hard
+CRAP at most 6 per function. Do not use file-average coverage or omit hard
 functions from an adapter report.
 
 The built-in metrics use these exact rules:
@@ -111,20 +132,20 @@ The built-in metrics use these exact rules:
   `@abstractmethod` declarations have no coverage requirement, but their
   complexity is still checked. A normal function whose body is `pass` is not a
   stub and still requires coverage.
-- CRAAP is always recalculated by the gate, including for normalized adapters:
+- CRAP is always recalculated by the gate, including for normalized adapters:
 
   ```text
-  CRAAP = complexity^2 * (1 - coverage/100)^3 + complexity
+  CRAP = complexity^2 * (1 - coverage/100)^3 + complexity
   ```
 
   The uncovered fraction is limited to the range 0 through 1. Pass/fail uses
   the unrounded score, so reports retain enough digits to explain a strict
-  `CRAAP <= limit` result.
+  `CRAP <= limit` result.
 
 With the default 100% coverage limit, every passing function has
-`CRAAP = complexity`. The CRAAP value still ranks failures by risk, but it adds
+`CRAP = complexity`. The CRAP value still ranks failures by risk, but it adds
 an independent pass condition only when a repository chooses a coverage limit
-below 100% or a CRAAP limit different from its complexity limit.
+below 100% or a CRAP limit different from its complexity limit.
 
 ### 4.1 Branch and slow-test adapters
 
@@ -250,12 +271,12 @@ quarantine, or order randomization as a substitute for fixing known flakes.
 ### 7. Mutation testing
 
 Set `mutation.test_command` to the real assertion-bearing test command. For
-Vitest, install the Stryker core and Vitest runner versions documented by the
-quality loop; a dedicated `vitest.mutation.config.*` may select fast unit tests,
-but the separate baseline command must still run the complete suite. Other
-stacks use the portable mutation engine unless a normalized adapter is
-configured. The final run must be uncapped, and every in-scope mutant must be
-killed.
+Vitest, the gate may use Stryker only when its core and Vitest runner are already
+installed; it never runs `npm install`. A dedicated `vitest.mutation.config.*`
+may select fast unit tests, but the separate baseline command must still run the
+complete suite. Other stacks use the portable mutation engine unless a
+normalized adapter is configured. The final run must be uncapped, and every
+in-scope mutant must be killed.
 
 ### 8. Module boundaries
 
@@ -277,9 +298,9 @@ length and keep `fail_on_page_errors` enabled. The report must contain a
 optional `page_errors` array. The file must be created or changed by the current
 run; stale evidence fails.
 
-Install whatever the repository-owned probe needs. For Playwright this is
-normally the project package and its browser (`npm install -D playwright` and
-`npx playwright install chromium`, or the existing package-manager equivalents).
+The repository owner prepares whatever its probe needs before the quality run.
+For Playwright this includes the package, browser, and operating-system libraries;
+the gate reports a blocker when any is missing and never installs them.
 The probe must start or attach to the real app, exercise the public UI/API, and
 clean up its process. For a CLI or library, configure `smoke.commands` with its
 real entry point. The simpler bundled `scripts/smoke_check.py` remains suitable
@@ -299,8 +320,8 @@ never minify code, remove useful documentation, or exclude a file to evade it.
 Run these in order and retain the generated JSON state and HTML report:
 
 ```bash
-python3 <skill-directory>/scripts/quality_loop.py --root . --fast --no-install
-python3 <skill-directory>/scripts/quality_loop.py --root . --no-install
+<skill-directory>/scripts/quality --root . --fast --no-install
+<skill-directory>/scripts/quality --root . --no-install
 ```
 
 Use `--no-install` for the proof after setup: success then demonstrates that the

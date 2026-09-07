@@ -52,62 +52,47 @@ def number(value: float, unit: str = "") -> str:
     return f"{value:.3g}{unit}"
 
 
-def semicircle(radius: int) -> str:
-    return f"M {132 - radius} 156 A {radius} {radius} 0 0 1 {132 + radius} 156"
+def scale_percentage(value: float, maximum: float) -> float:
+    return max(0.0, min(100.0, 100 * value / maximum))
 
 
-def limit_marker(limit: float, maximum: float) -> str:
-    angle = math.pi * (1 - limit / maximum)
-    x1, y1 = 132 + 50 * math.cos(angle), 156 - 50 * math.sin(angle)
-    x2, y2 = 132 + 116 * math.cos(angle), 156 - 116 * math.sin(angle)
-    return (
-        f'<line class="arc-limit" x1="{x1:.3f}" y1="{y1:.3f}" '
-        f'x2="{x2:.3f}" y2="{y2:.3f}" aria-hidden="true" />'
-    )
-
-
-def percentile_arc(
-    label: str, value: float, radius: int, metric: DistributionMetric
+def bullet_row(
+    label: str, value: float, metric: DistributionMetric, maximum: float
 ) -> str:
-    maximum = scale_maximum(metric)
-    length = 100 * value / maximum
-    path = semicircle(radius)
-    cap = "butt" if value == 0 else "round"
-    accessible = html.escape(f"{metric.label} {label}: {number(value, metric.unit)}")
-    arc = (
-        f'<g class="arc-series {label.lower()}"><path class="arc-track" d="{path}" />'
-        f'<path class="percentile-arc" data-percentile="{label}" d="{path}" '
-        f'pathLength="100" stroke-dasharray="{length:.5f} 100" stroke-linecap="{cap}" '
-        f'role="progressbar" aria-label="{accessible}" aria-valuemin="0" '
-        f'aria-valuemax="{maximum:g}" aria-valuenow="{value:g}" />'
-    )
-    if metric.limit is not None and value > metric.limit:
-        start = 100 * metric.limit / maximum
-        arc += (
-            f'<path class="arc-over-limit" d="{path}" pathLength="100" '
-            f'stroke-dasharray="{length - start:.5f} 100" '
-            f'stroke-dashoffset="{-start:.5f}" aria-hidden="true" />'
+    width = scale_percentage(value, maximum)
+    limit = metric.limit
+    over_limit = limit is not None and value > limit
+    marker = ""
+    if limit is not None:
+        position = scale_percentage(limit, maximum)
+        marker = (
+            f'<i class="bullet-limit" style="left:{position:.5f}%" '
+            f'title="Limit {number(limit, metric.unit)}" aria-hidden="true"></i>'
         )
-    return arc + "</g>"
+    accessible = html.escape(f"{metric.label} {label}: {number(value, metric.unit)}")
+    state = " over-limit" if over_limit else ""
+    return (
+        f'<div class="bullet-row{state}"><span class="bullet-label">{label}</span>'
+        f'<div class="bullet-track" role="progressbar" aria-label="{accessible}" '
+        f'aria-valuemin="0" aria-valuemax="{maximum:g}" aria-valuenow="{value:g}">'
+        f'<span class="bullet-fill {label.lower()}" style="width:{width:.5f}%"></span>'
+        f"{marker}</div><strong>{html.escape(number(value, metric.unit))}</strong></div>"
+    )
 
 
 def distribution_plot(metric: DistributionMetric) -> str:
     values = percentiles(metric.values)
     if not values:
-        return '<div class="arc-empty">No measurements in this run</div>'
+        return '<div class="chart-empty">No measurements in this run</div>'
     maximum = scale_maximum(metric)
-    arcs = "".join(
-        percentile_arc(label, value, radius, metric)
-        for label, value, radius in zip(
-            ("P50", "P75", "P95"), values, (62, 83, 104), strict=True
-        )
+    rows = "".join(
+        bullet_row(label, value, metric, maximum)
+        for label, value in zip(("P50", "P75", "P95"), values, strict=True)
     )
-    marker = "" if metric.limit is None else limit_marker(metric.limit, maximum)
-    axis_max = html.escape(number(maximum, metric.unit))
+    rows += bullet_row("MAX", max(metric.values), metric, maximum)
     return (
-        f'<svg class="nested-arcs" viewBox="16 42 232 148" aria-label="{html.escape(metric.label)} distribution">'
-        f'{arcs}{marker}<text x="22" y="182">0</text>'
-        f'<text x="242" y="182" text-anchor="end">{axis_max}</text></svg>'
+        f'<div class="bullet-chart" role="group" aria-label="{html.escape(metric.label)} distribution">'
+        f'{rows}<div class="bullet-axis"><span>0</span><span>{html.escape(number(maximum, metric.unit))}</span></div></div>'
     )
 
 
@@ -119,11 +104,6 @@ def distribution_card(metric: DistributionMetric) -> str:
         if metric.limit is None
         else f"Limit ≤ {number(metric.limit, metric.unit)}"
     )
-    values = percentiles(metric.values)
-    figures = "".join(
-        f'<div class="percentile-value {name.lower()}"><dt>{name}</dt><dd>{html.escape(number(value, metric.unit))}</dd></div>'
-        for name, value in zip(("P50", "P75", "P95"), values, strict=False)
-    )
     summary = f"{len(metric.values)} measured"
     if metric.values:
         summary += f" · Max {number(max(metric.values), metric.unit)}"
@@ -134,7 +114,6 @@ def distribution_card(metric: DistributionMetric) -> str:
         f'<div class="distribution-heading"><h3>{label}</h3>'
         f'<span class="metric-status {status.lower().replace(" ", "-")}">{status}</span></div>'
         f'<p class="distribution-limit">{html.escape(limit)}</p>{distribution_plot(metric)}'
-        f'<dl class="percentile-values">{figures}</dl>'
         f'<p class="distribution-sample">{html.escape(summary)}</p></article>'
     )
 
@@ -145,9 +124,9 @@ def function_distributions(
     covered = [item for item in functions if item.coverage_measured]
     return [
         DistributionMetric(
-            "CRAAP",
-            tuple(item.craap_score for item in covered),
-            metrics["craap_limit"],
+            "CRAP",
+            tuple(item.crap_score for item in covered),
+            metrics["crap_limit"],
             missing=len(functions) - len(covered),
         ),
         DistributionMetric(
@@ -184,15 +163,21 @@ def coverage_card(
 ) -> str:
     if not values:
         return f'<article class="coverage-card"><h3>{label}</h3><strong>—</strong><span>Not measured</span></article>'
-    average = sum(values) / len(values)
-    status = "FAIL" if min(values) < limit else ("PARTIAL" if missing else "PASS")
+    minimum = min(values)
+    passed = sum(value >= limit for value in values)
+    total = len(values) + missing
+    status = "FAIL" if minimum < limit else ("PARTIAL" if missing else "PASS")
+    measured = f"{passed}/{total} at target"
+    if missing:
+        measured += f" · {missing} not measured"
     return (
         f'<article class="coverage-card"><div><h3>{label}</h3>'
         f'<span class="metric-status {status.lower()}">{status}</span></div>'
-        f"<strong>{average:.1f}%</strong><span>Target ≥ {limit:g}%</span>"
-        f'<div class="coverage-track" role="progressbar" aria-label="{label}" '
-        f'aria-valuemin="0" aria-valuemax="100" aria-valuenow="{average:g}">'
-        f'<span class="{status.lower()}" style="width:{average:g}%"></span></div></article>'
+        f"<strong>{minimum:.1f}%</strong><span>Minimum · target ≥ {limit:g}%</span>"
+        f'<p class="coverage-count">{measured}</p>'
+        f'<div class="coverage-track" role="progressbar" aria-label="{label} minimum" '
+        f'aria-valuemin="0" aria-valuemax="100" aria-valuenow="{minimum:g}">'
+        f'<span class="{status.lower()}" style="width:{minimum:g}%"></span></div></article>'
     )
 
 
@@ -243,66 +228,66 @@ def coverage_overview(report: Any, thresholds: dict[str, Any]) -> str:
     )
 
 
-def health_overview(report: Any, thresholds: dict[str, Any]) -> str:
+def health_overview(
+    report: Any, thresholds: dict[str, Any], project_evidence: str = ""
+) -> str:
     charts = "".join(
         distribution_card(metric) for metric in distributions(report, thresholds)
     )
     return (
         '<section class="health-overview" aria-labelledby="health-title">'
         '<div class="health-heading"><div><h2 id="health-title">Health overview</h2>'
-        f"<p>{len(report.functions)} functions · {len(report.files)} files · {len(report.test_timings)} timed tests</p></div>"
-        '<div class="percentile-legend"><span class="p50">P50 · median</span>'
-        '<span class="p75">P75</span><span class="p95">P95</span></div></div>'
-        f'{coverage_overview(report, thresholds)}<div class="distribution-grid">{charts}</div>'
-        '<p class="distribution-note">Lower is better. Limits apply to every measured value; '
-        "a passing percentile does not hide a failing maximum. Function LOC is informational.</p></section>"
+        f"<p>{len(report.functions)} functions · {len(report.files)} files · {len(report.test_timings)} timed tests</p></div></div>"
+        f"{coverage_overview(report, thresholds)}{project_evidence}"
+        f'<div class="distribution-grid">{charts}</div>'
+        '<p class="distribution-note">Each chart uses its own linear scale. Lower is better. The maximum is shown so an outlier cannot hide behind a passing percentile. Function LOC is informational.</p></section>'
     )
 
 
 CHART_STYLES = """
-.health-overview{margin:8px 0 16px;--p50:#34363b;--p75:#008d91;--p95:#0867f6}
+.health-overview{margin:18px 0 20px;--p50:#4b5563;--p75:#007f83;--p95:#0867d8;--max:#5b3db7}
 .health-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
-.health-heading h2{margin:0 0 4px;font-size:18px;letter-spacing:-.025em}
+.health-heading h2{margin:0 0 4px;font-size:20px;letter-spacing:-.025em}
 .health-heading p,.distribution-note{margin:0;color:var(--secondary);font-size:13px}
-.percentile-legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px}
-.p50{color:var(--p50)}.p75{color:var(--p75)}.p95{color:var(--p95)}
-.percentile-legend span::before{content:"";display:inline-block;width:14px;height:4px;border-radius:3px;background:currentColor;vertical-align:middle;margin-right:6px}
 .distribution-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
-.distribution-card{min-width:0;padding:10px 12px 8px;background:var(--card);border:1px solid var(--line);border-radius:11px}
+.distribution-card{min-width:0;padding:13px;background:var(--card);border:1px solid var(--line);border-radius:13px}
 .distribution-heading{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}
-.distribution-heading h3,.coverage-card h3{margin:0;font-size:13px;font-weight:600;letter-spacing:-.015em}
-.metric-status{display:inline-block;padding:2px 5px;border:1px solid var(--line);border-radius:6px;font-size:10px;line-height:1.4;font-weight:600;color:var(--secondary);white-space:nowrap}
-.metric-status.pass{color:#13763d;background:#eef9f1;border-color:#d4ebdc}
-.metric-status.fail{color:#c92230;background:#fff0f0;border-color:#ffcbd0}
-.metric-status.partial{color:#875a06;background:#fff8e9;border-color:#efdfb8}
-.distribution-limit{margin:4px 0 0;font-size:11px;color:var(--secondary)}
-.nested-arcs{display:block;width:100%;max-width:144px;height:auto;margin:6px auto 0;overflow:visible}
-.nested-arcs path{fill:none;stroke-width:8}
-.arc-track{stroke:#eceef1}.percentile-arc{stroke:currentColor}
-.arc-over-limit{stroke:#df3444;stroke-linecap:butt}
-.arc-limit{stroke:var(--ink);stroke-width:1.2;stroke-dasharray:4 4}
-.nested-arcs text{fill:var(--secondary);font:19px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-.percentile-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:6px 0 0;padding-top:7px;border-top:1px solid var(--line);gap:5px;text-align:center}
-.percentile-values dt{font-size:11px;font-weight:500;margin-bottom:2px}
-.percentile-values dd{font-size:clamp(13px,1.15vw,16px);font-weight:500;letter-spacing:-.04em;margin:0;font-variant-numeric:tabular-nums}
-.distribution-sample{font-size:11px;line-height:1.4;color:var(--secondary);margin:7px 0 0;text-align:center}
-.distribution-note{margin-top:8px;font-size:11px;line-height:1.5}
-.arc-empty{display:grid;place-items:center;height:98px;color:var(--secondary);font-size:12px;text-align:center}
+.distribution-heading h3,.coverage-card h3{margin:0;font-size:14px;font-weight:650;letter-spacing:-.015em}
+.metric-status{display:inline-block;padding:3px 7px;border:1px solid var(--line);border-radius:999px;font-size:12px;line-height:1.35;font-weight:700;color:var(--secondary);white-space:nowrap}
+.metric-status.pass{color:var(--good);background:var(--good-soft);border-color:#b7dec9}
+.metric-status.fail{color:var(--bad);background:var(--bad-soft);border-color:#f2c0bc}
+.metric-status.partial{color:var(--warning);background:var(--warning-soft);border-color:#e5d3a7}
+.distribution-limit{margin:5px 0 12px;font-size:12px;color:var(--secondary)}
+.bullet-chart{display:grid;gap:7px;margin-top:10px}
+.bullet-row{display:grid;grid-template-columns:30px minmax(56px,1fr) auto;align-items:center;gap:7px}
+.bullet-label{font-size:12px;font-weight:750;color:var(--secondary)}
+.bullet-row strong{min-width:34px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
+.bullet-track{position:relative;height:8px;border-radius:99px;background:var(--track);overflow:visible}
+.bullet-fill{display:block;height:100%;min-width:2px;border-radius:99px;background:var(--p50)}
+.bullet-fill.p75{background:var(--p75)}.bullet-fill.p95{background:var(--p95)}.bullet-fill.max{background:var(--max)}
+.bullet-row.over-limit .bullet-fill{background:var(--bad)}.bullet-row.over-limit strong{color:var(--bad)}
+.bullet-limit{position:absolute;top:-3px;width:2px;height:14px;border-radius:1px;background:var(--ink);transform:translateX(-1px)}
+.bullet-axis{display:flex;justify-content:space-between;margin-left:37px;color:var(--secondary);font-size:12px;font-variant-numeric:tabular-nums}
+.distribution-sample{font-size:12px;line-height:1.4;color:var(--secondary);margin:10px 0 0}
+.distribution-note{margin-top:8px;font-size:12px;line-height:1.5}
+.chart-empty{display:grid;place-items:center;min-height:116px;color:var(--secondary);font-size:13px;text-align:center}
 .coverage-overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}
-.coverage-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:9px 12px}
+.coverage-card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px}
 .coverage-card>div:first-child{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.coverage-card>strong{display:inline-block;font-size:20px;font-weight:500;letter-spacing:-.04em;margin:5px 10px 5px 0}
-.coverage-card>span{font-size:11px;color:var(--secondary)}
-.coverage-track{height:5px;border-radius:5px;background:#eceef1;overflow:hidden}
+.coverage-card>strong{display:inline-block;font-size:24px;font-weight:650;letter-spacing:-.04em;margin:7px 10px 5px 0}
+.coverage-card>span{font-size:12px;color:var(--secondary)}
+.coverage-count{margin:4px 0 9px;color:var(--secondary);font-size:12px}
+.coverage-track{height:7px;border-radius:5px;background:var(--track);overflow:hidden}
 .coverage-track>span{display:block;height:100%;background:#9299a3}
-.coverage-track>.pass{background:#1a9857}.coverage-track>.fail{background:#dc3444}
-.chart-ring{width:36px;height:36px;border-radius:50%;background:conic-gradient(var(--good) var(--gate-completion),#e5e8ed 0);position:relative;flex:none}
-.chart-ring::after{content:"";position:absolute;inset:4px;border-radius:50%;background:var(--card)}
-.gate-summary{display:flex;align-items:center;gap:10px;margin:8px 0 12px}
+.coverage-track>.pass{background:var(--good)}.coverage-track>.fail{background:var(--bad)}
+.gate-summary{display:flex;align-items:center;gap:12px;margin:8px 0 16px;padding:14px 16px;border:1px solid var(--line);border-radius:14px;background:var(--card)}
+.gate-score{display:grid;min-width:78px;padding-right:14px;border-right:1px solid var(--line)}
+.gate-score strong{font-size:21px;line-height:1.1;font-variant-numeric:tabular-nums}.gate-score span{font-size:12px;color:var(--secondary)}
+.gate-score.pass strong{color:var(--good)}.gate-score.fail strong{color:var(--bad)}
 .gate-summary p{margin:3px 0;color:var(--secondary);font-size:13px}
 @media(max-width:800px){.distribution-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.health-heading{align-items:flex-start;flex-direction:column}.coverage-overview{grid-template-columns:1fr}.coverage-card{padding:9px 12px}}
 @media(max-width:580px){.distribution-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.distribution-card{padding:10px 9px 8px}}
-@media(max-width:390px){.distribution-grid{grid-template-columns:1fr}.percentile-values dd{font-size:16px}}
-@media(prefers-contrast:more){.arc-track{stroke:#b5bcc6}.distribution-card,.coverage-card{border-color:currentColor}.arc-limit{stroke-width:2}}
-@media print{.distribution-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.distribution-card,.coverage-card{break-inside:avoid}.nested-arcs{print-color-adjust:exact}}
+@media(max-width:390px){.distribution-grid{grid-template-columns:1fr}.gate-summary{align-items:flex-start}.gate-score{min-width:66px}}
+@media(prefers-contrast:more){.distribution-card,.coverage-card{border-color:currentColor}.bullet-limit{width:3px}}
+@media print{.distribution-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.distribution-card,.coverage-card{break-inside:avoid}.bullet-fill,.coverage-track>span{print-color-adjust:exact}}
 """

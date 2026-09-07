@@ -34,6 +34,7 @@ import threading
 import time
 import tokenize
 import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -45,15 +46,45 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
+from gherkin_check import main as gherkin_main  # noqa: E402
+from gherkin_yaml import main as gherkin_yaml_main  # noqa: E402
+from portable_analysis import (  # noqa: E402
+    HistoryInput,
+    PortableAnalysisReport,
+    ResolvedDependency,
+    analyze_portable_sources,
+)
+from portable_vulnerabilities import (  # noqa: E402
+    DependencyInventory,
+    VulnerabilityFinding,
+    discover_locked_packages,
+    query_osv,
+)
+from project_quality import (  # noqa: E402
+    QualityDimension,
+    attach_project_quality,
+    dimension_dicts,
+)
 from quality_charts import CHART_STYLES, health_overview  # noqa: E402
 
-VERSION = "4.4.0"
+VERSION = "6.2.0"
 QUALITY_DIRECTORY = ".quality"
 CONFIG_NAME = f"{QUALITY_DIRECTORY}/quality-gate.json"
 THRESHOLDS_NAME = f"{QUALITY_DIRECTORY}/quality-thresholds.json"
 DEPENDENCIES_NAME = f"{QUALITY_DIRECTORY}/quality-dependencies.json"
 DEFAULT_REPORT = f"{QUALITY_DIRECTORY}/quality-gate-report.html"
 STRYKER_VERSION = "9.6.1"
+PYTHON_TOOL_PACKAGES = {
+    "gherkin": "gherkin-official==42.0.1",
+    "yaml": "PyYAML==6.0.3",
+    "coverage": "coverage==7.10.2",
+    "jsonschema": "jsonschema==4.25.0",
+    "lizard": "lizard==1.17.31",
+    "mypy": "mypy==1.17.1",
+    "openapi_spec_validator": "openapi-spec-validator==0.7.2",
+    "ruff": "ruff==0.12.8",
+    "vulture": "vulture==2.14",
+}
 GITHUB_REPOSITORY = "benrben/code-skills"
 GITHUB_DEFAULT_REF = "main"
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -90,7 +121,7 @@ THRESHOLD_KEYS = {
         "coverage_limit",
         "branch_coverage_limit",
         "complexity_limit",
-        "craap_limit",
+        "crap_limit",
     },
     "slow_tests": {"max_test_seconds", "max_suite_seconds"},
     "extensibility": {
@@ -106,6 +137,15 @@ THRESHOLD_KEYS = {
     "flaky_tests": {"runs", "max_failures"},
     "mutation": {"max_surviving_mutants"},
     "dependencies": {"max_violations"},
+    "test_execution": {"min_executed", "max_skipped"},
+    "portable_analysis": {
+        "max_cognitive_complexity",
+        "max_nesting_depth",
+        "max_duplication_percent",
+        "max_dependency_cycles",
+        "max_secret_findings",
+        "max_known_vulnerabilities",
+    },
 }
 
 SOURCE_EXTENSIONS = {
@@ -289,6 +329,7 @@ class CommandResult:
     stdout: str
     duration_seconds: float
     timed_out: bool = False
+    dependency_changes: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -327,11 +368,11 @@ class FunctionMetric:
     covered_lines: int
     total_lines: int
     coverage_percent: float
-    craap_score: float
+    crap_score: float
     parser: str
     coverage_limit: float = 100.0
     complexity_limit: float = 6.0
-    craap_limit: float = 6.0
+    crap_limit: float = 6.0
     coverage_measured: bool = True
     covered_branches: int = 0
     total_branches: int = 0
@@ -353,7 +394,7 @@ class FunctionMetric:
             self.coverage_percent >= self.coverage_limit
             and branch_coverage_passed
             and self.complexity <= self.complexity_limit
-            and self.craap_score <= self.craap_limit
+            and self.crap_score <= self.crap_limit
         )
 
 
@@ -413,6 +454,18 @@ class TestTiming:
 
 
 @dataclasses.dataclass(frozen=True)
+class TestExecution:
+    executed: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    xfailed: int = 0
+    retried: int = 0
+    parser: str = "unknown"
+    measured: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
 class ExtensionScenario:
     name: str
     passed: bool
@@ -456,6 +509,9 @@ class GateResult:
     deferred: bool = False
     skipped: bool = False
     off: bool = False
+    blocked: bool = False
+    unsupported: bool = False
+    needs_context: bool = False
     smoke_probes: list[SmokeProbe] = dataclasses.field(default_factory=list)
 
 
@@ -535,6 +591,13 @@ class AnalysisReport:
     scope: GateScope = dataclasses.field(default_factory=repository_scope)
     selection: tuple[str, ...] = ()
     focus: str | None = None
+    test_execution: TestExecution = dataclasses.field(default_factory=TestExecution)
+    portable_analysis: PortableAnalysisReport | None = None
+    dependency_inventory: DependencyInventory | None = None
+    vulnerabilities: tuple[VulnerabilityFinding, ...] = ()
+    project_profile: dict[str, Any] = dataclasses.field(default_factory=dict)
+    quality_dimensions: tuple[QualityDimension, ...] = ()
+    certifications: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -727,6 +790,142 @@ def bundle_standalone_charts(runner: bytes, charts: bytes) -> bytes:
     return combined.encode("utf-8")
 
 
+def bundle_standalone_portable_analysis(runner: bytes, portable: bytes) -> bytes:
+    """Inline source-only analyzers into the legacy single-file runner."""
+    portable_source = portable.decode("utf-8").replace(
+        "from __future__ import annotations\n", ""
+    )
+    runner_source = runner.decode("utf-8")
+    marker = """from portable_analysis import (  # noqa: E402
+    HistoryInput,
+    PortableAnalysisReport,
+    ResolvedDependency,
+    analyze_portable_sources,
+)"""
+    if marker not in runner_source:
+        raise ValueError(
+            "The downloaded runner has no portable-analysis import to bundle"
+        )
+    combined = runner_source.replace(marker, portable_source, 1)
+    try:
+        ast.parse(combined)
+    except SyntaxError as error:
+        raise ValueError(
+            f"The downloaded portable analyzer is not valid Python: {error}"
+        ) from error
+    return combined.encode("utf-8")
+
+
+def bundle_standalone_portable_graph(runner: bytes, portable: bytes) -> bytes:
+    """Inline graph, secret, and hotspot primitives into a single-file runner."""
+    portable_source = portable.decode("utf-8").replace(
+        "from __future__ import annotations\n", ""
+    )
+    runner_source = runner.decode("utf-8")
+    marker = """from portable_graph import (
+    DependencyReport,
+    HotspotMetric,
+    SecretFinding,
+    analyze_dependency_graph,
+    calculate_hotspots,
+    scan_secrets,
+)\nfrom portable_graph import HistoryInput as HistoryInput
+from portable_graph import ResolvedDependency as ResolvedDependency"""
+    if marker not in runner_source:
+        raise ValueError("The downloaded runner has no portable-graph import to bundle")
+    combined = runner_source.replace(marker, portable_source, 1)
+    try:
+        ast.parse(combined)
+    except SyntaxError as error:
+        raise ValueError(
+            f"The downloaded portable graph is not valid Python: {error}"
+        ) from error
+    return combined.encode("utf-8")
+
+
+def bundle_standalone_vulnerability_analysis(runner: bytes, portable: bytes) -> bytes:
+    """Inline lockfile and OSV adapters into the legacy single-file runner."""
+    portable_source = portable.decode("utf-8").replace(
+        "from __future__ import annotations\n", ""
+    )
+    runner_source = runner.decode("utf-8")
+    marker = """from portable_vulnerabilities import (  # noqa: E402
+    DependencyInventory,
+    VulnerabilityFinding,
+    discover_locked_packages,
+    query_osv,
+)"""
+    if marker not in runner_source:
+        raise ValueError(
+            "The downloaded runner has no vulnerability-analysis import to bundle"
+        )
+    combined = runner_source.replace(marker, portable_source, 1)
+    try:
+        ast.parse(combined)
+    except SyntaxError as error:
+        raise ValueError(
+            f"The downloaded vulnerability analyzer is not valid Python: {error}"
+        ) from error
+    return combined.encode("utf-8")
+
+
+def bundle_standalone_project_quality(runner: bytes, project_quality: bytes) -> bytes:
+    """Inline the project-wide evidence catalog into a single-file runner."""
+    project_source = project_quality.decode("utf-8").replace(
+        "from __future__ import annotations\n", ""
+    )
+    runner_source = runner.decode("utf-8")
+    marker = """from project_quality import (  # noqa: E402
+    QualityDimension,
+    attach_project_quality,
+    dimension_dicts,
+)"""
+    if marker not in runner_source:
+        raise ValueError(
+            "The downloaded runner has no project-quality import to bundle"
+        )
+    combined = runner_source.replace(marker, project_source, 1)
+    try:
+        ast.parse(combined)
+    except SyntaxError as error:
+        raise ValueError(
+            f"The downloaded project-quality catalog is not valid Python: {error}"
+        ) from error
+    return combined.encode("utf-8")
+
+
+def bundle_standalone_gherkin(runner: bytes, checker: bytes) -> bytes:
+    return bundle_standalone_bdd_helper(
+        runner, checker, "gherkin_check", "gherkin_main"
+    )
+
+
+def bundle_standalone_gherkin_yaml(runner: bytes, compiler: bytes) -> bytes:
+    return bundle_standalone_bdd_helper(
+        runner, compiler, "gherkin_yaml", "gherkin_yaml_main"
+    )
+
+
+def bundle_standalone_bdd_helper(
+    runner: bytes, helper: bytes, module: str, alias: str
+) -> bytes:
+    """Keep the validator's namespace isolated inside a legacy single-file release."""
+    marker = f"from {module} import main as {alias}  # noqa: E402"
+    source = runner.decode("utf-8")
+    if marker not in source:
+        raise ValueError("The downloaded runner has no Gherkin import to bundle")
+    checker_source = helper.decode("utf-8")
+    ast.parse(checker_source)
+    embedded = (
+        "import types as _gherkin_types\n"
+        f"_gherkin_module = _gherkin_types.ModuleType({module!r})\n"
+        f"sys.modules[{module!r}] = _gherkin_module\n"
+        f"exec(compile({checker_source!r}, {module + '.py'!r}, 'exec'), _gherkin_module.__dict__)\n"
+        f"{alias} = _gherkin_module.main"
+    )
+    return source.replace(marker, embedded, 1).encode("utf-8")
+
+
 def normalized_git_remote(value: str) -> str:
     normalized = value.strip().removesuffix(".git").removesuffix("/")
     if normalized.startswith("git@github.com:"):
@@ -830,6 +1029,51 @@ def update_from_github(runner_path: Path, reference: str) -> int:
             )
             runner_payload = bundle_standalone_charts(
                 runner_payload, download_update_file(charts_url, 1_000_000)
+            )
+        if b"from portable_analysis import" in runner_payload:
+            portable_url = github_raw_url(
+                reference, "skills/code-discipline/scripts/portable_analysis.py"
+            )
+            runner_payload = bundle_standalone_portable_analysis(
+                runner_payload, download_update_file(portable_url, 1_000_000)
+            )
+        if b"from portable_graph import" in runner_payload:
+            graph_url = github_raw_url(
+                reference, "skills/code-discipline/scripts/portable_graph.py"
+            )
+            runner_payload = bundle_standalone_portable_graph(
+                runner_payload, download_update_file(graph_url, 1_000_000)
+            )
+        if b"from portable_vulnerabilities import" in runner_payload:
+            vulnerability_url = github_raw_url(
+                reference,
+                "skills/code-discipline/scripts/portable_vulnerabilities.py",
+            )
+            runner_payload = bundle_standalone_vulnerability_analysis(
+                runner_payload,
+                download_update_file(vulnerability_url, 1_000_000),
+            )
+        if b"from project_quality import" in runner_payload:
+            project_quality_url = github_raw_url(
+                reference, "skills/code-discipline/scripts/project_quality.py"
+            )
+            runner_payload = bundle_standalone_project_quality(
+                runner_payload,
+                download_update_file(project_quality_url, 1_000_000),
+            )
+        if b"from gherkin_check import" in runner_payload:
+            checker_url = github_raw_url(
+                reference, "skills/code-discipline/scripts/gherkin_check.py"
+            )
+            runner_payload = bundle_standalone_gherkin(
+                runner_payload, download_update_file(checker_url, 1_000_000)
+            )
+        if b"from gherkin_yaml import" in runner_payload:
+            yaml_url = github_raw_url(
+                reference, "skills/code-discipline/scripts/gherkin_yaml.py"
+            )
+            runner_payload = bundle_standalone_gherkin_yaml(
+                runner_payload, download_update_file(yaml_url, 1_000_000)
             )
         thresholds_payload = download_update_file(thresholds_url, 100_000)
         version = install_standalone_release(
@@ -936,6 +1180,7 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
         ("metrics", "branch_coverage_limit"),
         ("extensibility", "contract_coverage_limit"),
         ("error_handling", "failure_path_coverage_limit"),
+        ("portable_analysis", "max_duplication_percent"),
     )
     for section, key in percentage_paths:
         if threshold_number(thresholds, section, key) > 100:
@@ -960,6 +1205,13 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
         ("flaky_tests", "max_failures"),
         ("mutation", "max_surviving_mutants"),
         ("dependencies", "max_violations"),
+        ("test_execution", "min_executed"),
+        ("test_execution", "max_skipped"),
+        ("portable_analysis", "max_cognitive_complexity"),
+        ("portable_analysis", "max_nesting_depth"),
+        ("portable_analysis", "max_dependency_cycles"),
+        ("portable_analysis", "max_secret_findings"),
+        ("portable_analysis", "max_known_vulnerabilities"),
     )
     for section, key in integer_paths:
         if not isinstance(thresholds[section][key], int):
@@ -975,12 +1227,18 @@ def validate_thresholds(thresholds: dict[str, Any]) -> None:
         ("flaky_tests", "max_failures"),
         ("mutation", "max_surviving_mutants"),
         ("dependencies", "max_violations"),
+        ("test_execution", "max_skipped"),
+        ("portable_analysis", "max_dependency_cycles"),
+        ("portable_analysis", "max_secret_findings"),
+        ("portable_analysis", "max_known_vulnerabilities"),
     )
     for section, key in zero_only_paths:
         if thresholds[section][key] != 0:
             raise ValueError(
                 f"Threshold {section}.{key} must remain 0 for certification"
             )
+    if thresholds["test_execution"]["min_executed"] < 1:
+        raise ValueError("Threshold test_execution.min_executed must be at least 1")
 
 
 def read_thresholds(path: Path) -> dict[str, Any]:
@@ -990,7 +1248,20 @@ def read_thresholds(path: Path) -> dict[str, Any]:
         raise ValueError(f"Cannot read thresholds {path}: {error}") from error
     if not isinstance(loaded, dict):
         raise ValueError(f"Threshold file {path} must contain a JSON object")
-    return loaded
+    return normalize_crap_config(loaded)
+
+
+def normalize_crap_config(value: dict[str, Any]) -> dict[str, Any]:
+    """Read the former spelling without changing an existing owned threshold."""
+    metrics = value.get("metrics")
+    if not isinstance(metrics, dict) or "craap_limit" not in metrics:
+        return value
+    metrics = dict(metrics)
+    legacy = metrics.pop("craap_limit")
+    if "crap_limit" in metrics and metrics["crap_limit"] != legacy:
+        raise ValueError("Conflicting metrics.crap_limit and legacy craap_limit")
+    metrics["crap_limit"] = legacy
+    return {**value, "metrics": metrics}
 
 
 def is_bundled_thresholds(path: Path) -> bool:
@@ -1145,6 +1416,13 @@ def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
             "story": None,
             "timeout_seconds": 300,
         },
+        "gherkin": {
+            "enabled": True,
+            "command": None,
+            "report": ".quality/gherkin.json",
+            "format": "cucumber-json",
+            "timeout_seconds": 300,
+        },
         "flaky_tests": {
             "enabled": True,
             "timeout_seconds": 600,
@@ -1154,6 +1432,10 @@ def default_config(thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
             "edges_report": None,
             "rules": DEPENDENCIES_NAME,
             "timeout_seconds": 300,
+        },
+        "project_quality": {
+            "enabled": "auto",
+            "profile": ".quality/project-profile.json",
         },
         "tools": {"auto_install": True, "cache_dir": None},
     }
@@ -1180,7 +1462,7 @@ def load_config(
             raise ValueError(f"Cannot read configuration {path}: {error}") from error
         if not isinstance(loaded, dict):
             raise ValueError(f"Configuration {path} must contain a JSON object")
-        config = deep_merge(config, loaded)
+        config = deep_merge(config, normalize_crap_config(loaded))
         config = deep_merge(config, threshold_config(active_thresholds))
         notes.append(f"Loaded configuration from {path}")
     else:
@@ -1641,35 +1923,41 @@ def bootstrap_tools(
     if needs_lizard and not _python_module_available(
         python, "lizard", root, python_env
     ):
-        missing_packages.append("lizard")
+        missing_packages.append(PYTHON_TOOL_PACKAGES["lizard"])
     if needs_coverage and not _python_module_available(
         python, "coverage", root, python_env
     ):
-        missing_packages.append("coverage")
+        missing_packages.append(PYTHON_TOOL_PACKAGES["coverage"])
     has_python = any(path.suffix.lower() in {".py", ".pyi"} for path in source_files)
     optional_python_tools = []
+    if config.get("gherkin", {}).get("command"):
+        optional_python_tools.append(("gherkin", PYTHON_TOOL_PACKAGES["gherkin"]))
+        optional_python_tools.append(("yaml", PYTHON_TOOL_PACKAGES["yaml"]))
     if has_python and (
         any((root / name).exists() for name in ("ruff.toml", ".ruff.toml"))
         or project_config_contains(root, "[tool.ruff")
     ):
-        optional_python_tools.append(("ruff", "ruff"))
+        optional_python_tools.append(("ruff", PYTHON_TOOL_PACKAGES["ruff"]))
     if has_python and (
         (root / "mypy.ini").exists()
         or project_config_contains(root, "[tool.mypy")
         or project_config_contains(root, "[mypy")
     ):
-        optional_python_tools.append(("mypy", "mypy"))
+        optional_python_tools.append(("mypy", PYTHON_TOOL_PACKAGES["mypy"]))
     if has_python and project_config_contains(root, "[tool.vulture"):
-        optional_python_tools.append(("vulture", "vulture"))
+        optional_python_tools.append(("vulture", PYTHON_TOOL_PACKAGES["vulture"]))
     contract_files = discover_contract_files(root, config.get("contracts", {}))
     if any(path.name.lower().endswith(".schema.json") for path in contract_files):
-        optional_python_tools.append(("jsonschema", "jsonschema"))
+        optional_python_tools.append(("jsonschema", PYTHON_TOOL_PACKAGES["jsonschema"]))
     if any(
         path.name.lower() in {"openapi.json", "openapi.yaml", "openapi.yml"}
         for path in contract_files
     ):
         optional_python_tools.append(
-            ("openapi_spec_validator", "openapi-spec-validator")
+            (
+                "openapi_spec_validator",
+                PYTHON_TOOL_PACKAGES["openapi_spec_validator"],
+            )
         )
     for module, package in optional_python_tools:
         if not _python_module_available(python, module, root, python_env):
@@ -1697,28 +1985,6 @@ def bootstrap_tools(
     )
 
     dependencies = package_dependencies(root)
-    vitest_version = node_package_version(root, "vitest")
-    needs_vitest_coverage = (
-        not has_metrics_adapter
-        and "vitest" in dependencies
-        and not node_package_version(root, "@vitest/coverage-v8")
-    )
-    if auto_install and needs_vitest_coverage and executable(root, "npm"):
-        requested = vitest_version or dependencies.get("vitest", "latest")
-        install = run_command(
-            [
-                executable(root, "npm") or "npm",
-                "install",
-                "--no-save",
-                "--package-lock=false",
-                "--ignore-scripts",
-                f"@vitest/coverage-v8@{requested}",
-            ],
-            root,
-            900,
-        )
-        context.setup_results.append(install)
-
     mutation_config = config.get("mutation", {})
     mutation_engine = str(mutation_config.get("engine", "auto")).lower()
     needs_stryker = (
@@ -1734,24 +2000,7 @@ def bootstrap_tools(
         node_package_version(root, "@stryker-mutator/core")
         and node_package_version(root, "@stryker-mutator/vitest-runner")
     )
-    stryker_install_succeeded = False
-    if needs_stryker and not has_stryker and auto_install and executable(root, "npm"):
-        install = run_command(
-            [
-                executable(root, "npm") or "npm",
-                "install",
-                "--no-save",
-                "--package-lock=false",
-                "--ignore-scripts",
-                f"@stryker-mutator/core@{STRYKER_VERSION}",
-                f"@stryker-mutator/vitest-runner@{STRYKER_VERSION}",
-            ],
-            root,
-            900,
-        )
-        context.setup_results.append(install)
-        stryker_install_succeeded = install.returncode == 0
-    if needs_stryker and (has_stryker or stryker_install_succeeded):
+    if needs_stryker and has_stryker:
         binary_name = "stryker.cmd" if os.name == "nt" else "stryker"
         context.stryker_command = [str(root / "node_modules" / ".bin" / binary_name)]
 
@@ -1815,9 +2064,14 @@ def infer_test_command(root: Path) -> list[str] | None:
         ):
             return [python, "-m", "pytest", "-q"]
     if (root / "go.mod").exists() and executable(root, "go"):
-        return [executable(root, "go") or "go", "test", "./..."]
+        return [executable(root, "go") or "go", "test", "-json", "./..."]
     if (root / "Cargo.toml").exists() and executable(root, "cargo"):
-        return [executable(root, "cargo") or "cargo", "test", "--all"]
+        return [
+            executable(root, "cargo") or "cargo",
+            "test",
+            "--all",
+            "--frozen",
+        ]
     if (root / "Gemfile").exists() and executable(root, "bundle"):
         if (root / "spec").exists():
             return [executable(root, "bundle") or "bundle", "exec", "rspec"]
@@ -1825,11 +2079,15 @@ def infer_test_command(root: Path) -> list[str] | None:
     if (root / "composer.json").exists() and (root / "vendor/bin/phpunit").exists():
         return [str(root / "vendor/bin/phpunit")]
     if (root / "pom.xml").exists() and executable(root, "mvn"):
-        return [executable(root, "mvn") or "mvn", "test"]
+        return [executable(root, "mvn") or "mvn", "-o", "test"]
     if (root / "gradlew").exists():
-        return [str(root / "gradlew"), "test"]
+        return [str(root / "gradlew"), "--offline", "test"]
     if list(root.glob("*.sln")) and executable(root, "dotnet"):
-        return [executable(root, "dotnet") or "dotnet", "test"]
+        return [
+            executable(root, "dotnet") or "dotnet",
+            "test",
+            "--no-restore",
+        ]
     return None
 
 
@@ -1886,6 +2144,7 @@ def workspace_coverage_template(root: Path) -> dict[str, Any]:
         commands.append(
             [
                 "npx",
+                "--no-install",
                 "vitest",
                 "run",
                 "--root",
@@ -2145,7 +2404,12 @@ def infer_type_commands(
     if (root / "Cargo.toml").exists() and executable(root, "cargo"):
         commands.append(
             CheckCommand(
-                [executable(root, "cargo") or "cargo", "check", "--all-targets"]
+                [
+                    executable(root, "cargo") or "cargo",
+                    "check",
+                    "--all-targets",
+                    "--frozen",
+                ]
             )
         )
     if list(root.glob("*.sln")) and executable(root, "dotnet"):
@@ -2259,7 +2523,7 @@ SELECTABLE_CHECKS: dict[str, str] = {
     "coverage": "quality",
     "branches": "quality",
     "complexity": "quality",
-    "craap": "quality",
+    "crap": "quality",
     "slow-tests": "slow_tests",
     "extension-contracts": "extensibility",
     "extension-deps": "extensibility",
@@ -2272,8 +2536,16 @@ SELECTABLE_CHECKS: dict[str, str] = {
     "flaky": "flaky",
     "mutation": "mutation",
     "smoke": "smoke",
+    "gherkin": "gherkin",
+    "test-count": "test_execution",
+    "cognitive": "cognitive",
+    "duplication": "duplication",
+    "cycles": "dependency_health",
+    "secrets": "secrets",
+    "hotspots": "hotspots",
+    "vulnerabilities": "vulnerabilities",
 }
-METRIC_FOCUS_PRIORITY = ("craap", "branches", "coverage", "complexity", "tests")
+METRIC_FOCUS_PRIORITY = ("crap", "branches", "coverage", "complexity", "tests")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2301,13 +2573,15 @@ def selected_gate_keys(names: Sequence[str]) -> frozenset[str] | None:
     keys = {SELECTABLE_CHECKS[name] for name in names}
     if "failure-paths" in names:
         keys.add("quality")
+    if "tests" in names:
+        keys.add("test_execution")
     return frozenset(keys)
 
 
 def metrics_focus(names: Sequence[str]) -> str | None:
     chosen = set(names)
     if {"coverage", "complexity"} <= chosen:
-        return "craap"
+        return "crap"
     for name in METRIC_FOCUS_PRIORITY:
         if name in chosen:
             return name
@@ -2344,6 +2618,413 @@ def with_gate_enabled(config: dict[str, Any], section: str) -> dict[str, Any]:
     return {**config, section: {**config[section], "enabled": True}}
 
 
+def _summary_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for amount, name in re.findall(
+        r"(?<![\w.])(\d+)\s+(passed|failed|skipped|xfailed|xpassed|errors?|ignored|retried|rerun|total)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        key = name.lower()
+        if key == "error":
+            key = "errors"
+        counts[key] = counts.get(key, 0) + int(amount)
+    return counts
+
+
+def _go_test_event(line: str) -> tuple[str, str, str] | None:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    action = value.get("Action")
+    test = value.get("Test")
+    if action not in {"pass", "fail", "skip"} or not isinstance(test, str):
+        return None
+    return str(value.get("Package", "")), test, action
+
+
+def _go_test_execution(output: str) -> TestExecution | None:
+    outcomes: dict[tuple[str, str], str] = {}
+    for line in output.splitlines():
+        event = _go_test_event(line)
+        if event is not None:
+            package, test, action = event
+            outcomes[(package, test)] = action
+    if not outcomes:
+        return None
+    counts = Counter(outcomes.values())
+    return TestExecution(
+        len(outcomes),
+        counts["pass"],
+        counts["fail"],
+        counts["skip"],
+        parser="go-json",
+        measured=True,
+    )
+
+
+def parse_test_execution(output: str) -> TestExecution:
+    """Parse only explicit summaries; unknown output never implies that tests ran."""
+    go_execution = _go_test_execution(output)
+    if go_execution is not None:
+        return go_execution
+    cargo_rows = re.findall(
+        r"test result:\s+\w+\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;",
+        output,
+        re.IGNORECASE,
+    )
+    if cargo_rows:
+        passed = sum(int(row[0]) for row in cargo_rows)
+        failed = sum(int(row[1]) for row in cargo_rows)
+        skipped = sum(int(row[2]) for row in cargo_rows)
+        return TestExecution(
+            passed + failed + skipped,
+            passed,
+            failed,
+            skipped,
+            parser="cargo",
+            measured=True,
+        )
+
+    unittest_match = re.search(r"\bRan\s+(\d+)\s+tests?\b", output)
+    if unittest_match:
+        executed = int(unittest_match.group(1))
+        tail = output[unittest_match.end() :]
+        failures = sum(
+            int(value) for value in re.findall(r"(?:failures|errors)=(\d+)", tail)
+        )
+        skipped_match = re.search(r"skipped=(\d+)", tail)
+        skipped = int(skipped_match.group(1)) if skipped_match else 0
+        return TestExecution(
+            executed,
+            max(0, executed - failures - skipped),
+            failures,
+            skipped,
+            parser="unittest",
+            measured=True,
+        )
+
+    vitest_match = re.search(r"^\s*Tests\s{2,}(.+?)\((\d+)\)\s*$", output, re.MULTILINE)
+    if vitest_match and "|" in vitest_match.group(1):
+        counts = _summary_counts(vitest_match.group(1))
+        xfailed = counts.get("xfailed", 0)
+        return TestExecution(
+            int(vitest_match.group(2)),
+            counts.get("passed", 0),
+            counts.get("failed", 0) + counts.get("errors", 0),
+            counts.get("skipped", 0) + xfailed,
+            xfailed,
+            counts.get("retried", 0) + counts.get("rerun", 0),
+            "vitest",
+            True,
+        )
+
+    jest_match = re.search(r"^Tests:\s+(.+)$", output, re.MULTILINE)
+    if jest_match:
+        counts = _summary_counts(jest_match.group(1))
+        total = counts.get("total", 0)
+        if total:
+            skipped = counts.get("skipped", 0)
+            failed = counts.get("failed", 0)
+            return TestExecution(
+                total,
+                counts.get("passed", max(0, total - failed - skipped)),
+                failed,
+                skipped,
+                parser="jest",
+                measured=True,
+            )
+
+    pytest_lines = [
+        line
+        for line in output.splitlines()
+        if re.search(r"\b\d+\s+(?:passed|failed|xfailed|xpassed)\b", line)
+        and (" in " in line or line.strip().startswith("="))
+    ]
+    if pytest_lines:
+        counts = _summary_counts(pytest_lines[-1])
+        xfailed = counts.get("xfailed", 0)
+        failed = counts.get("failed", 0) + counts.get("errors", 0)
+        skipped = counts.get("skipped", 0) + xfailed
+        passed = counts.get("passed", 0)
+        return TestExecution(
+            passed + failed + skipped + counts.get("xpassed", 0),
+            passed,
+            failed,
+            skipped,
+            xfailed,
+            counts.get("rerun", 0),
+            "pytest",
+            True,
+        )
+
+    minitest_match = re.search(
+        r"(\d+) runs?,.*?(\d+) failures?,\s*(\d+) errors?(?:,\s*(\d+) skips?)?",
+        output,
+        re.IGNORECASE,
+    )
+    if minitest_match:
+        executed, failures, errors, skipped = (
+            int(value or 0) for value in minitest_match.groups()
+        )
+        failed = failures + errors
+        return TestExecution(
+            executed,
+            max(0, executed - failed - skipped),
+            failed,
+            skipped,
+            parser="minitest",
+            measured=True,
+        )
+
+    tap_total = re.search(r"^# tests\s+(\d+)\s*$", output, re.MULTILINE)
+    if tap_total:
+        counts = {
+            name: int(value)
+            for name, value in re.findall(
+                r"^# (pass|fail|skipped)\s+(\d+)\s*$", output, re.MULTILINE
+            )
+        }
+        total = int(tap_total.group(1))
+        skipped = counts.get("skipped", 0)
+        failed = counts.get("fail", 0)
+        return TestExecution(
+            total,
+            counts.get("pass", max(0, total - failed - skipped)),
+            failed,
+            skipped,
+            parser="tap",
+            measured=True,
+        )
+    return TestExecution()
+
+
+def project_execution_env(
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Prevent common package managers from restoring dependencies during checks."""
+    environment = {
+        "UV_NO_SYNC": "1",
+        "UV_OFFLINE": "1",
+        "PIP_NO_INDEX": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "NPM_CONFIG_OFFLINE": "true",
+        "YARN_ENABLE_NETWORK": "0",
+        "BUNDLE_FROZEN": "true",
+        "COMPOSER_DISABLE_NETWORK": "1",
+        "CARGO_NET_OFFLINE": "true",
+        "DOTNET_NOLOGO": "1",
+        "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
+        "GOPROXY": "off",
+        "GOSUMDB": "off",
+        "GOTOOLCHAIN": "local",
+    }
+    environment.update(extra or {})
+    return environment
+
+
+DEPENDENCY_STATE_FILES = {
+    "Cargo.lock",
+    "Cargo.toml",
+    "Gemfile.lock",
+    "Package.resolved",
+    "Pipfile.lock",
+    "composer.lock",
+    "go.mod",
+    "go.sum",
+    "mix.lock",
+    "package-lock.json",
+    "package.json",
+    "packages.lock.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "pubspec.lock",
+    "pylock.toml",
+    "pyproject.toml",
+    "uv.lock",
+    "yarn.lock",
+}
+DEPENDENCY_DIRECTORY_MARKERS = {
+    ".dart_tool": ("package_config.json",),
+    ".venv": ("pyvenv.cfg",),
+    "node_modules": (".package-lock.json", ".modules.yaml", ".yarn-state.yml"),
+    "obj": ("project.assets.json",),
+    "venv": ("pyvenv.cfg",),
+    "vendor": ("autoload.php",),
+}
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def project_dependency_state(root: Path) -> dict[str, str]:
+    """Fingerprint manifests, locks, and standard restore markers without large trees."""
+    state: dict[str, str] = {}
+    for directory, names, files in os.walk(root):
+        path = Path(directory)
+        relative_directory = normalize_path(path, root)
+        if relative_directory == ".git" or relative_directory.startswith(".git/"):
+            names[:] = []
+            continue
+        for filename in files:
+            candidate = path / filename
+            relative = normalize_path(candidate, root)
+            is_requirement = bool(
+                re.fullmatch(r"requirements(?:[-_.][^/]*)?\.txt", filename, re.I)
+            )
+            parent_marker = DEPENDENCY_DIRECTORY_MARKERS.get(path.name, ())
+            if (
+                filename in DEPENDENCY_STATE_FILES
+                or is_requirement
+                or filename in parent_marker
+            ):
+                with contextlib.suppress(OSError):
+                    state[relative] = _file_digest(candidate)
+        marker_directories = set(DEPENDENCY_DIRECTORY_MARKERS) & set(names)
+        names[:] = [
+            name
+            for name in names
+            if name not in DEPENDENCY_DIRECTORY_MARKERS and name != ".git"
+        ]
+        for name in marker_directories:
+            marker_root = path / name
+            for marker in DEPENDENCY_DIRECTORY_MARKERS[name]:
+                candidate = marker_root / marker
+                if candidate.is_file():
+                    relative = normalize_path(candidate, root)
+                    with contextlib.suppress(OSError):
+                        state[relative] = _file_digest(candidate)
+    return state
+
+
+def changed_dependency_state(
+    before: dict[str, str], after: dict[str, str]
+) -> list[str]:
+    return sorted(
+        path for path in set(before) | set(after) if before.get(path) != after.get(path)
+    )
+
+
+def blocked_prerequisite(output: str) -> str | None:
+    lowered = output.lower()
+    patterns = {
+        "project dependencies are missing": (
+            "modulenotfounderror",
+            "cannot find module",
+            "could not resolve dependencies",
+            "dependency resolution failed",
+            "no matching package named",
+            "package restore failed",
+            "assets file",  # dotnet project.assets.json is created by restore
+        ),
+        "the required runtime or test command is missing": (
+            "command not found",
+            "no such file or directory",
+            "is not recognized as an internal or external command",
+        ),
+        "the dependency cache is incomplete and network restore is disabled": (
+            "offline mode",
+            "offline and the package",
+            "not available in offline mode",
+            "failed to download",
+        ),
+    }
+    for reason, needles in patterns.items():
+        if any(needle in lowered for needle in needles):
+            return reason
+    return None
+
+
+def run_test_execution_gate(
+    baseline: CommandResult | None, section: dict[str, Any]
+) -> tuple[GateResult, TestExecution]:
+    if baseline is None:
+        return (
+            GateResult(
+                "test_execution",
+                "Test execution",
+                False,
+                "No complete test command could be configured or inferred.",
+                blocked=True,
+            ),
+            TestExecution(),
+        )
+    if baseline.dependency_changes:
+        return (
+            GateResult(
+                "test_execution",
+                "Test execution",
+                False,
+                "The test command changed project dependency state; quality checks may install tools only.",
+                baseline.dependency_changes,
+                [baseline],
+            ),
+            parse_test_execution(baseline.stdout),
+        )
+    measurement = parse_test_execution(baseline.stdout)
+    if baseline.returncode != 0:
+        reason = blocked_prerequisite(baseline.stdout)
+        return (
+            GateResult(
+                "test_execution",
+                "Test execution",
+                False,
+                reason
+                or "The test process failed; its execution count is diagnostic only.",
+                [baseline.stdout] if baseline.stdout else [],
+                [baseline],
+                blocked=reason is not None,
+            ),
+            measurement,
+        )
+    if not measurement.measured:
+        return (
+            GateResult(
+                "test_execution",
+                "Test execution",
+                False,
+                "The test command exited successfully, but its output did not prove that any tests executed.",
+                [
+                    "Use a supported native summary (unittest, pytest, Vitest, Jest, Cargo, Minitest, or TAP) or configure the command to emit one."
+                ],
+                [baseline],
+                blocked=True,
+            ),
+            measurement,
+        )
+    minimum = int(section.get("min_executed", 1))
+    maximum_skipped = int(section.get("max_skipped", 0))
+    details = []
+    if measurement.executed < minimum:
+        details.append(
+            f"Executed {measurement.executed} tests; at least {minimum} required."
+        )
+    if measurement.skipped > maximum_skipped:
+        details.append(
+            f"Skipped {measurement.skipped} tests; at most {maximum_skipped} allowed."
+        )
+    passed = not details and measurement.failed == 0
+    return (
+        GateResult(
+            "test_execution",
+            "Test execution",
+            passed,
+            f"{measurement.executed} tests measured by {measurement.parser}: {measurement.passed} passed, {measurement.failed} failed, {measurement.skipped} skipped.",
+            details,
+            [baseline],
+        ),
+        measurement,
+    )
+
+
 def tests_only_gate(
     test_command: list[str] | None, baseline: CommandResult | None
 ) -> GateResult:
@@ -2360,15 +3041,26 @@ def tests_only_gate(
                 )
             ],
         )
-    if baseline.returncode != 0:
+    if baseline.dependency_changes:
         return GateResult(
             "quality",
             "Tests",
             False,
-            "The complete test suite failed.",
+            "The test command changed project dependency state; dependency restore is forbidden.",
+            baseline.dependency_changes,
+            [baseline],
+        )
+    if baseline.returncode != 0:
+        reason = blocked_prerequisite(baseline.stdout)
+        return GateResult(
+            "quality",
+            "Tests",
+            False,
+            reason or "The complete test suite failed.",
             [baseline.stdout] if baseline.stdout else [],
             [baseline],
             [("Repair tests", generic_adapter_prompt("test", baseline))],
+            blocked=reason is not None,
         )
     return GateResult(
         "quality",
@@ -2487,7 +3179,7 @@ def run_contract_gate(
         effective_section,
         unique_check_commands(commands),
         "Add OpenAPI or *.schema.json documents, or configure contracts.commands for repository-specific compatibility checks.",
-        tools.python_env,
+        project_execution_env(tools.python_env),
     )
     if result.applicable and result.passed and files:
         result.summary = (
@@ -2503,9 +3195,17 @@ def run_test_baseline(
     command = command_list(config["test"].get("command")) or infer_test_command(root)
     if not command:
         return None, None
-    return command, run_command(
-        command, root, int(config["test"].get("timeout_seconds", 600))
+    before = project_dependency_state(root)
+    result = run_command(
+        command,
+        root,
+        int(config["test"].get("timeout_seconds", 600)),
+        project_execution_env(),
     )
+    result.dependency_changes = changed_dependency_state(
+        before, project_dependency_state(root)
+    )
+    return command, result
 
 
 def combine_test_and_metrics_gate(
@@ -2513,39 +3213,52 @@ def combine_test_and_metrics_gate(
     test_command: list[str] | None,
     baseline: CommandResult | None,
 ) -> GateResult:
-    title = "Tests, coverage & CRAAP"
+    title = "Tests, coverage & CRAP"
     if not test_command or baseline is None:
         return GateResult(
             "quality",
             title,
             False,
             "No complete test command could be configured or inferred. "
-            f"Coverage and CRAAP still ran diagnostically: {metrics_gate.summary}",
+            f"Coverage and CRAP still ran diagnostically: {metrics_gate.summary}",
             metrics_gate.details,
             metrics_gate.command_results,
             prompts=[
                 (
                     "Configure the complete test suite",
-                    "Configure test.command as an argument array that runs every required test and exits non-zero on failure. Then rerun coverage and CRAAP analysis.",
+                    "Configure test.command as an argument array that runs every required test and exits non-zero on failure. Then rerun coverage and CRAP analysis.",
                 ),
                 *metrics_gate.prompts,
             ],
         )
+    if baseline.dependency_changes:
+        return GateResult(
+            "quality",
+            title,
+            False,
+            "The test command changed project dependency state; coverage is diagnostic because dependency restore is forbidden.",
+            [*baseline.dependency_changes, *metrics_gate.details],
+            [baseline, *metrics_gate.command_results],
+            metrics_gate.prompts,
+        )
     if baseline.returncode != 0:
+        reason = blocked_prerequisite(baseline.stdout)
         details = [baseline.stdout] if baseline.stdout else []
         details.extend(metrics_gate.details)
         return GateResult(
             "quality",
             title,
             False,
-            "The complete test suite failed. Coverage and CRAAP ran diagnostically: "
-            f"{metrics_gate.summary} These measurements cannot be certified until the baseline tests pass.",
+            ((reason + ". ") if reason else "The complete test suite failed. ")
+            + "Coverage and CRAP ran diagnostically: "
+            + f"{metrics_gate.summary} These measurements cannot be certified until the baseline tests pass.",
             details,
             [baseline, *metrics_gate.command_results],
             [
                 ("Repair tests", generic_adapter_prompt("test", baseline)),
                 *metrics_gate.prompts,
             ],
+            blocked=reason is not None,
         )
     metrics_gate.key = "quality"
     metrics_gate.title = title
@@ -2593,7 +3306,9 @@ def run_flaky_test_gate(
     )
     results = [baseline]
     for _ in range(runs - 1):
-        results.append(run_command(test_command, root, timeout))
+        results.append(
+            run_command(test_command, root, timeout, project_execution_env())
+        )
     exit_codes = {result.returncode for result in results}
     if exit_codes == {0}:
         return GateResult(
@@ -2739,7 +3454,10 @@ def run_slow_test_gate(
     command_results: list[CommandResult] = []
     if command:
         command_result = run_command(
-            command, root, int(section.get("timeout_seconds", 600))
+            command,
+            root,
+            int(section.get("timeout_seconds", 600)),
+            project_execution_env(),
         )
         command_results.append(command_result)
         if command_result.returncode != 0:
@@ -2846,7 +3564,7 @@ def extension_scenario(
     command = command_list(row.get("command"))
     if not command:
         return ExtensionScenario(name, False, 0.0, "missing command"), None
-    result = run_command(command, root, timeout)
+    result = run_command(command, root, timeout, project_execution_env())
     return (
         ExtensionScenario(
             name,
@@ -3237,6 +3955,7 @@ def infer_coverage_commands(
             [
                 [
                     executable(root, "npx") or "npx",
+                    "--no-install",
                     "jest",
                     "--coverage",
                     "--coverageReporters=lcov",
@@ -3250,6 +3969,7 @@ def infer_coverage_commands(
             [
                 [
                     executable(root, "npx") or "npx",
+                    "--no-install",
                     "vitest",
                     "run",
                     "--coverage",
@@ -3267,6 +3987,8 @@ def infer_coverage_commands(
                 [
                     cargo_llvm_cov,
                     "--all",
+                    "--locked",
+                    "--offline",
                     "--lcov",
                     "--output-path",
                     str(report_path),
@@ -3302,7 +4024,7 @@ def load_normalized_metrics(
     root: Path,
     coverage_limit: float = 100.0,
     complexity_limit: float = 6.0,
-    craap_limit: float = 6.0,
+    crap_limit: float = 6.0,
     branch_coverage_limit: float = 100.0,
     branch_coverage_required: bool = False,
 ) -> list[FunctionMetric]:
@@ -3346,7 +4068,7 @@ def load_normalized_metrics(
             for item in row.get("error_paths", [])
             if isinstance(item, dict)
         ]
-        score = craap_score(complexity, coverage)
+        score = crap_score(complexity, coverage)
         functions.append(
             FunctionMetric(
                 path=relative,
@@ -3357,11 +4079,11 @@ def load_normalized_metrics(
                 covered_lines=covered,
                 total_lines=total,
                 coverage_percent=coverage,
-                craap_score=score,
+                crap_score=score,
                 parser=str(row.get("parser", "adapter")),
                 coverage_limit=coverage_limit,
                 complexity_limit=complexity_limit,
-                craap_limit=craap_limit,
+                crap_limit=crap_limit,
                 covered_branches=branch_covered,
                 total_branches=branch_total,
                 branch_coverage_percent=branch_percent,
@@ -3583,13 +4305,13 @@ def _match_report_suffix(filename: str, root: Path) -> str:
     return min(matching, key=len) if matching else normalized
 
 
-def craap_score(complexity: int, coverage_percent: float) -> float:
-    """The standard CRAP formula, named CRAAP here to match the requested gate."""
+def crap_score(complexity: int, coverage_percent: float) -> float:
+    """Change Risk Anti-Patterns: complexity weighted by missing coverage."""
     uncovered = max(0.0, min(1.0, 1.0 - coverage_percent / 100.0))
     return complexity**2 * uncovered**3 + complexity
 
 
-def format_craap(score: float) -> str:
+def format_crap(score: float) -> str:
     """Show enough precision to explain a strict threshold comparison."""
     return f"{score:.9g}"
 
@@ -4090,7 +4812,7 @@ def build_function_metrics(
     coverage: CoverageData | dict[str, dict[int, int]],
     coverage_limit: float = 100.0,
     complexity_limit: float = 6.0,
-    craap_limit: float = 6.0,
+    crap_limit: float = 6.0,
     external_functions: dict[str, list[tuple[str, int, int, int, str]]] | None = None,
     branch_coverage_limit: float = 100.0,
     branch_coverage_required: bool = False,
@@ -4175,11 +4897,11 @@ def build_function_metrics(
                     covered_lines=covered,
                     total_lines=total,
                     coverage_percent=percent,
-                    craap_score=craap_score(complexity, percent),
+                    crap_score=crap_score(complexity, percent),
                     parser=parser,
                     coverage_limit=coverage_limit,
                     complexity_limit=complexity_limit,
-                    craap_limit=craap_limit,
+                    crap_limit=crap_limit,
                     coverage_measured=coverage_measured,
                     covered_branches=covered_branches,
                     total_branches=total_branches,
@@ -4287,16 +5009,16 @@ def cleaner_prompt(function: FunctionMetric) -> str:
         if function.branch_coverage_measured
         else "not measured"
     )
-    return f"""You are the cleaner agent. Fix the CRAAP gate failure in {function.path}:{function.start_line} for `{function.name}`.
+    return f"""You are the cleaner agent. Fix the CRAP gate failure in {function.path}:{function.start_line} for `{function.name}`.
 
 Current evidence:
 - line coverage: {function.coverage_percent:.2f}% ({function.covered_lines}/{function.total_lines})
 - branch coverage: {branch_line}
 - cyclomatic complexity: {function.complexity}
-- CRAAP score: {format_craap(function.craap_score)}
-- required: {function.coverage_limit:g}% line coverage, {function.branch_coverage_limit:g}% branch coverage, complexity <= {function.complexity_limit:g}, and CRAAP <= {function.craap_limit:g}
+- CRAP score: {format_crap(function.crap_score)}
+- required: {function.coverage_limit:g}% line coverage, {function.branch_coverage_limit:g}% branch coverage, complexity <= {function.complexity_limit:g}, and CRAP <= {function.crap_limit:g}
 
-Read the function, its callers, and neighboring tests. Add behavior-focused tests for every uncovered path, then simplify control flow without changing behavior until complexity and CRAAP satisfy the threshold. Preserve error paths and public contracts. Run the repository's real coverage command and report the exact before/after metrics; do not exclude lines, weaken assertions, or mock the function under test."""
+Read the function, its callers, and neighboring tests. Add behavior-focused tests for every uncovered path, then simplify control flow without changing behavior until complexity and CRAP satisfy the threshold. Preserve error paths and public contracts. Run the repository's real coverage command and report the exact before/after metrics; do not exclude lines, weaken assertions, or mock the function under test."""
 
 
 def report_fingerprint(path: Path) -> tuple[int, int, int] | None:
@@ -4323,8 +5045,8 @@ def failed_metrics_command_gate(
     repair_kind: str,
 ) -> GateResult:
     return GateResult(
-        "craap",
-        "CRAAP: coverage + complexity",
+        "crap",
+        "CRAP: coverage + complexity",
         False,
         summary,
         [result.stdout for result in failures if result.stdout],
@@ -4378,7 +5100,7 @@ def run_metrics_gate(
     branch_coverage_limit = float(metrics.get("branch_coverage_limit", 100))
     branch_coverage_required = bool(metrics.get("branch_coverage_required", True))
     complexity_limit = float(metrics.get("complexity_limit", 6))
-    craap_limit = float(metrics.get("craap_limit", metrics.get("complexity_limit", 6)))
+    crap_limit = float(metrics.get("crap_limit", metrics.get("complexity_limit", 6)))
     command_results: list[CommandResult] = []
     substitutions = {"root": str(root), "report": str(workspace / "metrics.json")}
     adapter_command = command_list(metrics.get("command"), substitutions)
@@ -4396,7 +5118,7 @@ def run_metrics_gate(
                 adapter_command,
                 root,
                 int(metrics.get("timeout_seconds", 600)),
-                tools.python_env,
+                project_execution_env(tools.python_env),
             )
         )
         if command_results[-1].returncode != 0:
@@ -4419,7 +5141,7 @@ def run_metrics_gate(
                     root,
                     coverage_limit,
                     complexity_limit,
-                    craap_limit,
+                    crap_limit,
                     branch_coverage_limit,
                     branch_coverage_required,
                 )
@@ -4443,8 +5165,8 @@ def run_metrics_gate(
                 json.JSONDecodeError,
             ) as error:
                 return GateResult(
-                    "craap",
-                    "CRAAP: coverage + complexity",
+                    "crap",
+                    "CRAP: coverage + complexity",
                     False,
                     f"The normalized metrics report is invalid: {error}",
                     [],
@@ -4452,8 +5174,8 @@ def run_metrics_gate(
                     [("Fix metrics report", normalized_metrics_prompt(str(error)))],
                 ), []
         return GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             False,
             f"Metrics report not found: {metrics_path}",
             [],
@@ -4493,7 +5215,7 @@ def run_metrics_gate(
                 command,
                 root,
                 int(metrics.get("timeout_seconds", 600)),
-                tools.python_env,
+                project_execution_env(tools.python_env),
             )
             command_results.append(command_result)
             if command_result.returncode != 0:
@@ -4522,7 +5244,7 @@ def run_metrics_gate(
                     command,
                     root,
                     int(metrics.get("timeout_seconds", 600)),
-                    tools.python_env,
+                    project_execution_env(tools.python_env),
                 )
                 command_results.append(command_result)
                 if command_result.returncode != 0:
@@ -4554,8 +5276,8 @@ def run_metrics_gate(
 
     if not coverage_report or not coverage_report[0].exists():
         return GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             False,
             "No coverage adapter or supported coverage report was available.",
             [
@@ -4580,8 +5302,8 @@ def run_metrics_gate(
         ET.ParseError,
     ) as error:
         return GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             False,
             f"Coverage report could not be parsed: {error}",
             [],
@@ -4599,7 +5321,7 @@ def run_metrics_gate(
         coverage,
         coverage_limit,
         complexity_limit,
-        craap_limit,
+        crap_limit,
         lizard_functions,
         branch_coverage_limit,
         branch_coverage_required,
@@ -4639,7 +5361,7 @@ def static_function_metrics(
                     covered_lines=0,
                     total_lines=0,
                     coverage_percent=0.0,
-                    craap_score=float(complexity),
+                    crap_score=float(complexity),
                     parser=parser,
                     complexity_limit=complexity_limit,
                     coverage_measured=False,
@@ -4711,8 +5433,8 @@ def finish_metrics_gate(
 ) -> GateResult:
     if not functions:
         return GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             False,
             "No function-level metrics were produced.",
             [
@@ -4729,11 +5451,11 @@ def finish_metrics_gate(
     coverage_limit = functions[0].coverage_limit
     branch_coverage_limit = functions[0].branch_coverage_limit
     complexity_limit = functions[0].complexity_limit
-    craap_limit = functions[0].craap_limit
+    crap_limit = functions[0].crap_limit
     failures = sorted(
         (function for function in functions if not function.passed),
         key=lambda function: (
-            -function.craap_score,
+            -function.crap_score,
             function.coverage_percent,
             function.path,
             function.start_line,
@@ -4746,7 +5468,7 @@ def finish_metrics_gate(
             if function.branch_coverage_measured
             else "branch coverage not measured, "
         )
-        + f"complexity {function.complexity}, CRAAP {format_craap(function.craap_score)}"
+        + f"complexity {function.complexity}, CRAP {format_crap(function.crap_score)}"
         for function in failures[:100]
     ]
     prompts = [
@@ -4771,8 +5493,8 @@ def finish_metrics_gate(
             ),
         )
         return GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             False,
             f"Semantic adapter required for {len(heuristic_files)} files; {len(failures)} measured functions also fail thresholds.",
             details,
@@ -4781,19 +5503,19 @@ def finish_metrics_gate(
         )
     if failures:
         return GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             False,
-            f"{len(failures)} of {len(functions)} functions fail {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, or CRAAP <= {craap_limit:g}.",
+            f"{len(failures)} of {len(functions)} functions fail {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, or CRAP <= {crap_limit:g}.",
             details,
             commands,
             prompts,
         )
     return GateResult(
-        "craap",
-        "CRAAP: coverage + complexity",
+        "crap",
+        "CRAP: coverage + complexity",
         True,
-        f"All {len(functions)} functions have {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.",
+        f"All {len(functions)} functions have {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, and CRAP <= {crap_limit:g}.",
         [],
         commands,
     )
@@ -4822,7 +5544,7 @@ def normalized_metrics_prompt(reason: str) -> str:
 Configure `metrics.command` to run the language's real coverage and cyclomatic-complexity tools and `metrics.report` to point to normalized JSON with this shape:
 {{"functions":[{{"path":"src/file.ext","name":"functionName","start_line":1,"end_line":10,"complexity":2,"covered_lines":5,"total_lines":5,"coverage_percent":100,"covered_branches":2,"total_branches":2,"branch_coverage_percent":100,"branch_coverage_measured":true,"error_paths":[]}}]}}
 
-Include every production function. Use executable-line and branch-outcome coverage, not file averages. The gate requires exactly 100% line and branch coverage and computes CRAAP as complexity^2 * (1 - coverage/100)^3 + complexity, with a maximum of 6. Do not invent measurements or omit failing functions."""
+Include every production function. Use executable-line and branch-outcome coverage, not file averages. The gate requires exactly 100% line and branch coverage and computes CRAP as complexity^2 * (1 - coverage/100)^3 + complexity, with a maximum of 6. Do not invent measurements or omit failing functions."""
 
 
 def operator_offsets(
@@ -5393,7 +6115,7 @@ def run_stryker_mutation_gate(
             [*command, "run", str(config_path)],
             worker_root,
             timeout,
-            {"QUALITY_GATE_MUTATION_WORKER": "1"},
+            project_execution_env({"QUALITY_GATE_MUTATION_WORKER": "1"}),
         )
         if not report_path.exists():
             return GateResult(
@@ -5586,14 +6308,16 @@ def execute_mutation_candidate(
                 test_command,
                 execution_root,
                 timeout,
-                {
-                    "PYTHONPYCACHEPREFIX": mutation_temp,
-                    "TMPDIR": mutation_temp,
-                    "TMP": mutation_temp,
-                    "TEMP": mutation_temp,
-                    "QUALITY_GATE_MUTATION_WORKER": str(worker_number),
-                    "QUALITY_GATE_MUTANT_ID": mutant_id,
-                },
+                project_execution_env(
+                    {
+                        "PYTHONPYCACHEPREFIX": mutation_temp,
+                        "TMPDIR": mutation_temp,
+                        "TMP": mutation_temp,
+                        "TEMP": mutation_temp,
+                        "QUALITY_GATE_MUTATION_WORKER": str(worker_number),
+                        "QUALITY_GATE_MUTANT_ID": mutant_id,
+                    }
+                ),
             )
     except OSError as error:
         mutation_error = str(error)
@@ -5783,7 +6507,7 @@ def run_mutation_gate(
     baseline = (
         test_baseline
         if test_baseline and test_baseline.command == test_command
-        else run_command(test_command, root, timeout)
+        else run_command(test_command, root, timeout, project_execution_env())
     )
     if baseline.returncode != 0:
         return GateResult(
@@ -6052,7 +6776,12 @@ def run_dependency_gate(
         substitutions,
     )
     if command:
-        result = run_command(command, root, int(dependency.get("timeout_seconds", 300)))
+        result = run_command(
+            command,
+            root,
+            int(dependency.get("timeout_seconds", 300)),
+            project_execution_env(),
+        )
         command_results.append(result)
         if result.returncode != 0:
             return GateResult(
@@ -6234,6 +6963,296 @@ def run_dependency_gate(
     ), []
 
 
+def parse_git_history(
+    output: str, selected_paths: set[str]
+) -> tuple[HistoryInput, ...]:
+    current_commit = ""
+    commits: dict[str, set[str]] = {path: set() for path in selected_paths}
+    additions = {path: 0 for path in selected_paths}
+    deletions = {path: 0 for path in selected_paths}
+    for line in output.splitlines():
+        if line.startswith("commit:"):
+            current_commit = line.removeprefix("commit:").strip()
+            continue
+        columns = line.split("\t", 2)
+        if len(columns) != 3 or columns[2] not in selected_paths:
+            continue
+        added, deleted, path = columns
+        if not (added.isdigit() and deleted.isdigit()):
+            continue
+        additions[path] += int(added)
+        deletions[path] += int(deleted)
+        if current_commit:
+            commits[path].add(current_commit)
+    return tuple(
+        HistoryInput(path, len(commits[path]), additions[path], deletions[path])
+        for path in sorted(selected_paths)
+        if commits[path]
+    )
+
+
+def read_git_history(root: Path, selected_paths: set[str]) -> tuple[HistoryInput, ...]:
+    git = shutil.which("git")
+    if not git or not (root / ".git").exists() or not selected_paths:
+        return ()
+    result = run_command(
+        [git, "log", "--format=commit:%H", "--numstat", "--no-renames", "--", "."],
+        root,
+        30,
+    )
+    if result.returncode != 0:
+        return ()
+    return parse_git_history(result.stdout, selected_paths)
+
+
+def resolved_source_dependencies(
+    root: Path, source_files: Sequence[Path]
+) -> tuple[ResolvedDependency, ...]:
+    result: set[ResolvedDependency] = set()
+    for source in source_files:
+        source_name = normalize_path(source, root)
+        for specifier, _line in import_specs(source):
+            target = resolve_import(source, specifier, root, source_files)
+            if target:
+                result.add(ResolvedDependency(source_name, target))
+    return tuple(sorted(result, key=lambda item: (item.source, item.target)))
+
+
+def run_portable_source_gates(
+    root: Path,
+    source_files: Sequence[Path],
+    section: dict[str, Any],
+    *,
+    include_history: bool = True,
+) -> tuple[list[GateResult], PortableAnalysisReport]:
+    sources = {
+        normalize_path(path, root): path.read_text(encoding="utf-8", errors="replace")
+        for path in source_files
+    }
+    languages = {
+        path: EXTENSION_LANGUAGES.get(Path(path).suffix.lower(), "unknown")
+        for path in sources
+    }
+    history = read_git_history(root, set(sources)) if include_history else ()
+    report = analyze_portable_sources(
+        sources,
+        languages,
+        resolved_source_dependencies(root, source_files),
+        history,
+    )
+
+    cognitive_limit = int(section.get("max_cognitive_complexity", 15))
+    nesting_limit = int(section.get("max_nesting_depth", 4))
+    unsupported = [item for item in report.complexity if item.status == "unsupported"]
+    parse_errors = [item for item in report.complexity if item.status == "parse_error"]
+    cognitive_failures = [
+        function
+        for item in report.complexity
+        for function in item.functions
+        if function.cognitive_complexity > cognitive_limit
+        or function.max_nesting > nesting_limit
+    ]
+    cognitive_details = [
+        f"{item.path}: {item.message}" for item in [*parse_errors, *unsupported]
+    ]
+    cognitive_details.extend(
+        f"{item.path}:{item.line} {item.name}: cognitive {item.cognitive_complexity}/{cognitive_limit}, nesting {item.max_nesting}/{nesting_limit}"
+        for item in cognitive_failures
+    )
+    supported_functions = sum(
+        len(item.functions) for item in report.complexity if item.status == "supported"
+    )
+    if parse_errors:
+        cognitive_gate = GateResult(
+            "cognitive",
+            "Cognitive complexity & nesting",
+            False,
+            f"{len(parse_errors)} source files could not be parsed; complexity is incomplete.",
+            cognitive_details,
+            blocked=True,
+        )
+    elif unsupported:
+        cognitive_gate = GateResult(
+            "cognitive",
+            "Cognitive complexity & nesting",
+            False,
+            f"Cognitive complexity is unsupported for {len(unsupported)} of {len(report.complexity)} source files; {supported_functions} functions were measured precisely.",
+            cognitive_details,
+            unsupported=True,
+        )
+    else:
+        cognitive_gate = GateResult(
+            "cognitive",
+            "Cognitive complexity & nesting",
+            not cognitive_failures,
+            f"Measured {supported_functions} functions with limits cognitive ≤ {cognitive_limit} and nesting ≤ {nesting_limit}.",
+            cognitive_details,
+        )
+
+    duplication_limit = float(section.get("max_duplication_percent", 5))
+    duplication = report.duplication
+    duplicate_details = [
+        f"{pair.first.path}:{pair.first.start_line}-{pair.first.end_line} duplicates {pair.second.path}:{pair.second.start_line}-{pair.second.end_line} ({pair.line_count} lines)"
+        for pair in duplication.pairs
+    ]
+    duplication_gate = GateResult(
+        "duplication",
+        "Source duplication",
+        duplication.percentage <= duplication_limit,
+        f"{duplication.duplicated_lines} of {duplication.total_code_lines} code lines are duplicated ({duplication.percentage:.2f}%; limit {duplication_limit:g}%).",
+        duplicate_details,
+    )
+
+    cycle_limit = int(section.get("max_dependency_cycles", 0))
+    dependency_details = [
+        " -> ".join(cycle.example_path) for cycle in report.dependencies.cycles
+    ]
+    dependency_gate = GateResult(
+        "dependency_health",
+        "Dependency cycles & coupling",
+        len(report.dependencies.cycles) <= cycle_limit,
+        f"{len(report.dependencies.cycles)} dependency cycles across {len(report.dependencies.modules)} source modules and {report.dependencies.internal_edges} resolved internal edges; limit {cycle_limit}.",
+        dependency_details,
+    )
+
+    secret_limit = int(section.get("max_secret_findings", 0))
+    secret_details = [
+        f"{item.path}:{item.line}:{item.column} {item.kind}" for item in report.secrets
+    ]
+    secrets_gate = GateResult(
+        "secrets",
+        "High-confidence secrets",
+        len(report.secrets) <= secret_limit,
+        f"{len(report.secrets)} high-confidence secret findings; limit {secret_limit}. Secret values are never retained in the report.",
+        secret_details,
+    )
+
+    if report.hotspots:
+        hotspots_gate = GateResult(
+            "hotspots",
+            "Git change hotspots",
+            True,
+            f"Ranked {len(report.hotspots)} files using commit frequency and measured cognitive complexity.",
+            [
+                f"{item.path}: commits={item.commit_count}, churn={item.churn}, score={item.score if item.score is not None else 'complexity unsupported'}"
+                for item in report.hotspots[:20]
+            ],
+        )
+    else:
+        hotspots_gate = GateResult(
+            "hotspots",
+            "Git change hotspots",
+            True,
+            "Not applicable: no Git history was available for the selected source files.",
+            applicable=False,
+        )
+    return (
+        [
+            cognitive_gate,
+            duplication_gate,
+            dependency_gate,
+            secrets_gate,
+            hotspots_gate,
+        ],
+        report,
+    )
+
+
+def run_vulnerability_gate(
+    root: Path, section: dict[str, Any]
+) -> tuple[GateResult, DependencyInventory | None, tuple[VulnerabilityFinding, ...]]:
+    try:
+        inventory = discover_locked_packages(root)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return (
+            GateResult(
+                "vulnerabilities",
+                "Known dependency vulnerabilities",
+                False,
+                f"A detected dependency file could not be parsed: {error}",
+                blocked=True,
+            ),
+            None,
+            (),
+        )
+    if not inventory.lockfiles and not inventory.unsupported:
+        return (
+            GateResult(
+                "vulnerabilities",
+                "Known dependency vulnerabilities",
+                True,
+                "Not applicable: no dependency lockfile or pinned requirement file was detected.",
+                applicable=False,
+            ),
+            inventory,
+            (),
+        )
+    if not inventory.packages and inventory.unsupported:
+        return (
+            GateResult(
+                "vulnerabilities",
+                "Known dependency vulnerabilities",
+                False,
+                "Detected dependency files use formats the built-in OSV inventory parser does not support.",
+                list(inventory.unsupported),
+                unsupported=True,
+            ),
+            inventory,
+            (),
+        )
+    try:
+        findings = query_osv(inventory.packages)
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        TimeoutError,
+    ) as error:
+        return (
+            GateResult(
+                "vulnerabilities",
+                "Known dependency vulnerabilities",
+                False,
+                f"OSV could not verify {len(inventory.packages)} locked package versions: {error}",
+                ["No project dependencies were installed or restored."],
+                blocked=True,
+            ),
+            inventory,
+            (),
+        )
+    details = [
+        f"{item.vulnerability_id}: {item.package.ecosystem}/{item.package.name}@{item.package.version} ({item.package.source})"
+        for item in findings
+    ]
+    details.extend(f"Unsupported inventory: {path}" for path in inventory.unsupported)
+    if inventory.unsupported:
+        return (
+            GateResult(
+                "vulnerabilities",
+                "Known dependency vulnerabilities",
+                False,
+                f"OSV checked {len(inventory.packages)} packages, but {len(inventory.unsupported)} dependency files remain unsupported.",
+                details,
+                unsupported=True,
+            ),
+            inventory,
+            findings,
+        )
+    limit = int(section.get("max_known_vulnerabilities", 0))
+    return (
+        GateResult(
+            "vulnerabilities",
+            "Known dependency vulnerabilities",
+            len(findings) <= limit,
+            f"OSV checked {len(inventory.packages)} locked package versions from {len(inventory.lockfiles)} files and found {len(findings)} known vulnerabilities; limit {limit}.",
+            details,
+        ),
+        inventory,
+        findings,
+    )
+
+
 def dependency_spec_prompt(reason: str = "no specification exists") -> str:
     return f"""Define the repository's enforceable module dependency contract ({reason}). Create `{DEPENDENCIES_NAME}`:
 
@@ -6260,18 +7279,23 @@ def format_command(result: CommandResult) -> str:
 
 
 def without_fast_flag(command: str) -> str:
+    diagnostic_flags = {
+        "--fast",
+        "--craap",
+        *(f"--{name}" for name in SELECTABLE_CHECKS),
+    }
     try:
         parts = shlex.split(command)
     except ValueError:
         return command.replace(" --fast", "")
-    return shlex.join([part for part in parts if part != "--fast"])
+    return shlex.join([part for part in parts if part not in diagnostic_flags])
 
 
 def master_fix_prompt(report: AnalysisReport) -> str:
     failing_functions = sorted(
         (function for function in report.functions if not function.passed),
         key=lambda function: (
-            -function.craap_score,
+            -function.crap_score,
             function.coverage_percent,
             function.path,
             function.start_line,
@@ -6298,7 +7322,7 @@ def master_fix_prompt(report: AnalysisReport) -> str:
     )
     function_summary = (
         "\n".join(
-            f"- {function.path}:{function.start_line} `{function.name}` — coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAAP {format_craap(function.craap_score)}"
+            f"- {function.path}:{function.start_line} `{function.name}` — coverage {function.coverage_percent:.2f}%, complexity {function.complexity}, CRAP {format_crap(function.crap_score)}"
             for function in failing_functions[:50]
         )
         or "- None in the current report."
@@ -6338,7 +7362,7 @@ def master_fix_prompt(report: AnalysisReport) -> str:
         thresholds, "metrics", "branch_coverage_limit"
     )
     complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
-    craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
+    crap_limit = threshold_number(thresholds, "metrics", "crap_limit")
     file_loc_limit = threshold_number(thresholds, "file_loc", "max_lines")
     if report.mode == "partial":
         flags = " ".join(f"--{name}" for name in report.selection)
@@ -6377,7 +7401,7 @@ Non-negotiable finish conditions:
 1. Every applicable formatter and linter command passes with zero violations.
 2. Every applicable static type checker passes with zero errors.
 3. Every detected or configured contract/schema check passes.
-4. The complete test suite passes; every production function has {coverage_limit:g}% executable-line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, and CRAAP <= {craap_limit:g}.
+4. The complete test suite passes; every production function has {coverage_limit:g}% executable-line coverage, {branch_coverage_limit:g}% branch coverage, complexity <= {complexity_limit:g}, and CRAP <= {crap_limit:g}.
 5. Every production file has at most {file_loc_limit:g} physical lines.
 6. Every applicable dead-code detector reports zero findings.
 7. The complete test suite passes consistently across every configured flaky-test run{off_note(report, "flaky")}.
@@ -6390,7 +7414,7 @@ Non-negotiable finish conditions:
 Current gate status:
 {gate_summary}
 
-Highest-priority CRAAP failures ({len(failing_functions)} total; first 50 shown):
+Highest-priority CRAP failures ({len(failing_functions)} total; first 50 shown):
 {function_summary}
 
 Oversized production files ({len(oversized_files)} total; first 50 shown):
@@ -6411,7 +7435,7 @@ Automatic installation failures:
 Repair rules:
 - Read neighboring production code and tests before editing.
 - For uncovered behavior or a surviving mutant, add a behavior-focused test through the production API and prove it fails against the unfixed or mutated code.
-- Simplify control flow without changing behavior until each function meets the CRAAP limit. Preserve public contracts and error paths.
+- Simplify control flow without changing behavior until each function meets the CRAP limit. Preserve public contracts and error paths.
 - Split oversized files along cohesive responsibilities without changing public behavior or hiding code through formatting tricks.
 - Fix formatter, lint, type, contract, and dead-code findings in production code; do not hide them with ignore comments, generated baselines, exclusions, or weakened configuration.
 - Eliminate test nondeterminism at its source. Do not use retries or quarantine to conceal flaky behavior.
@@ -6429,6 +7453,12 @@ def off_note(report: AnalysisReport, key: str) -> str:
 
 
 def gate_outcome(gate: GateResult) -> str:
+    if getattr(gate, "blocked", False):
+        return "BLOCKED"
+    if getattr(gate, "unsupported", False):
+        return "UNSUPPORTED"
+    if getattr(gate, "needs_context", False):
+        return "NEEDS CONTEXT"
     if gate.deferred:
         return "DEFERRED"
     if getattr(gate, "skipped", False):
@@ -6458,7 +7488,7 @@ def function_measurement(function: Any) -> dict[str, Any]:
             getattr(function, "branch_coverage_measured", False)
         ),
         "complexity": function.complexity,
-        "craap_score": round(function.craap_score, 8),
+        "crap_score": round(function.crap_score, 8),
         "passed": function.passed,
     }
 
@@ -6498,8 +7528,10 @@ def dependency_failure(violation: Any) -> dict[str, Any]:
 def state_status(analysis: Any, error: str | None) -> str:
     if error:
         return "error"
-    if analysis.passed or partial_run_passed(analysis):
+    if analysis.passed:
         return "pass"
+    if partial_run_passed(analysis):
+        return "selected_pass"
     return "ready_for_full" if analysis.ready_for_full else "fail"
 
 
@@ -6520,6 +7552,12 @@ def command_state(command: Any) -> dict[str, Any]:
 
 
 def gate_status(result: Any) -> str:
+    if getattr(result, "blocked", False):
+        return "blocked"
+    if getattr(result, "unsupported", False):
+        return "unsupported"
+    if getattr(result, "needs_context", False):
+        return "needs_context"
     if result.deferred:
         return "deferred"
     if getattr(result, "skipped", False):
@@ -6604,6 +7642,8 @@ def error_handling_measurement(analysis: Any) -> dict[str, Any]:
 
 
 def metrics_state(analysis: Any, quality_gate: Any) -> dict[str, Any]:
+    test_execution = getattr(analysis, "test_execution", TestExecution())
+    portable = getattr(analysis, "portable_analysis", None)
     return {
         "certified": bool(analysis.functions and quality_gate and quality_gate.passed),
         "functions": [function_measurement(item) for item in analysis.functions],
@@ -6633,6 +7673,38 @@ def metrics_state(analysis: Any, quality_gate: Any) -> dict[str, Any]:
             }
             for item in getattr(analysis, "test_integrity_violations", [])
         ],
+        "test_execution": dataclasses.asdict(test_execution),
+        "portable_analysis": (
+            {
+                "complexity": [
+                    {
+                        "path": source.path,
+                        "language": source.language,
+                        "status": source.status,
+                        "message": source.message,
+                        "functions": [
+                            dataclasses.asdict(item) for item in source.functions
+                        ],
+                    }
+                    for source in portable.complexity
+                ],
+                "duplication": dataclasses.asdict(portable.duplication),
+                "dependencies": dataclasses.asdict(portable.dependencies),
+                "secrets": [dataclasses.asdict(item) for item in portable.secrets],
+                "hotspots": [dataclasses.asdict(item) for item in portable.hotspots],
+                "vulnerability_inventory": (
+                    dataclasses.asdict(analysis.dependency_inventory)
+                    if getattr(analysis, "dependency_inventory", None) is not None
+                    else None
+                ),
+                "known_vulnerabilities": [
+                    dataclasses.asdict(item)
+                    for item in getattr(analysis, "vulnerabilities", ())
+                ],
+            }
+            if portable is not None
+            else None
+        ),
     }
 
 
@@ -6651,6 +7723,9 @@ def count_state(
         "checks_off": outcomes.count("off"),
         "checks_applicable": outcomes.count("pass") + outcomes.count("fail"),
         "checks_passing": outcomes.count("pass"),
+        "checks_blocked": outcomes.count("blocked"),
+        "checks_unsupported": outcomes.count("unsupported"),
+        "checks_needing_context": outcomes.count("needs_context"),
         "functions_total": len(analysis.functions),
         "functions_failing": len(failing_functions),
         "slow_tests_measured": len(getattr(analysis, "test_timings", [])),
@@ -6666,6 +7741,30 @@ def count_state(
         "test_integrity_violations": len(
             getattr(analysis, "test_integrity_violations", [])
         ),
+        "tests_executed": getattr(
+            getattr(analysis, "test_execution", None), "executed", 0
+        ),
+        "tests_skipped": getattr(
+            getattr(analysis, "test_execution", None), "skipped", 0
+        ),
+        "duplicate_lines": getattr(
+            getattr(getattr(analysis, "portable_analysis", None), "duplication", None),
+            "duplicated_lines",
+            0,
+        ),
+        "dependency_cycles": len(
+            getattr(
+                getattr(
+                    getattr(analysis, "portable_analysis", None), "dependencies", None
+                ),
+                "cycles",
+                (),
+            )
+        ),
+        "secret_findings": len(
+            getattr(getattr(analysis, "portable_analysis", None), "secrets", ())
+        ),
+        "known_vulnerabilities": len(getattr(analysis, "vulnerabilities", ())),
         "files_total": len(analysis.files),
         "files_failing_loc": sum(not item.passed for item in analysis.files),
         "mutants_total": len(analysis.mutations),
@@ -6735,7 +7834,7 @@ def failure_state(
 def failing_function_items(analysis: Any) -> list[Any]:
     return sorted(
         (item for item in analysis.functions if not item.passed),
-        key=lambda item: (-item.craap_score, item.coverage_percent, item.path),
+        key=lambda item: (-item.crap_score, item.coverage_percent, item.path),
     )
 
 
@@ -6791,6 +7890,11 @@ def analysis_state(
         },
         "selection": list(getattr(analysis, "selection", ())),
         "focus": getattr(analysis, "focus", None),
+        "project_profile": getattr(analysis, "project_profile", {}),
+        "quality_dimensions": dimension_dicts(
+            getattr(analysis, "quality_dimensions", ())
+        ),
+        "certifications": getattr(analysis, "certifications", {}),
         "metrics": metrics_state(analysis, quality_gate),
         "thresholds": analysis.thresholds,
         "gates": [gate_state(result) for result in analysis.gates],
@@ -6824,11 +7928,8 @@ def gate_card_html(
     metric_details: str = "",
 ) -> str:
     step, question, kicker, explanation = presentation
-    state = (
-        "deferred"
-        if gate.deferred
-        else ("na" if not gate.applicable else ("pass" if gate.passed else "fail"))
-    )
+    outcome = gate_status(gate)
+    state = "na" if outcome in {"not_applicable", "skipped", "off"} else outcome
     return f"""<details class="check-row {state}">
       <summary><span class="check-title"><span class="step">{html.escape(step)}</span>
       <span><strong>{html.escape(kicker)}</strong><small>{html.escape(question)}</small></span></span>
@@ -6853,6 +7954,245 @@ Current state: {gate.summary}
 Guidance: {guidance}
 
 Inspect the repository's languages, package managers, existing scripts, and CI before choosing a tool. Install the smallest maintained dependency that fits the existing toolchain, configure a deterministic non-interactive check command, and add it to `{CONFIG_NAME}`. Do not disable another gate, weaken thresholds, add broad ignores, or replace the check with a no-op. Run the new check directly, then rerun the repository quality gate and report the exact command and result."""
+
+
+def quality_status_label(status: str) -> str:
+    return status.replace("_", " ").upper()
+
+
+def connected_metric_count(dimensions: Sequence[Any]) -> tuple[int, int]:
+    metrics = [metric for dimension in dimensions for metric in dimension.metrics]
+    connected = sum(item.status in {"measured", "confirmed"} for item in metrics)
+    return connected, len(metrics)
+
+
+def certification_dimensions(
+    key: str, state: dict[str, Any], dimensions: Sequence[Any]
+) -> list[Any]:
+    if key == "full_profile":
+        return [item for item in dimensions if item.status != "not_applicable"]
+    keys = set(state.get("dimensions", []))
+    return [item for item in dimensions if item.key in keys]
+
+
+def certification_text(
+    key: str, status: str, selected: Sequence[Any], report: AnalysisReport
+) -> tuple[str, str]:
+    if key == "repository":
+        applicable = [
+            item for item in report.gates if item.applicable and not item.deferred
+        ]
+        passed = sum(item.passed for item in applicable)
+        if report.mode != "full":
+            return (
+                "FULL RUN REQUIRED",
+                f"{passed}/{len(applicable)} selected checks passed",
+            )
+        label = "SHIP GATE PASS" if status == "certified" else "NEEDS WORK"
+        return label, f"{passed}/{len(applicable)} applicable checks passed"
+    if status == "not_applicable":
+        return "NOT APPLICABLE", "No applicable dimensions"
+    connected, total = connected_metric_count(selected)
+    if key == "full_profile" and report.mode != "full":
+        return "FULL RUN REQUIRED", f"{connected}/{total} metric sources connected"
+    if status != "certified":
+        return quality_status_label(
+            status
+        ), f"{connected}/{total} metric sources connected"
+    if not connected:
+        return "NO REQUIRED EVIDENCE", f"0/{total} optional metric sources connected"
+    label = "CORE PROFILE COMPLETE" if key == "full_profile" else "CORE EVIDENCE READY"
+    return label, f"{connected}/{total} metric sources connected"
+
+
+CONNECTED_METRIC_STATUSES = frozenset({"measured", "confirmed"})
+CONFIGURE_METRICS = frozenset(
+    "acceptance_pass_rate contract_pass_rate interaction_success compatibility_matrix recovery_success flaky_test_rate accessibility_violations cross_platform_ui sast_dast_findings lockfile_coverage license_issues sbom_provenance ci_pinning iac_validation misconfiguration_findings container_findings migration_pass_rate rollback_pass_rate backup_restore schema_compatibility health_checks alert_tests mutation_score static_smells".split()
+)
+ADD_EVIDENCE_METRICS = frozenset(
+    "ownership_coverage public_api_docs policy_files runbook_coverage".split()
+)
+
+
+def priority_evidence_html(priority: str, metrics: Sequence[Any]) -> str:
+    selected = [
+        item for item in metrics if getattr(item, "priority", "recommended") == priority
+    ]
+    connected = sum(item.status in CONNECTED_METRIC_STATUSES for item in selected)
+    unavailable = sum(item.status == "unsupported" for item in selected)
+    setup = len(selected) - connected - unavailable
+    if priority == "required":
+        detail = f"{connected}/{len(selected)} complete"
+        if setup:
+            detail += f" · {setup} need setup"
+        if unavailable:
+            detail += f" · {unavailable} unavailable"
+    elif priority == "recommended":
+        detail = (
+            f"{connected} connected · {setup} need setup · {unavailable} unavailable"
+        )
+    else:
+        detail = (
+            f"{connected} connected · {setup} available · {unavailable} unavailable"
+        )
+    return (
+        f'<div class="evidence-item {html.escape(priority)}">'
+        f"<span>{html.escape(priority.title())}</span><strong>{detail}</strong></div>"
+    )
+
+
+def evidence_summary_html(dimensions: Sequence[Any]) -> str:
+    metrics = [
+        metric
+        for dimension in dimensions
+        if dimension.status != "not_applicable"
+        for metric in dimension.metrics
+    ]
+    required = [
+        item
+        for item in metrics
+        if getattr(item, "priority", "recommended") == "required"
+    ]
+    missing = sum(item.status not in CONNECTED_METRIC_STATUSES for item in required)
+    state = "action" if missing else "complete"
+    guidance = (
+        f"{missing} required measurement{'s' if missing != 1 else ''} need setup before certification."
+        if missing
+        else "No additional setup is required to pass."
+    )
+    evidence = "".join(
+        priority_evidence_html(priority, metrics)
+        for priority in ("required", "recommended", "optional")
+    )
+    return (
+        f'<div class="evidence-summary {state}" aria-label="Project evidence status">{evidence}</div>'
+        f'<p class="evidence-guidance {state}">{html.escape(guidance)}</p>'
+    )
+
+
+def metric_value_html(value: Any) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, (list, tuple)):
+        values = "".join(
+            f'<span class="value-item">{html.escape(str(item))}</span>'
+            for item in value
+        )
+        return f'<span class="value-list">{values}</span>'
+    if isinstance(value, dict):
+        return f"<code>{html.escape(json.dumps(value, sort_keys=True))}</code>"
+    return html.escape(str(value))
+
+
+def metric_setup_action(metric: Any) -> str:
+    if not metric.action:
+        return "—"
+    if metric.status == "unsupported":
+        return "No compatible metric adapter is available."
+    label = metric.label.lower()
+    if metric.key in ADD_EVIDENCE_METRICS:
+        return f"Add or connect {label} evidence."
+    if metric.key in CONFIGURE_METRICS:
+        return f"Configure {label} measurement."
+    return f"Connect {label} data."
+
+
+def metric_availability_label(status: str) -> str:
+    return {
+        "measured": "CONNECTED · MEASURED",
+        "confirmed": "CONNECTED · CONFIRMED",
+        "not_configured": "NEEDS SETUP",
+        "needs_context": "NEEDS SETUP",
+        "unsupported": "UNAVAILABLE",
+        "not_applicable": "NOT APPLICABLE",
+    }.get(status, quality_status_label(status))
+
+
+def quality_metric_rows(metrics: Sequence[Any]) -> str:
+    return "".join(
+        f'<tr><td class="metric-name" data-label="Metric">{html.escape(item.label)}</td>'
+        f'<td data-label="Priority"><span class="metric-priority {html.escape(getattr(item, "priority", "recommended"))}">{html.escape(getattr(item, "priority", "recommended").upper())}</span></td>'
+        f'<td data-label="Availability"><span class="metric-state {html.escape(item.status)}">{metric_availability_label(item.status)}</span></td>'
+        f'<td class="metric-value" data-label="Value">{metric_value_html(item.value)}</td>'
+        f'<td class="metric-why" data-label="Why">{html.escape(item.why)}</td>'
+        f'<td class="metric-action" data-label="Next action">{html.escape(metric_setup_action(item))}</td></tr>'
+        for item in metrics
+    )
+
+
+def dimension_summary(dimension: Any) -> tuple[str, str]:
+    if dimension.status == "not_applicable":
+        return "NOT APPLICABLE", "No metrics apply to this project surface"
+    connected, total = connected_metric_count((dimension,))
+    if dimension.status == "needs_context":
+        return "NEEDS CONTEXT", f"{connected}/{total} metric sources connected"
+    if not connected:
+        return "NOT CONNECTED", f"0/{total} optional metric sources connected"
+    return "EVIDENCE AVAILABLE", f"{connected}/{total} metric sources connected"
+
+
+def quality_dimension_html(dimension: Any) -> str:
+    rows = quality_metric_rows(dimension.metrics)
+    state_label, detail = dimension_summary(dimension)
+    content = (
+        f'<div class="table-wrap metric-table-wrap"><table class="metric-table"><caption>{html.escape(dimension.title)} metric evidence</caption><thead><tr><th scope="col">Metric</th><th scope="col">Priority</th><th scope="col">Availability</th><th scope="col">Value</th><th scope="col">Why</th><th scope="col">Next action</th></tr></thead><tbody>{rows}</tbody></table></div>'
+        if rows
+        else "<p>No metrics apply to the detected project surface.</p>"
+    )
+    return (
+        f'<details class="dimension-row {html.escape(dimension.status)}"><summary><span>{html.escape(dimension.title)}</span>'
+        f'<span><strong>{state_label}</strong> · {html.escape(detail)}</span></summary><div class="panel">{content}</div></details>'
+    )
+
+
+def dimension_chip_html(dimension: Any) -> str:
+    state_label, detail = dimension_summary(dimension)
+    connected, total = connected_metric_count((dimension,))
+    label = {
+        "product": "Product",
+        "security": "Security",
+        "supply_chain": "Supply chain",
+        "governance": "Governance",
+        "language_semantics": "Code",
+    }.get(dimension.key, dimension.title)
+    return (
+        f'<div class="dimension-chip {html.escape(dimension.status)}" title="{html.escape(detail)}">'
+        f"<span>{html.escape(label)}</span><strong>{connected}/{total}</strong>"
+        f"<small>{html.escape(state_label)}</small></div>"
+    )
+
+
+def project_quality_panel(report: AnalysisReport) -> str:
+    dimensions = getattr(report, "quality_dimensions", ())
+    if not dimensions:
+        return ""
+    applicable = [item for item in dimensions if item.status != "not_applicable"]
+    not_applicable = [item for item in dimensions if item.status == "not_applicable"]
+    dimension_rows = "".join(quality_dimension_html(item) for item in applicable)
+    dimension_chips = "".join(dimension_chip_html(item) for item in applicable)
+    unavailable_rows = "".join(quality_dimension_html(item) for item in not_applicable)
+    unavailable = ""
+    if unavailable_rows:
+        unavailable = f'<details class="na-dimensions"><summary><span>Not applicable to this project</span><span>{len(not_applicable)} dimensions</span></summary>{unavailable_rows}</details>'
+    unavailable_chip = ""
+    if not_applicable:
+        unavailable_chip = f'<div class="dimension-chip not_applicable"><span>Other dimensions</span><strong>{len(not_applicable)}</strong><small>NOT APPLICABLE</small></div>'
+    certifications = getattr(report, "certifications", {})
+    profile = certifications.get(
+        "full_profile", {"status": "needs_context", "needs": []}
+    )
+    profile_status = str(profile.get("status", "needs_context"))
+    selected = certification_dimensions("full_profile", profile, dimensions)
+    profile_label, profile_detail = certification_text(
+        "full_profile", profile_status, selected, report
+    )
+    connected, total = connected_metric_count(applicable)
+    return f"""<div class="project-evidence" id="project-evidence">
+      <div class="project-evidence-heading"><div><h3>Project evidence</h3><p>Product, security, delivery, operations, and code signals</p></div><span class="profile-state {html.escape(profile_status)}" title="{html.escape(profile_detail)}">{html.escape(profile_label)}</span></div>
+      {evidence_summary_html(dimensions)}
+      <div class="dimension-chip-grid">{dimension_chips}{unavailable_chip}</div>
+      <details class="project-evidence-details"><summary><span>View all project metric evidence</span><span>{connected}/{total} sources connected</span></summary><div class="dimension-list">{dimension_rows}{unavailable}</div></details>
+    </div>"""
 
 
 def html_report(report: AnalysisReport) -> str:
@@ -6902,7 +8242,7 @@ def html_report(report: AnalysisReport) -> str:
         thresholds, "metrics", "branch_coverage_limit"
     )
     complexity_limit = threshold_number(thresholds, "metrics", "complexity_limit")
-    craap_limit = threshold_number(thresholds, "metrics", "craap_limit")
+    crap_limit = threshold_number(thresholds, "metrics", "crap_limit")
     max_test_seconds = threshold_number(thresholds, "slow_tests", "max_test_seconds")
     max_suite_seconds = threshold_number(thresholds, "slow_tests", "max_suite_seconds")
     extension_contract_limit = threshold_number(
@@ -6918,6 +8258,20 @@ def html_report(report: AnalysisReport) -> str:
         thresholds, "error_handling", "max_silent_handlers"
     )
     file_loc_limit = int(threshold_number(thresholds, "file_loc", "max_lines"))
+    min_executed = int(threshold_number(thresholds, "test_execution", "min_executed"))
+    max_skipped = int(threshold_number(thresholds, "test_execution", "max_skipped"))
+    cognitive_limit = int(
+        threshold_number(thresholds, "portable_analysis", "max_cognitive_complexity")
+    )
+    nesting_limit = int(
+        threshold_number(thresholds, "portable_analysis", "max_nesting_depth")
+    )
+    duplication_limit = threshold_number(
+        thresholds, "portable_analysis", "max_duplication_percent"
+    )
+    vulnerability_limit = int(
+        threshold_number(thresholds, "portable_analysis", "max_known_vulnerabilities")
+    )
     applicable_gates = sum(
         gate.applicable and not gate.deferred for gate in report.gates
     )
@@ -6949,7 +8303,49 @@ def html_report(report: AnalysisReport) -> str:
             "4",
             "Are all code paths tested?",
             "Tests + coverage + complexity",
-            f"The complete suite must pass, with {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity {complexity_limit:g} or lower, and CRAAP {craap_limit:g} or lower.",
+            f"The complete suite must pass, with {coverage_limit:g}% line coverage, {branch_coverage_limit:g}% branch coverage, complexity {complexity_limit:g} or lower, and CRAP {crap_limit:g} or lower.",
+        ),
+        "test_execution": (
+            "5",
+            "Did the test command actually execute tests?",
+            "Test execution evidence",
+            f"A supported native summary must prove at least {min_executed} test ran, with no more than {max_skipped} skipped.",
+        ),
+        "cognitive": (
+            "6",
+            "How hard is each function to reason about?",
+            "Cognitive complexity + nesting",
+            f"Precisely parsed functions must have cognitive complexity ≤ {cognitive_limit} and nesting depth ≤ {nesting_limit}; unsupported syntax stays explicit.",
+        ),
+        "duplication": (
+            "7",
+            "How much source is repeated?",
+            "Duplicate source blocks",
+            f"Exact normalized blocks of at least six code lines may cover at most {duplication_limit:g}% of production code.",
+        ),
+        "dependency_health": (
+            "8",
+            "Do imports form cycles or excessive coupling?",
+            "Dependency health",
+            "Resolved internal imports are measured for cycles and per-module fan-in and fan-out.",
+        ),
+        "secrets": (
+            "9",
+            "Were high-confidence secrets committed to source?",
+            "Secret scan",
+            "Known credential formats are reported by location and kind; credential values never enter report artifacts.",
+        ),
+        "vulnerabilities": (
+            "10",
+            "Do locked dependency versions have known vulnerabilities?",
+            "OSV vulnerability scan",
+            f"Pinned versions are queried directly against OSV without restoring dependencies; at most {vulnerability_limit} findings are allowed.",
+        ),
+        "hotspots": (
+            "11",
+            "Which frequently changed files are hardest to reason about?",
+            "Git hotspots",
+            "Commit frequency and churn are combined with measured cognitive complexity to rank review risk.",
         ),
         "slow_tests": (
             "5",
@@ -7016,19 +8412,20 @@ def html_report(report: AnalysisReport) -> str:
         report.functions,
         key=lambda function: (
             function.passed,
-            -function.craap_score,
+            -function.crap_score,
             function.path,
             function.start_line,
         ),
     )
-    shown_functions = ordered_functions[:200]
+    function_limit = 50 if any(not item.passed for item in ordered_functions) else 25
+    shown_functions = ordered_functions[:function_limit]
     function_rows = (
         "".join(
             f"""<tr class="{"ok" if function.passed else "bad"}">
           <td><code>{html.escape(function.path)}:{function.start_line}</code></td>
           <td>{html.escape(function.name)}</td><td>{function.coverage_percent:.2f}%</td>
           <td>{f"{function.branch_coverage_percent:.2f}%" if function.branch_coverage_measured else "not measured"}</td>
-          <td>{function.complexity}</td><td>{format_craap(function.craap_score)}</td>
+          <td>{function.complexity}</td><td>{format_crap(function.crap_score)}</td>
           <td>{html.escape(function.parser)}</td><td>{"PASS" if function.passed else "FAIL"}</td>
         </tr>"""
             for function in shown_functions
@@ -7036,7 +8433,7 @@ def html_report(report: AnalysisReport) -> str:
         or '<tr><td colspan="8">No function metrics produced.</td></tr>'
     )
     if len(ordered_functions) > len(shown_functions):
-        function_rows += f'<tr><td colspan="8">Showing the 200 highest-priority functions out of {len(ordered_functions)}. Fix and rerun to refresh this list.</td></tr>'
+        function_rows += f'<tr><td colspan="8">Showing the {len(shown_functions)} highest-risk functions out of {len(ordered_functions)}. The saved JSON state retains the complete measurement.</td></tr>'
     ordered_files = sorted(
         report.files, key=lambda file: (file.passed, -file.lines, file.path)
     )
@@ -7142,8 +8539,102 @@ def html_report(report: AnalysisReport) -> str:
         )
         or '<tr><td colspan="4">No anti-vacuous-mock violations found.</td></tr>'
     )
+    test_execution = report.test_execution
+    test_execution_rows = f"""<tr class="{"ok" if test_execution.measured and not test_execution.failed else "bad"}">
+        <td>{test_execution.executed}</td><td>{test_execution.passed}</td>
+        <td>{test_execution.failed}</td><td>{test_execution.skipped}</td>
+        <td>{test_execution.retried}</td><td>{html.escape(test_execution.parser)}</td>
+        <td>{"MEASURED" if test_execution.measured else "UNMEASURED"}</td></tr>"""
+    portable = report.portable_analysis
+    ordered_cognitive = sorted(
+        (
+            item
+            for source in (portable.complexity if portable else ())
+            for item in source.functions
+        ),
+        key=lambda item: (
+            item.cognitive_complexity <= cognitive_limit
+            and item.max_nesting <= nesting_limit,
+            -item.cognitive_complexity,
+            -item.max_nesting,
+            item.path,
+            item.line,
+        ),
+    )
+    cognitive_limit_rows = (
+        50
+        if any(
+            item.cognitive_complexity > cognitive_limit
+            or item.max_nesting > nesting_limit
+            for item in ordered_cognitive
+        )
+        else 25
+    )
+    shown_cognitive = ordered_cognitive[:cognitive_limit_rows]
+    cognitive_rows = (
+        "".join(
+            f"""<tr class="{"ok" if item.cognitive_complexity <= cognitive_limit and item.max_nesting <= nesting_limit else "bad"}">
+            <td><code>{html.escape(item.path)}:{item.line}</code></td><td>{html.escape(item.name)}</td>
+            <td>{item.cognitive_complexity}</td><td>{item.max_nesting}</td><td>PRECISE AST</td></tr>"""
+            for item in shown_cognitive
+        )
+        + "".join(
+            f"""<tr class="bad"><td><code>{html.escape(source.path)}</code></td><td>—</td><td>—</td><td>—</td><td>{html.escape(source.status.upper())}</td></tr>"""
+            for source in (portable.complexity if portable else ())
+            if source.status != "supported"
+        )
+        or '<tr><td colspan="5">No functions selected.</td></tr>'
+    )
+    if len(ordered_cognitive) > len(shown_cognitive):
+        cognitive_rows += f'<tr><td colspan="5">Showing the {len(shown_cognitive)} highest-risk functions out of {len(ordered_cognitive)}. The saved JSON state retains the complete measurement.</td></tr>'
+    duplicate_rows = (
+        "".join(
+            f"""<tr class="bad"><td><code>{html.escape(item.first.path)}:{item.first.start_line}-{item.first.end_line}</code></td>
+            <td><code>{html.escape(item.second.path)}:{item.second.start_line}-{item.second.end_line}</code></td><td>{item.line_count}</td></tr>"""
+            for item in (portable.duplication.pairs if portable else ())
+        )
+        or '<tr><td colspan="3">No duplicate blocks found.</td></tr>'
+    )
+    dependency_health_rows = (
+        "".join(
+            f"""<tr><td><code>{html.escape(item.module)}</code></td><td>{item.fan_in}</td><td>{item.fan_out}</td></tr>"""
+            for item in (portable.dependencies.modules if portable else ())
+        )
+        or '<tr><td colspan="3">No internal modules selected.</td></tr>'
+    )
+    secret_rows = (
+        "".join(
+            f"""<tr class="bad"><td><code>{html.escape(item.path)}:{item.line}:{item.column}</code></td><td>{html.escape(item.kind)}</td></tr>"""
+            for item in (portable.secrets if portable else ())
+        )
+        or '<tr><td colspan="2">No high-confidence secret formats found.</td></tr>'
+    )
+    vulnerability_rows = (
+        "".join(
+            f"""<tr class="bad"><td>{html.escape(item.vulnerability_id)}</td>
+            <td>{html.escape(item.package.ecosystem)}</td><td>{html.escape(item.package.name)}</td>
+            <td>{html.escape(item.package.version)}</td><td><code>{html.escape(item.package.source)}</code></td></tr>"""
+            for item in report.vulnerabilities
+        )
+        or '<tr><td colspan="5">No known vulnerabilities found in measured locked versions.</td></tr>'
+    )
+    hotspot_rows = (
+        "".join(
+            f"""<tr><td><code>{html.escape(item.path)}</code></td><td>{item.commit_count}</td><td>{item.churn}</td>
+            <td>{item.complexity if item.complexity is not None else "UNSUPPORTED"}</td><td>{item.score if item.score is not None else "—"}</td></tr>"""
+            for item in (portable.hotspots[:100] if portable else ())
+        )
+        or '<tr><td colspan="5">No Git history available for selected files.</td></tr>'
+    )
     metric_details_by_gate = {
-        "quality": f"""<div class="check-detail"><h4>Function metrics</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Line coverage</th><th>Branch coverage</th><th>Complexity</th><th>CRAAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div>""",
+        "quality": f"""<div class="check-detail"><h4>Function metrics</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Line coverage</th><th>Branch coverage</th><th>Complexity</th><th>CRAP</th><th>Parser</th><th>Status</th></tr></thead><tbody>{function_rows}</tbody></table></div></div>""",
+        "test_execution": f"""<div class="check-detail"><h4>Native test summary</h4><div class="table-wrap"><table><thead><tr><th>Executed</th><th>Passed</th><th>Failed</th><th>Skipped</th><th>Retried</th><th>Parser</th><th>Evidence</th></tr></thead><tbody>{test_execution_rows}</tbody></table></div></div>""",
+        "cognitive": f"""<div class="check-detail"><h4>Cognitive complexity and nesting</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Function</th><th>Cognitive</th><th>Max nesting</th><th>Evidence</th></tr></thead><tbody>{cognitive_rows}</tbody></table></div></div>""",
+        "duplication": f"""<div class="check-detail"><h4>Duplicate blocks</h4><div class="table-wrap"><table><thead><tr><th>First block</th><th>Second block</th><th>Lines</th></tr></thead><tbody>{duplicate_rows}</tbody></table></div></div>""",
+        "dependency_health": f"""<div class="check-detail"><h4>Module coupling</h4><div class="table-wrap"><table><thead><tr><th>Module</th><th>Fan in</th><th>Fan out</th></tr></thead><tbody>{dependency_health_rows}</tbody></table></div></div>""",
+        "secrets": f"""<div class="check-detail"><h4>Secret locations</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Credential kind</th></tr></thead><tbody>{secret_rows}</tbody></table></div></div>""",
+        "vulnerabilities": f"""<div class="check-detail"><h4>Known vulnerabilities</h4><div class="table-wrap"><table><thead><tr><th>Advisory</th><th>Ecosystem</th><th>Package</th><th>Version</th><th>Lockfile</th></tr></thead><tbody>{vulnerability_rows}</tbody></table></div></div>""",
+        "hotspots": f"""<div class="check-detail"><h4>Change hotspots</h4><div class="table-wrap"><table><thead><tr><th>File</th><th>Commits</th><th>Churn</th><th>Cognitive</th><th>Score</th></tr></thead><tbody>{hotspot_rows}</tbody></table></div></div>""",
         "slow_tests": f"""<div class="check-detail"><h4>Test timings</h4><div class="table-wrap"><table><thead><tr><th>File</th><th>Test</th><th>Duration</th><th>Status</th></tr></thead><tbody>{timing_rows}</tbody></table></div></div>""",
         "error_handling": f"""<div class="check-detail"><h4>Error paths</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Handler</th><th>Covered</th><th>Silent</th><th>Evidence</th><th>Parser</th></tr></thead><tbody>{error_path_rows}</tbody></table></div></div>""",
         "test_integrity": f"""<div class="check-detail"><h4>Anti-vacuous mock findings</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Rule</th><th>Target</th><th>Finding</th></tr></thead><tbody>{test_integrity_rows}</tbody></table></div></div>""",
@@ -7156,7 +8647,9 @@ def html_report(report: AnalysisReport) -> str:
     gate_groups: dict[str, list[str]] = {"Build": [], "Tests": [], "Architecture": []}
     build_keys = {"format_lint", "types", "contracts"}
     test_keys = {
+        "gherkin",
         "quality",
+        "test_execution",
         "slow_tests",
         "error_handling",
         "test_integrity",
@@ -7255,12 +8748,11 @@ def html_report(report: AnalysisReport) -> str:
     else:
         setup_summary = "No install was needed. Built-in tools and existing project tools were enough."
         setup_evidence = ""
-    total_gates = max(1, len(report.gates))
     failed_count = len(failed_gates)
     function_count = len(report.functions)
     file_count = len(report.files)
-    average_craap = (
-        f"{sum(item.craap_score for item in report.functions) / function_count:.2f}"
+    average_crap = (
+        f"{sum(item.crap_score for item in report.functions) / function_count:.2f}"
         if function_count
         else "—"
     )
@@ -7288,7 +8780,7 @@ def html_report(report: AnalysisReport) -> str:
         else "—"
     )
     metric_tiles = f"""<div class="metric-grid">
-      <div class="metric-tile"><strong>{average_craap}</strong><span>Average CRAAP</span><small>Target ≤ {craap_limit:g}</small></div>
+      <div class="metric-tile"><strong>{average_crap}</strong><span>Average CRAP</span><small>Target ≤ {crap_limit:g}</small></div>
       <div class="metric-tile"><strong>{mean_file_loc}</strong><span>Mean file LOC</span><small>Limit ≤ {file_loc_limit:,}</small></div>
       <div class="metric-tile"><strong>{average_complexity}</strong><span>Average complexity</span><small>Target ≤ {complexity_limit:g}</small></div>
       <div class="metric-tile"><strong>{average_coverage}</strong><span>Average coverage</span><small>Target {coverage_limit:g}%</small></div>
@@ -7315,6 +8807,13 @@ def html_report(report: AnalysisReport) -> str:
         else 100.0
     )
     extended_metric_tiles = f"""<div class="metric-grid">
+      <div class="metric-tile"><strong>{test_execution.executed if test_execution.measured else "—"}</strong><span>Tests executed</span><small>Minimum {min_executed}</small></div>
+      <div class="metric-tile"><strong>{test_execution.skipped if test_execution.measured else "—"}</strong><span>Tests skipped</span><small>Limit ≤ {max_skipped}</small></div>
+      <div class="metric-tile"><strong>{portable.duplication.percentage if portable else 0:.1f}%</strong><span>Duplicated code</span><small>Limit ≤ {duplication_limit:g}%</small></div>
+      <div class="metric-tile"><strong>{len(portable.dependencies.cycles) if portable else 0}</strong><span>Dependency cycles</span><small>Limit 0</small></div>
+      <div class="metric-tile"><strong>{len(portable.secrets) if portable else 0}</strong><span>Secret findings</span><small>Limit 0</small></div>
+      <div class="metric-tile"><strong>{len(report.vulnerabilities)}</strong><span>Known vulnerabilities</span><small>Limit ≤ {vulnerability_limit}</small></div>
+      <div class="metric-tile"><strong>{len(portable.hotspots) if portable else 0}</strong><span>Git hotspots</span><small>Ranked evidence</small></div>
       <div class="metric-tile"><strong>{average_branch_coverage}</strong><span>Branch coverage</span><small>Target {branch_coverage_limit:g}%</small></div>
       <div class="metric-tile"><strong>{slowest_test_text}</strong><span>Slowest test</span><small>Limit ≤ {max_test_seconds:g}s</small></div>
       <div class="metric-tile"><strong>{contract_coverage_text}</strong><span>Extension contracts</span><small>Target {extension_contract_limit:g}%</small></div>
@@ -7324,7 +8823,6 @@ def html_report(report: AnalysisReport) -> str:
     </div>"""
     thresholds_html = html.escape(json.dumps(thresholds, indent=2))
     repository_name = Path(report.root).name or report.root
-    completion = 100 * passed_gates / max(1, applicable_gates)
     decision_note = (
         "No action required" if report.passed else "Review the check details below"
     )
@@ -7340,47 +8838,54 @@ def html_report(report: AnalysisReport) -> str:
     )
     if report.mode == "fast":
         scope_note = f"Fast quality check for {html.escape(report.scope.description)}"
-    health_charts = health_overview(report, thresholds)
+    project_coverage = project_quality_panel(report)
+    health_charts = health_overview(report, thresholds, project_coverage)
+    project_link = (
+        '<a href="#project-evidence">Project evidence</a>' if project_coverage else ""
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_heading} — {status}</title>
 <style>
-:root{{--bg:#f4f6f8;--ink:#111318;--secondary:#606773;--card:rgba(255,255,255,.94);--glass:rgba(248,251,255,.76);--line:rgba(41,50,65,.12);--blue:#087cff;--good:#16a05d;--good-soft:#eaf8f0;--bad:#ef3939;--bad-soft:#fff0f0;--deferred:#7b4ce2;--deferred-soft:#f1ebff;--na:#8b929d;--na-soft:#f0f2f4;--code:#1f232b}}
-*{{box-sizing:border-box}} body{{margin:0;overflow-x:hidden;background:radial-gradient(circle at 50% -20%,#dcecff 0,transparent 35%),var(--bg);color:var(--ink);font:15px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif}}
-main{{max-width:1280px;margin:auto;padding:18px 24px 46px}} h1,h2,h3,p{{margin-top:0}} h1{{font-size:clamp(34px,4vw,50px);line-height:1.04;letter-spacing:-.035em;margin:5px 0 8px}} h2{{font-size:19px}} button{{font:inherit}}
-.toolbar{{position:sticky;top:12px;z-index:5;display:flex;align-items:center;gap:18px;padding:11px 16px;border:1px solid rgba(255,255,255,.72);border-radius:18px;background:var(--glass);backdrop-filter:blur(24px) saturate(150%);box-shadow:0 8px 30px rgba(40,58,90,.11)}} .brand{{font-weight:700}} .repo{{padding:6px 12px;border-radius:999px;background:rgba(255,255,255,.62);border:1px solid var(--line)}} .toolbar-meta{{margin-left:auto;display:flex;gap:18px;color:var(--secondary);font-size:13px}} .toolbar-meta strong{{color:var(--ink)}}
-.hero{{display:grid;grid-template-columns:1fr auto;align-items:end;gap:24px;padding:28px 4px 18px}} .eyebrow{{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--secondary)}} .verdict{{display:inline-flex;margin-top:8px;padding:5px 9px;border-radius:8px;font-size:12px;font-weight:700}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--deferred);background:var(--deferred-soft)}} .meta{{color:var(--secondary)}}
-.copy{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 13px;border-radius:10px;border:1px solid rgba(8,124,255,.48);background:#fff;color:var(--blue);font-weight:650;cursor:pointer}} .copy.primary{{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 5px 14px rgba(8,124,255,.2)}} .copy:hover{{filter:brightness(.97)}} .copy.copied{{background:var(--good);border-color:var(--good);color:#fff}}
-.dashboard{{display:grid;grid-template-columns:1fr 1fr;gap:14px}} .card{{min-width:0;background:var(--card);border:1px solid rgba(255,255,255,.85);border-radius:18px;padding:16px;box-shadow:0 7px 24px rgba(35,45,70,.07)}} .card h2{{margin-bottom:14px}} .outcome-bar{{display:flex;height:22px;overflow:hidden;border-radius:7px;background:#e8ebef}} .segment.pass,.bar-track .pass,.legend i.pass{{background:var(--good)}} .segment.fail,.bar-track .fail,.legend i.fail{{background:var(--bad)}} .segment.deferred,.legend i.deferred{{background:var(--deferred)}} .segment.na,.legend i.na{{background:var(--na)}} .legend{{display:flex;flex-wrap:wrap;gap:20px;margin-top:14px;color:var(--secondary)}} .legend span{{display:flex;align-items:center;gap:6px}} .legend i{{width:10px;height:10px;border-radius:3px}}
-.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .metrics-wide{{grid-column:1/-1}} .metrics-wide .metric-grid{{grid-template-columns:repeat(3,1fr)}} .metric-tile{{display:grid;gap:1px;padding:12px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.62)}} .metric-tile strong{{font-size:25px;line-height:1.05;letter-spacing:-.03em}} .metric-tile span{{font-size:12px;font-weight:700}} .metric-tile small{{color:var(--secondary);font-size:10px}}
-.flow-card{{grid-column:1/-1;overflow:hidden}} .gate-flow{{display:grid;grid-template-columns:repeat({total_gates},minmax(94px,1fr));gap:4px;overflow:auto;padding:4px 0}} .flow-item{{position:relative;display:grid;justify-items:center;gap:3px;text-align:center;color:var(--secondary)}} .flow-item:not(:last-child)::after{{content:"";position:absolute;top:16px;left:64%;width:72%;height:1px;background:var(--line)}} .flow-symbol{{position:relative;z-index:1;display:grid;place-items:center;width:34px;height:34px;border:1.5px solid currentColor;border-radius:50%;background:#fff;font-size:19px}} .flow-item strong{{font-size:12px;color:var(--ink);font-weight:600}} .flow-item small{{font-size:10px;font-weight:700}} .flow-item.pass{{color:var(--good)}} .flow-item.fail{{color:var(--bad)}} .flow-item.deferred{{color:var(--deferred)}} .flow-item.na{{color:var(--na)}}
-.accordion{{margin-top:14px;overflow:hidden;border:1px solid rgba(255,255,255,.82);border-radius:18px;background:var(--glass);backdrop-filter:blur(18px) saturate(135%);box-shadow:0 8px 28px rgba(35,45,70,.08)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
+:root{{--bg:#f8fafc;--ink:#111827;--secondary:#4b5563;--card:#fff;--line:#d8dee7;--blue:#075fb8;--good:#0a6b3d;--good-soft:#eaf8f0;--bad:#b42318;--bad-soft:#fff0f0;--warning:#744d00;--warning-soft:#fff8e9;--deferred:#5b3db7;--deferred-soft:#f1ebff;--na:#565e69;--na-soft:#f0f2f4;--track:#e7ebf0;--code:#1f232b}}
+*{{box-sizing:border-box}} body{{margin:0;overflow-x:hidden;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif}}
+main{{max-width:1440px;margin:auto;padding:24px 28px 40px}} h1,h2,h3,p{{margin-top:0}} h1{{font-size:28px;line-height:1.2;letter-spacing:-.03em;margin:0 0 6px}} h2{{font-size:20px;letter-spacing:-.02em}} button{{font:inherit}}
+.toolbar{{display:flex;align-items:center;gap:18px;padding:0 0 20px;flex-wrap:wrap}} .brand{{font-size:20px;font-weight:750;letter-spacing:-.025em}} .repo{{color:var(--secondary)}} .toolbar-meta{{margin-left:auto;display:flex;gap:18px;color:var(--secondary);font-size:13px}} .toolbar-meta strong{{color:var(--ink)}}
+.hero{{display:grid;grid-template-columns:1fr auto;align-items:center;gap:24px;padding:10px 0}} .eyebrow{{font-size:12px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;color:var(--secondary)}} .verdict{{display:inline-flex;margin-top:4px;padding:5px 9px;border-radius:8px;font-size:12px;font-weight:750}} .verdict.pass{{color:var(--good);background:var(--good-soft)}} .verdict.fail{{color:var(--bad);background:var(--bad-soft)}} .verdict.diagnostic{{color:var(--deferred);background:var(--deferred-soft)}} .meta{{color:var(--secondary)}}
+.report-nav{{display:flex;gap:6px;overflow:auto;margin:8px 0 14px;padding-bottom:2px}}.report-nav a{{padding:7px 10px;border:1px solid var(--line);border-radius:999px;color:var(--ink);font-size:13px;font-weight:650;text-decoration:none;white-space:nowrap}}.report-nav a:hover{{border-color:var(--blue);color:var(--blue)}}.report-nav a:focus-visible{{outline:3px solid var(--blue);outline-offset:2px}}
+.copy{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:8px 13px;border-radius:10px;border:1px solid rgba(8,124,255,.48);background:var(--card);color:var(--blue);font-weight:650;cursor:pointer}} .copy.primary{{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 5px 14px rgba(8,124,255,.2)}} .copy:hover{{filter:brightness(.97)}} .copy.copied{{background:var(--good);border-color:var(--good);color:#fff}}
+.dashboard{{display:grid;grid-template-columns:1fr 1fr;gap:14px}} .card{{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}} .card h2{{margin-bottom:14px}} .outcome-bar{{display:flex;height:22px;overflow:hidden;border-radius:7px;background:var(--track)}} .segment.pass,.bar-track .pass,.legend i.pass{{background:var(--good)}} .segment.fail,.bar-track .fail,.legend i.fail{{background:var(--bad)}} .segment.deferred,.legend i.deferred{{background:var(--deferred)}} .segment.na,.legend i.na{{background:var(--na)}} .legend{{display:flex;flex-wrap:wrap;gap:20px;margin-top:14px;color:var(--secondary)}} .legend span{{display:flex;align-items:center;gap:6px}} .legend i{{width:10px;height:10px;border-radius:3px}}
+.metric-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .metrics-wide{{grid-column:1/-1}} .metrics-wide .metric-grid{{grid-template-columns:repeat(3,1fr)}} .metric-tile{{display:grid;gap:1px;padding:12px;border:1px solid var(--line);border-radius:13px;background:var(--card)}} .metric-tile strong{{font-size:25px;line-height:1.05;letter-spacing:-.03em}} .metric-tile span{{font-size:12px;font-weight:700}} .metric-tile small{{color:var(--secondary);font-size:12px}}
+.accordion{{margin-top:16px;overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--card)}} .group-section,.data-section{{margin:0;border-bottom:1px solid var(--line)}} .accordion>details:last-child{{border-bottom:0}} summary{{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:44px;padding:10px 16px;cursor:pointer;font-weight:650;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"›";font-size:22px;font-weight:400;transform:rotate(0);transition:.18s}} details[open]>summary::after{{transform:rotate(90deg)}} summary>span:first-child{{display:flex;align-items:center;gap:9px}} summary:focus-visible,button:focus-visible{{outline:3px solid var(--blue);outline-offset:3px;border-radius:8px}} .summary-icon{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;font-size:11px}} .summary-icon.fail{{color:var(--bad);border:1px solid var(--bad)}} .summary-icon.na{{color:var(--na);border:1px solid var(--na)}} .group-body{{border-top:1px solid var(--line)}}
 .issue-row,.optional-row{{display:grid;grid-template-columns:94px 1fr auto;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}} .issue-row:last-child,.optional-row:last-child{{border-bottom:0}} .issue-row p,.optional-row p,.optional-heading p{{margin:2px 0 0;color:var(--secondary);font-size:13px}} .state-label{{font-size:12px;font-weight:750}} .state-label.fail{{color:var(--bad)}} .na-mark{{display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--na);border-radius:50%;color:var(--na);font-size:10px}} .optional-heading{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}} .optional-heading p{{margin:0}} .panel{{padding:16px;border-top:1px solid var(--line)}}
-.checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:rgba(255,255,255,.5)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#edf0f4}} .check-status{{margin-left:auto;margin-right:8px;font-size:11px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .check-detail{{margin-top:16px}} .check-detail h4{{margin:0 0 8px;font-size:13px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
-.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#fff}} table{{width:100%;border-collapse:collapse}} th,td{{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}} th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f6f8}} tr.bad{{background:#fff8f8}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
-@media(max-width:900px){{main{{padding:12px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.flow-card,.metrics-wide{{grid-column:auto}}.metrics-wide .metric-grid{{grid-template-columns:1fr 1fr}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
-@media(max-width:620px){{.toolbar{{justify-content:center;gap:9px}}.brand,.toolbar-meta{{display:none}}.repo{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}}h1{{font-size:34px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.metric-tile{{padding:10px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
+.fix-section{{margin:0 0 16px;overflow:hidden;border:1px solid var(--bad);border-radius:14px;background:var(--bad-soft)}}
+.checks-list{{border-bottom:1px solid var(--line)}} .check-row{{margin:0;border-bottom:1px solid var(--line);background:var(--card)}} .check-row:last-child{{border-bottom:0}} .check-row summary{{padding:11px 16px}} .check-title{{display:flex;align-items:center;gap:12px}} .check-title>span:last-child{{display:grid;gap:1px}} .check-title strong{{font-size:14px}} .check-title small{{color:var(--secondary);font-size:12px;font-weight:450}} .step{{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:var(--na-soft)}} .check-status{{margin-left:auto;margin-right:8px;font-size:12px;font-weight:800}} .check-row.pass .check-status{{color:var(--good)}} .check-row.fail .check-status,.check-row.blocked .check-status,.check-row.unsupported .check-status,.check-row.needs_context .check-status{{color:var(--bad)}} .check-row.deferred .check-status{{color:var(--deferred)}} .check-row.na .check-status{{color:var(--na)}} .check-body{{padding:0 56px 14px}} .check-detail{{margin-top:16px}} .check-detail h4{{margin:0 0 8px;font-size:13px}} .explain{{color:var(--secondary);font-size:12px}} .result{{font-weight:600;font-size:13px}} code,pre{{font-family:"SFMono-Regular",Consolas,monospace}} pre{{white-space:pre-wrap;word-break:break-word;background:var(--code);color:#f5f7fa;padding:14px;border-radius:12px;max-height:400px;overflow:auto}}
+.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--card)}} table{{width:100%;border-collapse:collapse}} caption{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}} th,td{{padding:10px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line);white-space:nowrap}} th{{position:sticky;top:0;z-index:1;font-size:12px;text-transform:uppercase;letter-spacing:.04em;background:var(--bg)}} tr.bad{{background:var(--bad-soft)}} tr.ok td:last-child{{color:var(--good);font-weight:700}} ul{{margin:0;padding-left:20px}} footer{{padding:22px 8px 0;text-align:center;color:var(--secondary);font-size:12px}}
+@media(max-width:900px){{main{{padding:18px}}.toolbar-meta span{{display:none}}.hero{{grid-template-columns:1fr}}.dashboard{{grid-template-columns:1fr}}.metrics-wide{{grid-column:auto}}.metrics-wide .metric-grid{{grid-template-columns:1fr 1fr}}.issue-row,.optional-row{{grid-template-columns:72px 1fr}}.issue-row .copy,.optional-row .copy{{grid-column:2}}}}
+@media(max-width:620px){{.toolbar{{align-items:flex-start;gap:9px}}.repo{{font-size:12px}}.legend{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.metric-tile{{padding:10px}}.check-title small{{display:none}}.check-body{{padding-left:16px;padding-right:16px}}.optional-heading{{align-items:flex-start;flex-direction:column}}.copy{{width:100%}}}}
 {CHART_STYLES}
-body{{background:#f8fafc}}main{{max-width:1440px;padding:24px 28px 40px}}
-.toolbar{{position:static;box-shadow:none;border:0;border-radius:0;background:transparent;backdrop-filter:none;padding:0 0 20px;flex-wrap:wrap}}
-.brand{{font-size:20px;letter-spacing:-.025em}}.repo{{border:0;background:transparent;padding:0;color:var(--secondary)}}
-.hero{{padding:10px 0;align-items:center}}h1{{font-size:28px;line-height:1.2;margin:0 0 6px}}.hero .eyebrow,.hero .meta{{display:none}}
-.verdict{{margin-top:4px}}.accordion{{box-shadow:none;border:1px solid var(--line);background:#fff;backdrop-filter:none;border-radius:14px}}
 .copy{{min-height:44px}}.check-body{{overflow-wrap:anywhere}}.group-section,.data-section{{min-width:0}}
 .additional-metrics{{display:grid;gap:14px}}.additional-metrics h3{{margin:0;font-size:15px}}
-@media(max-width:760px){{main{{padding:18px 14px 30px}}.toolbar{{gap:8px 16px}}.toolbar-meta{{margin-left:0}}.hero{{gap:12px;grid-template-columns:1fr}}.hero h1{{font-size:25px}}.brand{{display:block}}.repo{{max-width:100%;white-space:normal;overflow-wrap:anywhere}}.gate-summary{{align-items:flex-start}}}}
+.project-evidence{{margin:10px 0;padding:13px;border:1px solid var(--line);border-radius:13px;background:var(--card)}}.project-evidence-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}.project-evidence-heading h3{{margin:0;font-size:14px;letter-spacing:-.015em}}.project-evidence-heading p{{margin:2px 0 0;color:var(--secondary);font-size:12px}}.profile-state{{flex:none;padding:3px 7px;border:1px solid var(--line);border-radius:999px;color:var(--secondary);font-size:12px;font-weight:750;line-height:1.35}}.profile-state.certified{{color:var(--good);background:var(--good-soft);border-color:#b7dec9}}.profile-state.needs_context{{color:var(--warning);background:var(--warning-soft);border-color:#e5d3a7}}.profile-state.needs_work{{color:var(--bad);background:var(--bad-soft);border-color:#f2c0bc}}
+.evidence-summary{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:10px 0 6px}}.evidence-item{{display:grid;gap:1px;min-width:0;padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:var(--bg);line-height:1.35}}.evidence-summary.action .evidence-item.required{{border-color:#e5d3a7;background:var(--warning-soft)}}.evidence-item span{{color:var(--secondary);font-size:11px;font-weight:700}}.evidence-item strong{{overflow-wrap:anywhere;font-size:12px}}.evidence-guidance{{margin:0 0 9px;color:var(--good);font-size:12px}}.evidence-guidance.action{{color:var(--warning)}}
+.dimension-chip-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:7px}}.dimension-chip{{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:1px 8px;min-width:0;padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:var(--card)}}.dimension-chip span{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--secondary);font-size:12px}}.dimension-chip strong{{font-size:12px;font-variant-numeric:tabular-nums}}.dimension-chip small{{grid-column:1/-1;font-size:11px;font-weight:750;color:var(--good)}}.dimension-chip.needs_context small{{color:var(--warning)}}.dimension-chip.not_applicable small{{color:var(--na)}}.project-evidence-details{{margin-top:9px;border-top:1px solid var(--line)}}.project-evidence-details>summary{{min-height:38px;padding:7px 3px 0;font-size:12px}}.project-evidence-details>summary>span:last-child{{color:var(--secondary);font-weight:500}}.project-evidence-details>.dimension-list{{margin-top:8px}}
+.dimension-list{{border:1px solid var(--line);border-radius:12px;overflow:hidden}}.dimension-row,.na-dimensions{{border-bottom:1px solid var(--line)}}.dimension-list>*:last-child{{border-bottom:0}}.dimension-row summary>span:last-child,.na-dimensions>summary>span:last-child{{color:var(--secondary);font-size:12px;font-weight:500;text-align:right}}.dimension-row summary>span:last-child strong{{font-size:12px}}.dimension-row.needs_context summary>span:last-child strong{{color:var(--warning)}}.dimension-row.not_applicable summary>span:last-child strong{{color:var(--na)}}.metric-priority,.metric-state{{font-size:12px;font-weight:750}}.metric-priority.required{{color:var(--bad)}}.metric-priority.recommended{{color:var(--blue)}}.metric-priority.optional{{color:var(--na)}}.metric-state.measured,.metric-state.confirmed{{color:var(--good)}}.metric-state.needs_context{{color:var(--warning)}}.metric-state.unsupported{{color:var(--deferred)}}.metric-state.not_configured,.metric-state.not_applicable{{color:var(--na)}}
+.metric-table{{table-layout:fixed;min-width:860px}}.metric-table th:nth-child(1){{width:15%}}.metric-table th:nth-child(2){{width:11%}}.metric-table th:nth-child(3){{width:12%}}.metric-table th:nth-child(4){{width:15%}}.metric-table th:nth-child(5){{width:23.5%}}.metric-table th:nth-child(6){{width:23.5%}}.metric-table td{{white-space:normal;overflow-wrap:anywhere}}.metric-name{{font-weight:650}}.metric-value code{{white-space:normal}}.metric-action{{color:var(--secondary)}}.value-list{{display:flex;flex-wrap:wrap;gap:5px}}.value-item{{padding:3px 7px;border-radius:999px;background:var(--na-soft);font-size:12px}}
+@media(max-width:760px){{main{{padding:18px 14px 30px}}.toolbar{{gap:8px 16px}}.toolbar-meta{{width:100%;margin-left:0}}.hero{{gap:12px;grid-template-columns:1fr}}h1{{font-size:25px}}.repo{{max-width:100%;white-space:normal;overflow-wrap:anywhere}}.gate-summary{{align-items:flex-start}}.project-evidence-heading{{align-items:flex-start;flex-direction:column}}.evidence-summary{{grid-template-columns:1fr}}.dimension-chip-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.dimension-row summary,.na-dimensions>summary{{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start}}.dimension-row summary>span:last-child,.na-dimensions>summary>span:last-child{{grid-column:1;grid-row:2;text-align:left}}.dimension-row summary::after,.na-dimensions>summary::after{{grid-column:2;grid-row:1/3;align-self:center}}.metric-table-wrap{{border:0;overflow:visible}}.metric-table{{display:block;min-width:0}}.metric-table thead{{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}}.metric-table tbody,.metric-table tr,.metric-table td{{display:block;width:100%}}.metric-table tr{{margin-bottom:10px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card)}}.metric-table td{{display:grid;grid-template-columns:100px 1fr;gap:10px;padding:6px 0;border:0}}.metric-table td::before{{content:attr(data-label);color:var(--secondary);font-size:12px;font-weight:650}}}}
 @media(prefers-reduced-motion:reduce){{*,*::before,*::after{{transition:none!important;animation:none!important}}}}
-@media(prefers-reduced-transparency:reduce){{.toolbar,.accordion,.card,.check-row{{background:#fff;backdrop-filter:none}}}}
+@media(prefers-reduced-transparency:reduce){{*{{backdrop-filter:none!important}}}}
 @media(prefers-contrast:more){{:root{{--secondary:#30343b;--line:#8a929e}}}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#11151c;--ink:#f3f5f7;--secondary:#b3bdc9;--card:#191f28;--line:#35404d;--blue:#79b8ff;--good:#7bdba8;--good-soft:#153426;--bad:#ff9b91;--bad-soft:#3b1e1d;--warning:#f2c66d;--warning-soft:#382e18;--deferred:#c0a8ff;--deferred-soft:#2c2444;--na:#c0c7d0;--na-soft:#2a3039;--track:#333c47;--code:#090b0f}}.health-overview{{--p50:#c7ced8;--p75:#54ced1;--p95:#79b8ff;--max:#c0a8ff}}tr.bad{{background:var(--bad-soft)}}}}
 </style></head><body><main>
 <header class="toolbar"><span class="brand">Code Confidence</span><span class="repo">{html.escape(repository_name)} · {html.escape(report.scope.description)}</span>
 <div class="toolbar-meta"><strong>{report.mode.upper()} RUN</strong><span>{html.escape(report.generated_at)}</span></div></header>
 <section class="hero"><div><div class="eyebrow">Repository health · v{VERSION}</div><h1>{page_heading}</h1>
 <div class="meta">{html.escape(report.root)} · {html.escape(language_text)}</div><span class="verdict {verdict_class}">{status}</span></div>{repair_action_html}</section>
-<section class="gate-summary"><div class="chart-ring" style="--gate-completion:{completion:g}%" role="img" aria-label="{passed_gates} of {applicable_gates} applicable checks passed"></div><div><strong>{decision_note}</strong><p>{passed_gates} checks passed · {failed_count} failed · {not_applicable_gates} not applicable · {deferred_gates} deferred</p><p>{scope_note}</p></div></section>
+<section class="gate-summary"><div class="gate-score {"pass" if not failed_count else "fail"}" aria-label="{passed_gates} of {applicable_gates} applicable checks passed"><strong>{passed_gates}/{applicable_gates}</strong><span>checks passed</span></div><div><strong>{decision_note}</strong><p>{failed_count} failed · {not_applicable_gates} not applicable · {deferred_gates} deferred</p><p>{scope_note}</p></div></section>
+{fix_section}
+<nav class="report-nav" aria-label="Report sections">{project_link}<a href="#health-title">Code health</a><a href="#repository-checks">Repository checks</a></nav>
 {health_charts}
-<section class="accordion">{fix_section}
-<div class="checks-list">{gate_cards}</div>
+<section class="accordion" id="repository-checks"><div class="checks-list">{gate_cards}</div>
 {optional_section}
 <details class="data-section"><summary><span>View run details</span><span>{report.mode} mode · {html.escape(report.scope.description)}</span></summary><div class="panel"><div class="additional-metrics"><h3>Code health</h3>{metric_tiles}<h3>Test performance · Extension safety · Failure handling</h3>{extended_metric_tiles}</div><h3>Thresholds</h3><pre>{thresholds_html}</pre><h3>Automatic tool setup</h3><p>{html.escape(setup_summary)}</p>{setup_evidence}<h3>Notes</h3><ul>{notes_html}</ul></div></details>
 </section><footer>{applicable_gates} applicable · {deferred_gates} deferred · generated {html.escape(report.generated_at)}</footer>
@@ -7588,7 +9093,7 @@ def run(
                 config["format_lint"],
                 infer_format_lint_commands(root, source_files, tools, scope),
                 "Configure format_lint.commands with non-mutating check-mode formatter and linter commands.",
-                tools.python_env,
+                project_execution_env(tools.python_env),
             )
             if selection.wants("format_lint")
             else skipped_check("format_lint", "Formatter & lint")
@@ -7601,7 +9106,7 @@ def run(
                 config["types"],
                 infer_type_commands(root, source_files, tools),
                 "Configure types.commands with the repository's complete static type checker.",
-                tools.python_env,
+                project_execution_env(tools.python_env),
             )
             if selection.wants("types")
             else skipped_check("types", "Static type checking")
@@ -7616,6 +9121,14 @@ def run(
             if selection_needs_test_baseline(selection)
             else (None, None)
         )
+        test_execution_gate, test_execution = (
+            run_test_execution_gate(test_baseline, config["test_execution"])
+            if selection.wants("test_execution")
+            else (
+                skipped_check("test_execution", "Test execution"),
+                TestExecution(),
+            )
+        )
         quality_gate, functions = run_quality_gate(
             root,
             config,
@@ -7626,6 +9139,47 @@ def run(
             selection,
             test_command,
             test_baseline,
+        )
+        portable_gates, portable_report = run_portable_source_gates(
+            root,
+            source_files,
+            config["portable_analysis"],
+            include_history=selection.wants("hotspots"),
+        )
+        portable_by_key = {gate.key: gate for gate in portable_gates}
+        cognitive_gate = (
+            portable_by_key["cognitive"]
+            if selection.wants("cognitive")
+            else skipped_check("cognitive", "Cognitive complexity & nesting")
+        )
+        duplication_gate = (
+            portable_by_key["duplication"]
+            if selection.wants("duplication")
+            else skipped_check("duplication", "Source duplication")
+        )
+        dependency_health_gate = (
+            portable_by_key["dependency_health"]
+            if selection.wants("dependency_health")
+            else skipped_check("dependency_health", "Dependency cycles & coupling")
+        )
+        secrets_gate = (
+            portable_by_key["secrets"]
+            if selection.wants("secrets")
+            else skipped_check("secrets", "High-confidence secrets")
+        )
+        vulnerability_gate, dependency_inventory, vulnerabilities = (
+            run_vulnerability_gate(root, config["portable_analysis"])
+            if selection.wants("vulnerabilities")
+            else (
+                skipped_check("vulnerabilities", "Known dependency vulnerabilities"),
+                None,
+                (),
+            )
+        )
+        hotspots_gate = (
+            portable_by_key["hotspots"]
+            if selection.wants("hotspots")
+            else skipped_check("hotspots", "Git change hotspots")
         )
         slow_tests_gate, test_timings = (
             run_slow_test_gate(root, config, test_baseline, workspace)
@@ -7667,7 +9221,7 @@ def run(
                 config["dead_code"],
                 infer_dead_code_commands(root, source_files, tools),
                 "Configure dead_code.commands with a high-confidence unused-code detector such as Vulture, Knip, or ts-prune.",
-                tools.python_env,
+                project_execution_env(tools.python_env),
             )
             if selection.wants("dead_code")
             else skipped_check("dead_code", "Dead code")
@@ -7699,7 +9253,14 @@ def run(
                 [],
             )
         )
-        smoke_gate = smoke_gate_for_run(root, config, fast, selection, tools.python_env)
+        smoke_gate = smoke_gate_for_run(
+            root,
+            config,
+            fast,
+            selection,
+            project_execution_env(tools.python_env),
+        )
+        gherkin_gate = gherkin_gate_for_run(root, config, fast, selection, tools)
         scope_gate = scope_gate_for_run(root, config, selection)
     analysis = AnalysisReport(
         root=str(root),
@@ -7710,15 +9271,23 @@ def run(
             types_gate,
             contracts_gate,
             quality_gate,
+            test_execution_gate,
+            cognitive_gate,
+            duplication_gate,
             slow_tests_gate,
             error_handling_gate,
             test_integrity_gate,
             smoke_gate,
+            gherkin_gate,
             file_loc_gate,
             dead_code_gate,
             flaky_gate,
             mutation_gate,
+            dependency_health_gate,
             dependency_gate,
+            secrets_gate,
+            vulnerability_gate,
+            hotspots_gate,
             extensibility_gate,
             scope_gate,
         ],
@@ -7742,7 +9311,12 @@ def run(
         scope=scope,
         selection=selection.names,
         focus=selection.focus,
+        test_execution=test_execution,
+        portable_analysis=portable_report,
+        dependency_inventory=dependency_inventory,
+        vulnerabilities=vulnerabilities,
     )
+    attach_project_quality(analysis, root, config)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(html_report(analysis), encoding="utf-8")
     return analysis
@@ -7755,6 +9329,8 @@ def run_mode(fast: bool, selection: GateSelection) -> str:
 
 
 def selection_needs_test_baseline(selection: GateSelection) -> bool:
+    if selection.wants("test_execution"):
+        return True
     if selection.wants("quality") and selection.focus != "complexity":
         return True
     return (
@@ -7776,13 +9352,13 @@ def run_quality_gate(
     test_baseline: CommandResult | None,
 ) -> tuple[GateResult, list[FunctionMetric]]:
     if not selection.wants("quality"):
-        return skipped_check("quality", "Tests, coverage & CRAAP"), []
+        return skipped_check("quality", "Tests, coverage & CRAP"), []
     if selection.focus == "tests":
         return tests_only_gate(test_command, test_baseline), []
     if scope.incremental and not source_files:
         raw = GateResult(
-            "craap",
-            "CRAAP: coverage + complexity",
+            "crap",
+            "CRAP: coverage + complexity",
             True,
             f"No changed production source files were selected from {scope.description}; file metrics were not needed.",
         )
@@ -7945,6 +9521,178 @@ def load_smoke_story_report(
     if not isinstance(raw_errors, list):
         raise ValueError("Smoke story page_errors must be an array")
     return probes, [str(item) for item in raw_errors]
+
+
+def gherkin_source_files(root: Path) -> list[Path]:
+    paths = [
+        path
+        for path in walk_files(root)
+        if path.name.endswith((".feature", ".feature.yaml", ".feature.yml"))
+    ]
+    generated = {
+        path.with_suffix("") for path in paths if path.suffix in {".yaml", ".yml"}
+    }
+    return sorted(path for path in paths if path not in generated)
+
+
+def gherkin_evidence_paths(features: Sequence[Path]) -> set[Path]:
+    return {
+        *features,
+        *(
+            path.with_suffix("")
+            for path in features
+            if path.suffix in {".yaml", ".yml"}
+        ),
+    }
+
+
+def prepare_gherkin_run(
+    root: Path, features: Sequence[Path], tools: ToolContext
+) -> CommandResult:
+    command = [
+        tools.python,
+        str(Path(__file__).resolve()),
+        "--root",
+        str(root),
+        "--prepare-gherkin",
+    ]
+    for feature in features:
+        command.extend(["--gherkin-feature", str(feature)])
+    return run_command(command, root, 60, project_execution_env(tools.python_env))
+
+
+def gherkin_gate_for_run(
+    root: Path,
+    config: dict[str, Any],
+    fast: bool,
+    selection: GateSelection,
+    tools: ToolContext,
+) -> GateResult:
+    title = "Gherkin acceptance"
+    if not selection.wants("gherkin"):
+        return skipped_check("gherkin", title)
+    if fast and not selection.forces("gherkin"):
+        return deferred_check(
+            "gherkin",
+            title,
+            "acceptance scenarios run in the ship report; run --gherkin to check them now.",
+        )
+    section = config["gherkin"]
+    if section.get("enabled") is False:
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "Gherkin acceptance is required and cannot be disabled.",
+        )
+    features = gherkin_source_files(root)
+    if not features:
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "No acceptance scenarios found. Add readable .feature.yaml files for the requested behavior.",
+        )
+    return run_gherkin_gate(root, section, features, tools)
+
+
+def run_gherkin_gate(
+    root: Path, section: dict[str, Any], features: Sequence[Path], tools: ToolContext
+) -> GateResult:
+    title = "Gherkin acceptance"
+    report_value = section.get("report")
+    if not report_value or not section.get("command"):
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "Configure gherkin.command and gherkin.report using a native Behave or Cucumber JSON formatter.",
+        )
+    report = resolve_config_path(str(report_value), root)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    command = command_list(
+        section["command"], {"root": str(root), "report": str(report)}
+    )
+    if not command:
+        raise ValueError("gherkin.command must execute the acceptance runner")
+    preparation = prepare_gherkin_run(root, features, tools)
+    if preparation.returncode != 0:
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "Acceptance source preparation failed.",
+            [format_command(preparation)],
+            [preparation],
+        )
+    before = report_fingerprint(report)
+    evidence_paths = gherkin_evidence_paths(features)
+    feature_before = {str(path): report_fingerprint(path) for path in evidence_paths}
+    source_before = gherkin_source_files(root)
+    environment = project_execution_env(tools.python_env)
+    result = run_command(
+        command, root, int(section.get("timeout_seconds", 300)), environment
+    )
+    if result.returncode != 0:
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "The Gherkin runner failed.",
+            [format_command(result)],
+            [result],
+        )
+    if not report_was_refreshed(report, before):
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "The Gherkin runner did not produce a fresh JSON report.",
+            command_results=[result],
+        )
+    if feature_before != {
+        str(path): report_fingerprint(path) for path in evidence_paths
+    } or source_before != gherkin_source_files(root):
+        return GateResult(
+            "gherkin",
+            title,
+            False,
+            "Feature files changed during acceptance execution. Rerun against stable specifications.",
+            command_results=[result],
+        )
+    validated = validate_gherkin_run(root, section, features, report, tools, result)
+    validated.command_results.insert(0, preparation)
+    return validated
+
+
+def validate_gherkin_run(
+    root: Path,
+    section: dict[str, Any],
+    features: Sequence[Path],
+    report: Path,
+    tools: ToolContext,
+    runner: CommandResult,
+) -> GateResult:
+    command = [
+        tools.python,
+        str(Path(__file__).resolve()),
+        "--root",
+        str(root),
+        "--validate-gherkin-report",
+        str(report),
+        "--gherkin-format",
+        str(section.get("format", "cucumber-json")),
+    ]
+    for feature in features:
+        command.extend(["--gherkin-feature", str(feature)])
+    checked = run_command(command, root, 60, project_execution_env(tools.python_env))
+    return GateResult(
+        "gherkin",
+        "Gherkin acceptance",
+        checked.returncode == 0,
+        checked.stdout.strip() or "Gherkin validation produced no evidence.",
+        command_results=[runner, checked],
+    )
 
 
 def run_smoke_story_gate(
@@ -8251,6 +9999,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--root", default=".", help="repository root (default: current directory)"
     )
+    parser.add_argument("--validate-gherkin-report", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--prepare-gherkin", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--gherkin-format", default="cucumber-json", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--gherkin-feature", action="append", default=[], help=argparse.SUPPRESS
+    )
     parser.add_argument(
         "--config",
         help=f"JSON configuration (default: ROOT/{CONFIG_NAME} when present)",
@@ -8320,6 +10078,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.prepare_gherkin:
+        preparation_args = ["--root", args.root]
+        for feature in args.gherkin_feature:
+            preparation_args.extend(["--feature", feature])
+        return gherkin_yaml_main(preparation_args)
+    if args.validate_gherkin_report:
+        validation_args = [
+            "--root",
+            args.root,
+            "--report",
+            args.validate_gherkin_report,
+            "--format",
+            args.gherkin_format,
+        ]
+        for feature in args.gherkin_feature:
+            validation_args.extend(["--feature", feature])
+        return gherkin_main(validation_args)
     if args.update_from_github:
         return update_from_github(Path(__file__).resolve(), args.update_from_github)
     if args.merge_lcov:

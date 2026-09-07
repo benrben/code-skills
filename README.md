@@ -2,9 +2,9 @@
 
 A self-contained Codex and Claude Code skill for engineering discipline: rules
 for readable code, a strict repository quality gate (tests, coverage,
-complexity, smoke, module boundaries), and tools that install or update the
-skill in any repository. Requirements: Python 3.10+ plus the target
-repository's own toolchain.
+complexity, smoke, module boundaries), and tools that install or update it on
+macOS or Linux. The launcher uses Python 3.10+ or downloads a pinned runtime;
+it never installs the target project's dependencies.
 
 ## The workflow the skill enforces
 
@@ -76,10 +76,9 @@ Globally for all repositories on this computer:
 curl -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github.com/repos/benrben/code-skills/contents/skills/code-discipline/scripts/install.py?ref=main" | python3 - --global
 ```
 
-Restart the agents after the first installation. One command configures both:
-Codex reads `.agents/skills/code-discipline`; Claude Code reads the
-`.claude/skills/code-discipline` link to the same skill. Global installation
-creates the same two paths under `$HOME`; nothing clones this repository.
+Restart the agents after the first installation. Codex reads
+`.agents/skills/code-discipline`; Claude Code reads its `.claude/skills` link.
+Global installation creates the same paths under `$HOME` without cloning.
 
 ## Update
 
@@ -89,40 +88,43 @@ python3 "$HOME/.agents/skills/code-discipline/scripts/install.py" --update-curre
 python3 .agents/skills/code-discipline/scripts/install.py --update-all
 ```
 
-The first two update this repository copy and the global one (add `--ref
-TAG_OR_COMMIT` to pin); the third refreshes every copy the installer has
-recorded on this computer and restores each `.claude/skills` link. Restart
-the agents afterwards. Updates preserve repository configuration, [refresh pinned toolchains and saved HTML](skills/code-discipline/references/quality-loop.md#entrypoint-and-configuration), and
-run the downloaded installer when it differs (copies before 1.4.0 need
-`scripts/install.py` overwritten from `main` once). Every change under `skills/`
-is also published to GHCR as an OCI Agent Skill package: `skr install oci://ghcr.io/benrben/code-skills.code-discipline:latest`.
+The first two update this repository and the global copy (`--ref TAG_OR_COMMIT`
+pins a version); the third refreshes every recorded copy. Updates preserve
+repository configuration, [refresh pinned toolchains and saved HTML](skills/code-discipline/references/quality-loop.md#entrypoint-and-configuration),
+and restore each `.claude/skills` link. Every skill change is also published as
+`oci://ghcr.io/benrben/code-skills.code-discipline:latest`.
 
 ## Run the quality gate
 
 ```bash
-python3 .agents/skills/code-discipline/scripts/repo_quality_gate.py --root . --init
-python3 .agents/skills/code-discipline/scripts/quality_loop.py --root . --local-changes --fast
+.agents/skills/code-discipline/scripts/quality --root . --init --non-interactive
+.agents/skills/code-discipline/scripts/quality --root . --local-changes --fast
 python3 .agents/skills/code-discipline/scripts/quality_items.py --root . --next
-python3 .agents/skills/code-discipline/scripts/quality_loop.py --root .   # ship report
+.agents/skills/code-discipline/scripts/quality --root .   # ship report
 ```
 
-Targeted checks combine and never certify: `--lint`, `--types`, `--contracts`,
+Targeted checks never certify: `--lint`, `--types`, `--contracts`,
 `--tests`, `--coverage`, `--branches`, `--slow-tests`,
 `--extension-contracts`, `--extension-deps`, `--failure-paths`,
-`--silent-errors`, `--test-integrity`, `--complexity`, `--craap`, `--loc`,
-`--dead-code`, `--deps`, `--smoke`, plus `--flaky` and `--mutation` on request. Every run
-prints each gate, `Coverage today`, `Since last run: fixed · remaining · new`,
-a `To fix` list grouped by file when it is long, the exact next command, and
+`--silent-errors`, `--test-integrity`, `--complexity`, `--crap`, `--loc`,
+`--dead-code`, `--deps`, `--test-count`, `--cognitive`, `--duplication`,
+`--cycles`, `--secrets`, `--vulnerabilities`, `--hotspots`, `--smoke`, `--gherkin`, plus
+`--flaky` and `--mutation` on request. Every run
+prints each gate and the separate product/security/deployment/operations
+coverage profile, `Coverage today`, `Since last run: fixed · remaining · new`, a `To fix` list grouped by file when it is long, the exact next command, and
 `QUALITY_LOOP=` / `ITEMS_TO_FIX=`. Every run writes `.quality/quality-gate-report.html`
 and `.quality/quality-gate-state.json`; `--html PATH` moves the HTML. Defaults:
 600 lines per file, 100% per-function line and branch coverage, 5 seconds per
 test, 300 seconds per suite, 100% extension contracts, no core-to-extension
-imports, 100% failure-path coverage, no silent handlers, and complexity and
-CRAAP at 6. The
-[setup guide](skills/code-discipline/references/repository-setup.md) documents
-configuration, adapters, and metric formulas; the
-[quality-loop reference](skills/code-discipline/references/quality-loop.md)
-documents the report, the per-step cycle, and sub-agent briefs.
+imports, 100% failure-path coverage, no silent handlers, at least one executed
+test with none skipped, cognitive complexity 15, nesting depth 4, duplicated
+code 5%, zero dependency cycles, secrets, or known vulnerabilities, and
+cyclomatic complexity and CRAP at 6. Write Gherkin scenarios in `.feature.yaml`; all
+scenarios, Examples rows, steps and hooks must pass. Only a full run prints
+`QUALITY_LOOP=PASS`; selected checks print `QUALITY_LOOP=SELECTED_PASS`.
+The launcher caches pinned tools/Python; it never restores project dependencies. The
+[setup guide](skills/code-discipline/references/repository-setup.md) covers adapters and formulas;
+the [loop reference](skills/code-discipline/references/quality-loop.md) covers reports, repairs, and delegation.
 
 ## Prompt for an agent: install in this repository
 
@@ -137,14 +139,12 @@ configure this repository's real toolchain, verify both scripts with
 ## Verify and develop
 
 ```bash
-python3 .agents/skills/code-discipline/scripts/quality_loop.py --version   # 3.8.0
+python3 .agents/skills/code-discipline/scripts/quality --version   # 5.0.0
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt
-.venv/bin/python -m unittest tests.test_repo_quality_gate
-.venv/bin/python skills/code-discipline/scripts/quality_loop.py --root . --no-install
+.venv/bin/python -m unittest discover -s tests
+skills/code-discipline/scripts/quality --root . --no-install
 ```
 
-The full gate uses the pinned tools in `.venv` and enforces
-`.quality/quality-thresholds.json`. This workflow is measured, not assumed:
-in pre-registered blind A/B rounds, loop v3.5 delivered green hand-offs in 3
-of 4 cells where v3.4 delivered 0 of 2, and the fan-out cleared a 95-item
-report that had previously been fatal.
+The full gate uses `.venv` and `.quality/quality-thresholds.json`. In blind A/B
+rounds, v3.5 delivered 3 of 4 green hand-offs where v3.4 delivered 0 of 2;
+fan-out also cleared a previously fatal 95-item report.

@@ -16,7 +16,7 @@ DEFAULT_LIMITS = {
     "coverage_limit": 100.0,
     "branch_coverage_limit": 100.0,
     "complexity_limit": 6.0,
-    "craap_limit": 6.0,
+    "crap_limit": 6.0,
 }
 HAND_OFF_LINE = (
     "HAND OFF NOW: the next message is the hand-off — list the deliverables (ticked) "
@@ -50,7 +50,7 @@ def gate_lines(gate: ModuleType, result: Any) -> list[str]:
             f"[N/A] {result.title}: {result.summary} Nothing to do here; not needed for hand-off."
         ]
     lines = [f"[{gate.gate_outcome(result)}] {result.title}: {result.summary}"]
-    if status != "fail":
+    if status not in {"fail", "blocked", "unsupported", "needs_context"}:
         return lines
     lines.extend(
         f"    {first_line(detail)}" for detail in result.details[:DETAIL_LIMIT]
@@ -190,9 +190,9 @@ def function_hint(item: dict[str, Any], limits: dict[str, float]) -> str:
             f"complexity {item['complexity']} > {limits['complexity_limit']:g}: "
             "split it into smaller functions"
         )
-    if item.get("craap_score", 0) > limits["craap_limit"]:
+    if item.get("crap_score", 0) > limits["crap_limit"]:
         hints.append(
-            f"CRAAP {item['craap_score']:g} > {limits['craap_limit']:g}: "
+            f"CRAP {item['crap_score']:g} > {limits['crap_limit']:g}: "
             "cover it or simplify it"
         )
     return "; ".join(hints) or "cover it or simplify it"
@@ -439,7 +439,7 @@ def empty_incremental_scope(state: dict[str, Any]) -> bool:
 
 
 def next_step_lines(state: dict[str, Any], analysis: Any) -> list[str]:
-    if state["status"] == "pass" and analysis.mode != "full":
+    if state["status"] == "selected_pass":
         return [
             "Selected checks are green. This does not certify: run the full ship report:",
             f"  {state['full_rerun_command']}",

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Run one machine-readable repository quality-gate round.
-
-Agents invoke this command repeatedly. Exit 0 means every required gate passed,
-exit 1 means actionable failures remain, and exit 2 means setup or configuration
-prevented a complete measurement.
-"""
+"""Run one machine-readable repository quality-gate round."""
 
 from __future__ import annotations
 
@@ -28,6 +23,17 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
+from project_profile import PROFILE_NAME  # noqa: E402
+from project_setup import (  # noqa: E402
+    active_thresholds_path,
+    add_setup_arguments,
+    print_analysis,
+    rerun_for,
+    resolve_run_files,
+    safe_setup_before_baseline,
+    setup_after_baseline,
+    show_profile,
+)
 from quality_report import (  # noqa: E402
     previous_item_keys,
     previous_measurement,
@@ -40,7 +46,7 @@ from repo_quality_gate import gate_status as gate_status  # noqa: E402
 from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
 from repo_quality_gate import state_status as state_status  # noqa: E402
 
-VERSION = "3.8.0"
+VERSION = "5.0.0"
 QUALITY_DIRECTORY = ".quality"
 DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
 CHECK_FLAGS: tuple[tuple[str, str], ...] = (
@@ -51,7 +57,7 @@ CHECK_FLAGS: tuple[tuple[str, str], ...] = (
     ("coverage", "tests plus per-function coverage"),
     ("branches", "tests plus per-function branch coverage"),
     ("complexity", "static complexity per function, no tests"),
-    ("craap", "tests, coverage and complexity (CRAAP per function)"),
+    ("crap", "tests, coverage and complexity (CRAP per function)"),
     ("slow-tests", "suite and individual-test duration"),
     ("extension-contracts", "configured extension scenarios"),
     ("extension-deps", "core-to-extension dependency direction"),
@@ -61,7 +67,15 @@ CHECK_FLAGS: tuple[tuple[str, str], ...] = (
     ("loc", "file size"),
     ("dead-code", "unused code"),
     ("deps", "module boundaries"),
+    ("test-count", "native executed, passed, failed, and skipped test counts"),
+    ("cognitive", "cognitive complexity and nesting depth"),
+    ("duplication", "exact normalized duplicate source blocks"),
+    ("cycles", "dependency cycles plus module fan-in and fan-out"),
+    ("secrets", "high-confidence credential formats without secret values"),
+    ("vulnerabilities", "known advisories for locked dependencies"),
+    ("hotspots", "Git change frequency and source complexity"),
     ("smoke", "start the application once and load it (the ship report requires it)"),
+    ("gherkin", "execute every Gherkin acceptance scenario and step"),
     ("flaky", "repeated test runs (off unless requested)"),
     ("mutation", "mutation testing (off unless requested)"),
 )
@@ -326,6 +340,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", default=".", help="repository root")
     parser.add_argument("--config", help="quality-gate JSON configuration")
     parser.add_argument("--thresholds", help="quality-threshold JSON configuration")
+    add_setup_arguments(parser)
     output = parser.add_mutually_exclusive_group()
     output.add_argument(
         "--artifact-dir",
@@ -382,6 +397,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     for name, description in CHECK_FLAGS:
         checks.add_argument(f"--{name}", action="store_true", help=f"run {description}")
+    checks.add_argument(
+        "--craap", dest="crap", action="store_true", help=argparse.SUPPRESS
+    )
     parser.add_argument("--version", action="version", version=VERSION)
     return parser.parse_args(argv)
 
@@ -478,80 +496,85 @@ def execute_analysis(
 
 
 def run_passed(analysis: Any) -> bool:
-    """Exit 0 for a green full run, or a partial run whose selected checks are green."""
-    if analysis.passed:
-        return True
-    return bool(analysis.mode == "partial" and analysis.selected_passed)
+    return bool(
+        analysis.passed or (analysis.mode == "partial" and analysis.selected_passed)
+    )
+
+
+def write_analysis_artifacts(
+    gate: ModuleType,
+    analysis: Any,
+    html_path: Path,
+    state_path: Path,
+    exit_code: int,
+    run_error: str | None,
+) -> dict[str, Any]:
+    html_path.write_text(gate.html_report(analysis), encoding="utf-8")
+    state = analysis_state(gate, analysis, html_path, state_path, exit_code, run_error)
+    state["report"] = dataclasses.asdict(analysis)
+    write_json_atomic(state_path, state)
+    return state
 
 
 def run_locked(args: argparse.Namespace, root: Path) -> int:
-    explicit_config = args.config is not None
-    quality_directory = root / QUALITY_DIRECTORY
-    config_path = resolve_from_root(
-        args.config, root, quality_directory / "quality-gate.json"
+    files = resolve_run_files(
+        args,
+        root,
+        QUALITY_DIRECTORY,
+        PROFILE_NAME,
+        DEFAULT_GATE_SCRIPT,
+        resolve_from_root,
+        resolve_artifacts,
     )
-    explicit_thresholds = args.thresholds is not None
-    thresholds_path = resolve_from_root(
-        args.thresholds, root, quality_directory / "quality-thresholds.json"
-    )
-    explicit_artifacts = args.artifact_dir is not None
-    explicit_html = args.html is not None
-    artifact_dir, html_path, state_path = resolve_artifacts(args, root)
-    explicit_gate_script = args.gate_script is not None
-    gate_script = resolve_from_root(args.gate_script, root, DEFAULT_GATE_SCRIPT)
-    scope_arguments = scope_cli_arguments(args)
-    gate = load_gate_safely(gate_script)
+    if args.show_profile:
+        return show_profile(root, files.profile)
+    gate = load_gate_safely(files.gate_script)
     if gate is None:
         return 2
-
-    if not explicit_thresholds and not thresholds_path.exists():
-        thresholds_path = gate.bundled_thresholds_path()
-
-    command = build_rerun_command(
+    profile, setup_ok = safe_setup_before_baseline(args, gate, root, files)
+    if not setup_ok:
+        return 2
+    thresholds_path = active_thresholds_path(gate, files)
+    command = rerun_for(
+        args,
         root,
-        config_path,
-        explicit_config,
+        files,
         thresholds_path,
-        explicit_thresholds,
-        artifact_dir,
-        explicit_artifacts,
-        html_path,
-        explicit_html,
-        gate_script,
-        explicit_gate_script,
-        scope_arguments,
-        args.no_install,
-        args.fast,
-        args.mutation_workers,
-        selection_names(args),
+        build_rerun_command,
+        scope_cli_arguments,
+        selection_names,
     )
     analysis, exit_code, run_error = execute_analysis(
         args,
         gate,
         root,
-        config_path,
+        files.config,
         thresholds_path,
-        html_path,
+        files.html,
         command,
     )
-
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    previous = previous_measurement(state_path)
-    previous_items = previous_item_keys(state_path)
-    html_path.write_text(gate.html_report(analysis), encoding="utf-8")
-    state = analysis_state(gate, analysis, html_path, state_path, exit_code, run_error)
-    state["report"] = dataclasses.asdict(analysis)
-    write_json_atomic(state_path, state)
-    print_report(
-        gate,
-        analysis,
-        state,
-        state_path,
-        html_path,
-        args.print_prompt,
-        previous,
-        previous_items,
+    files.artifact_dir.mkdir(parents=True, exist_ok=True)
+    previous = previous_measurement(files.state)
+    previous_items = previous_item_keys(files.state)
+    state = write_analysis_artifacts(
+        gate, analysis, files.html, files.state, exit_code, run_error
     )
+    print_analysis(
+        args, gate, analysis, state, files, previous, previous_items, print_report
+    )
+    if profile is not None:
+        setup_after_baseline(
+            args,
+            gate,
+            analysis,
+            root,
+            files,
+            thresholds_path,
+            profile,
+            exit_code,
+            run_error,
+            write_analysis_artifacts,
+        )
     return exit_code
 
 

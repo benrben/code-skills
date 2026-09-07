@@ -1,5 +1,8 @@
 check-jsonschema==0.33.2
 coverage==7.10.2
+behave==1.3.3
+gherkin-official==42.0.1
+PyYAML==6.0.3
 jsonschema==4.25.0
 lizard==1.17.31
 mypy==1.17.1

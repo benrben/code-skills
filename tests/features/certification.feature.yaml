@@ -1,0 +1,18 @@
+feature: Trustworthy quality completion signals
+description: A developer must distinguish focused feedback from certification.
+scenarios:
+  - name: A successful selected check cannot certify a repository
+    steps:
+      - given: a temporary repository with valid Python
+      - when: I run its lint gate
+      - then: the command exits with 0
+      - and: the status is SELECTED_PASS
+      - and: the report does not certify the repository
+
+  - name: A failed check keeps the repair loop open
+    steps:
+      - given: a temporary repository with invalid Python
+      - when: I run its lint gate
+      - then: the command exits with 1
+      - and: the status is FAIL
+      - and: the report does not certify the repository

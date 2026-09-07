@@ -38,7 +38,9 @@
     },
     {
       "name": "repository-update",
-      "paths": ["skills/code-discipline/scripts/quality_update.py"]
+      "paths": [
+        "skills/code-discipline/scripts/quality_update.py"
+      ]
     },
     {
       "name": "smoke-check",
@@ -51,25 +53,99 @@
       "paths": [
         "skills/code-discipline/scripts/quality_items.py"
       ]
+    },
+    {
+      "name": "portable-analysis",
+      "paths": [
+        "skills/code-discipline/scripts/portable_analysis.py"
+      ]
+    },
+    {
+      "name": "portable-graph",
+      "paths": [
+        "skills/code-discipline/scripts/portable_graph.py"
+      ]
+    },
+    {
+      "name": "portable-vulnerabilities",
+      "paths": [
+        "skills/code-discipline/scripts/portable_vulnerabilities.py"
+      ]
+    },
+    {
+      "name": "project-profile",
+      "paths": [
+        "skills/code-discipline/scripts/project_profile.py"
+      ]
+    },
+    {
+      "name": "project-setup",
+      "paths": [
+        "skills/code-discipline/scripts/project_setup.py"
+      ]
+    },
+    {
+      "name": "project-quality",
+      "paths": [
+        "skills/code-discipline/scripts/project_quality.py"
+      ]
+    },
+    {
+      "name": "gherkin-check",
+      "paths": [
+        "skills/code-discipline/scripts/gherkin_check.py"
+      ]
+    },
+    {
+      "name": "gherkin-yaml",
+      "paths": [
+        "skills/code-discipline/scripts/gherkin_yaml.py"
+      ]
     }
   ],
   "allow": {
     "compatibility-entrypoint": [
       "quality-engine"
     ],
-    "quality-engine": ["report-charts"],
+    "quality-engine": [
+      "report-charts",
+      "portable-analysis",
+      "portable-vulnerabilities",
+      "project-quality",
+      "gherkin-check",
+      "gherkin-yaml"
+    ],
     "quality-loop": [
       "quality-engine",
-      "quality-report"
+      "quality-report",
+      "project-profile",
+      "project-setup"
     ],
     "installer": [],
-    "repository-update": ["quality-engine", "quality-loop"],
+    "repository-update": [
+      "quality-engine",
+      "quality-loop"
+    ],
     "quality-report": [],
     "report-charts": [],
     "smoke-check": [],
     "quality-items": [
       "quality-report"
-    ]
+    ],
+    "portable-analysis": [
+      "portable-graph"
+    ],
+    "portable-graph": [],
+    "portable-vulnerabilities": [],
+    "project-profile": [],
+    "project-setup": [
+      "project-profile"
+    ],
+    "project-quality": [],
+    "gherkin-check": [
+      "gherkin-yaml"
+    ],
+    "gherkin-yaml": []
   },
   "deny": [
     {

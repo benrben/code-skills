@@ -12,8 +12,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
-from typing import Any, Sequence, cast, get_args, get_origin, get_type_hints
+from typing import Any, Sequence, Union, cast, get_args, get_origin, get_type_hints
 
 import quality_loop
 
@@ -148,16 +149,33 @@ def update_toolchain(root: Path, commit: str) -> None:
     print(f"Updated pinned toolchain at {cache} to {commit}")
 
 
+def _restore_union(annotation: Any, value: Any) -> Any:
+    if value is None:
+        return None
+    candidates = [item for item in get_args(annotation) if item is not type(None)]
+    return restore_value(candidates[0], value)
+
+
+def _restore_dataclass(annotation: Any, value: Any) -> Any:
+    hints = get_type_hints(annotation)
+    return cast(Any, annotation)(
+        **{key: restore_value(hints[key], item) for key, item in value.items()}
+    )
+
+
+def _restore_collection(origin: Any, annotation: Any, value: Any) -> Any:
+    element_type = get_args(annotation)[0]
+    return origin(restore_value(element_type, item) for item in value)
+
+
 def restore_value(annotation: Any, value: Any) -> Any:
-    if dataclasses.is_dataclass(annotation):
-        hints = get_type_hints(annotation)
-        return cast(Any, annotation)(
-            **{key: restore_value(hints[key], item) for key, item in value.items()}
-        )
     origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        return _restore_union(annotation, value)
+    if dataclasses.is_dataclass(annotation):
+        return _restore_dataclass(annotation, value)
     if origin in (list, tuple):
-        element_type = get_args(annotation)[0]
-        return origin(restore_value(element_type, item) for item in value)
+        return _restore_collection(origin, annotation, value)
     return value
 
 
