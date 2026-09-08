@@ -2485,6 +2485,58 @@ class QualityGateUnitTests(unittest.TestCase):
 
         self.assertEqual(functions[0].crap_score, 6)
 
+    def test_normalized_adapter_retains_precise_cognitive_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "metrics.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "app.ts",
+                                "name": "choose",
+                                "complexity": 2,
+                                "coverage_percent": 100,
+                                "cognitive_complexity": 3,
+                                "max_nesting": 2,
+                                "parser": "typescript-compiler-api",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            functions = gate.load_normalized_metrics(report, root)
+
+        self.assertEqual(functions[0].cognitive_complexity, 3)
+        self.assertEqual(functions[0].max_nesting, 2)
+
+    def test_normalized_adapter_rejects_partial_cognitive_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "metrics.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "functions": [
+                            {
+                                "path": "app.ts",
+                                "name": "choose",
+                                "complexity": 2,
+                                "coverage_percent": 100,
+                                "cognitive_complexity": 3,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "must provide both"):
+                gate.load_normalized_metrics(report, root)
+
     def test_lizard_adapter_normalizes_multilanguage_functions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

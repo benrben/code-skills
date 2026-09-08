@@ -49,9 +49,11 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 from gherkin_check import main as gherkin_main  # noqa: E402
 from gherkin_yaml import main as gherkin_yaml_main  # noqa: E402
 from portable_analysis import (  # noqa: E402
+    FunctionComplexity,
     HistoryInput,
     PortableAnalysisReport,
     ResolvedDependency,
+    SourceComplexity,
     analyze_portable_sources,
 )
 from portable_vulnerabilities import (  # noqa: E402
@@ -67,7 +69,7 @@ from project_quality import (  # noqa: E402
 )
 from quality_charts import CHART_STYLES, health_overview  # noqa: E402
 
-VERSION = "6.2.0"
+VERSION = "6.2.1"
 QUALITY_DIRECTORY = ".quality"
 CONFIG_NAME = f"{QUALITY_DIRECTORY}/quality-gate.json"
 THRESHOLDS_NAME = f"{QUALITY_DIRECTORY}/quality-thresholds.json"
@@ -370,6 +372,8 @@ class FunctionMetric:
     coverage_percent: float
     crap_score: float
     parser: str
+    cognitive_complexity: int | None = None
+    max_nesting: int | None = None
     coverage_limit: float = 100.0
     complexity_limit: float = 6.0
     crap_limit: float = 6.0
@@ -797,9 +801,11 @@ def bundle_standalone_portable_analysis(runner: bytes, portable: bytes) -> bytes
     )
     runner_source = runner.decode("utf-8")
     marker = """from portable_analysis import (  # noqa: E402
+    FunctionComplexity,
     HistoryInput,
     PortableAnalysisReport,
     ResolvedDependency,
+    SourceComplexity,
     analyze_portable_sources,
 )"""
     if marker not in runner_source:
@@ -4068,6 +4074,25 @@ def load_normalized_metrics(
             for item in row.get("error_paths", [])
             if isinstance(item, dict)
         ]
+        cognitive_complexity = (
+            int(row["cognitive_complexity"])
+            if row.get("cognitive_complexity") is not None
+            else None
+        )
+        max_nesting = (
+            int(row["max_nesting"]) if row.get("max_nesting") is not None else None
+        )
+        if (cognitive_complexity is None) != (max_nesting is None):
+            raise ValueError(
+                "Normalized cognitive metrics must provide both "
+                "'cognitive_complexity' and 'max_nesting'"
+            )
+        if (
+            cognitive_complexity is not None
+            and max_nesting is not None
+            and (cognitive_complexity < 0 or max_nesting < 0)
+        ):
+            raise ValueError("Normalized cognitive metrics must be non-negative")
         score = crap_score(complexity, coverage)
         functions.append(
             FunctionMetric(
@@ -4081,6 +4106,8 @@ def load_normalized_metrics(
                 coverage_percent=coverage,
                 crap_score=score,
                 parser=str(row.get("parser", "adapter")),
+                cognitive_complexity=cognitive_complexity,
+                max_nesting=max_nesting,
                 coverage_limit=coverage_limit,
                 complexity_limit=complexity_limit,
                 crap_limit=crap_limit,
@@ -7018,12 +7045,102 @@ def resolved_source_dependencies(
     return tuple(sorted(result, key=lambda item: (item.source, item.target)))
 
 
+def normalized_function_complexity(function: FunctionMetric) -> FunctionComplexity:
+    cognitive_complexity = function.cognitive_complexity
+    max_nesting = function.max_nesting
+    assert cognitive_complexity is not None and max_nesting is not None
+    return FunctionComplexity(
+        path=function.path,
+        name=function.name,
+        line=function.start_line,
+        end_line=function.end_line,
+        cognitive_complexity=cognitive_complexity,
+        max_nesting=max_nesting,
+    )
+
+
+def apply_normalized_complexity(
+    report: PortableAnalysisReport,
+    function_metrics: Sequence[FunctionMetric],
+) -> PortableAnalysisReport:
+    """Replace unsupported language results with complete native-adapter evidence."""
+    metrics_by_path: dict[str, list[FunctionMetric]] = {}
+    for function in function_metrics:
+        metrics_by_path.setdefault(function.path, []).append(function)
+
+    complexity: list[SourceComplexity] = []
+    for source in report.complexity:
+        metrics = metrics_by_path.get(source.path, [])
+        complete = metrics and all(
+            function.cognitive_complexity is not None
+            and function.max_nesting is not None
+            for function in metrics
+        )
+        if source.status != "unsupported" or not complete:
+            complexity.append(source)
+            continue
+        functions = tuple(
+            normalized_function_complexity(function) for function in metrics
+        )
+        complexity.append(
+            SourceComplexity(
+                path=source.path,
+                language=source.language,
+                status="supported",
+                functions=functions,
+                message=f"Measured by normalized {metrics[0].parser} adapter.",
+            )
+        )
+
+    complexity_by_path = {
+        source.path: float(
+            sum(function.cognitive_complexity for function in source.functions)
+        )
+        for source in complexity
+        if source.status == "supported"
+    }
+    hotspots = tuple(
+        sorted(
+            (
+                dataclasses.replace(
+                    item,
+                    complexity=complexity_by_path.get(item.path),
+                    score=(
+                        float(item.commit_count * (1 + complexity_by_path[item.path]))
+                        if item.path in complexity_by_path
+                        else None
+                    ),
+                    status=(
+                        "measured"
+                        if item.path in complexity_by_path
+                        else "missing_complexity"
+                    ),
+                )
+                for item in report.hotspots
+            ),
+            key=lambda item: (
+                item.score is None,
+                -(item.score or 0),
+                -item.commit_count,
+                -item.churn,
+                item.path,
+            ),
+        )
+    )
+    return dataclasses.replace(
+        report,
+        complexity=tuple(complexity),
+        hotspots=hotspots,
+    )
+
+
 def run_portable_source_gates(
     root: Path,
     source_files: Sequence[Path],
     section: dict[str, Any],
     *,
     include_history: bool = True,
+    function_metrics: Sequence[FunctionMetric] = (),
 ) -> tuple[list[GateResult], PortableAnalysisReport]:
     sources = {
         normalize_path(path, root): path.read_text(encoding="utf-8", errors="replace")
@@ -7040,6 +7157,7 @@ def run_portable_source_gates(
         resolved_source_dependencies(root, source_files),
         history,
     )
+    report = apply_normalized_complexity(report, function_metrics)
 
     cognitive_limit = int(section.get("max_cognitive_complexity", 15))
     nesting_limit = int(section.get("max_nesting_depth", 4))
@@ -9145,6 +9263,7 @@ def run(
             source_files,
             config["portable_analysis"],
             include_history=selection.wants("hotspots"),
+            function_metrics=functions,
         )
         portable_by_key = {gate.key: gate for gate in portable_gates}
         cognitive_gate = (

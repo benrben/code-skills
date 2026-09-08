@@ -93,6 +93,81 @@ class PortableGateIntegrationTests(unittest.TestCase):
             self.assertTrue(by_key["secrets"].passed)
             self.assertFalse(by_key["hotspots"].applicable)
 
+    def test_normalized_ast_metrics_supply_cognitive_complexity_for_typescript(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "main.ts"
+            source.write_text(
+                "export function choose(value: boolean) { return value ? 1 : 0; }\n",
+                encoding="utf-8",
+            )
+            function = gate.FunctionMetric(
+                path="main.ts",
+                name="choose",
+                start_line=1,
+                end_line=1,
+                complexity=2,
+                covered_lines=1,
+                total_lines=1,
+                coverage_percent=100,
+                crap_score=2,
+                parser="typescript-compiler-api",
+                cognitive_complexity=1,
+                max_nesting=1,
+            )
+
+            results, report = gate.run_portable_source_gates(
+                root,
+                [source],
+                self.thresholds(),
+                include_history=False,
+                function_metrics=[function],
+            )
+
+            cognitive = {result.key: result for result in results}["cognitive"]
+            self.assertTrue(cognitive.passed)
+            self.assertFalse(cognitive.unsupported)
+            self.assertEqual(report.complexity[0].status, "supported")
+            self.assertEqual(report.complexity[0].functions[0].name, "choose")
+
+    def test_partial_normalized_cognitive_evidence_stays_unsupported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "main.ts"
+            source.write_text(
+                "export const first = () => 1; export const second = () => 2;\n",
+                encoding="utf-8",
+            )
+            metrics = [
+                gate.FunctionMetric(
+                    path="main.ts",
+                    name=name,
+                    start_line=1,
+                    end_line=1,
+                    complexity=1,
+                    covered_lines=1,
+                    total_lines=1,
+                    coverage_percent=100,
+                    crap_score=1,
+                    parser="typescript-compiler-api",
+                    cognitive_complexity=0 if name == "first" else None,
+                    max_nesting=0 if name == "first" else None,
+                )
+                for name in ("first", "second")
+            ]
+
+            results, report = gate.run_portable_source_gates(
+                root,
+                [source],
+                self.thresholds(),
+                include_history=False,
+                function_metrics=metrics,
+            )
+
+            cognitive = {result.key: result for result in results}["cognitive"]
+            self.assertTrue(cognitive.unsupported)
+            self.assertEqual(report.complexity[0].status, "unsupported")
+
     def test_git_numstat_history_is_aggregated_per_file_and_commit(self):
         output = (
             "commit:one\n3\t1\ta.py\n2\t0\tb.py\n"
