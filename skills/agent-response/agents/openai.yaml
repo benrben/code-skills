@@ -1,0 +1,6 @@
+interface:
+  display_name: "Agent Response"
+  short_description: "Clear user replies in text, diagrams, HTML, or video"
+  default_prompt: "Use $agent-response for every reply, choosing the format that best serves my request."
+policy:
+  allow_implicit_invocation: true
