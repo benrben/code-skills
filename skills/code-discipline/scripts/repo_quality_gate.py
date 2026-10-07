@@ -47,6 +47,8 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from gherkin_check import main as gherkin_main  # noqa: E402
+from gherkin_check import read_report as read_gherkin_report  # noqa: E402
+from gherkin_check import runner_feature_path  # noqa: E402
 from gherkin_yaml import main as gherkin_yaml_main  # noqa: E402
 from portable_analysis import (  # noqa: E402
     HistoryInput,
@@ -488,6 +490,14 @@ class SmokeProbe:
 
 
 @dataclasses.dataclass(frozen=True)
+class GherkinScenario:
+    name: str
+    path: str
+    line: int
+    step_count: int
+
+
+@dataclasses.dataclass(frozen=True)
 class TestIntegrityViolation:
     path: str
     line: int
@@ -513,6 +523,7 @@ class GateResult:
     unsupported: bool = False
     needs_context: bool = False
     smoke_probes: list[SmokeProbe] = dataclasses.field(default_factory=list)
+    gherkin_scenarios: list[GherkinScenario] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -895,8 +906,15 @@ def bundle_standalone_project_quality(runner: bytes, project_quality: bytes) -> 
 
 
 def bundle_standalone_gherkin(runner: bytes, checker: bytes) -> bytes:
-    return bundle_standalone_bdd_helper(
+    bundled = bundle_standalone_bdd_helper(
         runner, checker, "gherkin_check", "gherkin_main"
+    )
+    return bundled.replace(
+        b"from gherkin_check import read_report as read_gherkin_report  # noqa: E402",
+        b"read_gherkin_report = _gherkin_module.read_report",
+    ).replace(
+        b"from gherkin_check import runner_feature_path  # noqa: E402",
+        b"runner_feature_path = _gherkin_module.runner_feature_path",
     )
 
 
@@ -8530,6 +8548,16 @@ def html_report(report: AnalysisReport) -> str:
         )
         or '<tr><td colspan="3">No structured core-user-story probes configured.</td></tr>'
     )
+    gherkin_gate = next((gate for gate in report.gates if gate.key == "gherkin"), None)
+    gherkin_scenario_rows = (
+        "".join(
+            f"""<tr class="ok"><td>{html.escape(item.name)}</td>
+        <td><code>{html.escape(item.path)}:{item.line}</code></td>
+        <td>{item.step_count}</td><td>PASS</td></tr>"""
+            for item in (gherkin_gate.gherkin_scenarios if gherkin_gate else [])
+        )
+        or '<tr><td colspan="4">No validated Gherkin scenarios available.</td></tr>'
+    )
     test_integrity_rows = (
         "".join(
             f"""<tr class="bad"><td><code>{html.escape(item.path)}:{item.line}</code></td>
@@ -8639,6 +8667,7 @@ def html_report(report: AnalysisReport) -> str:
         "error_handling": f"""<div class="check-detail"><h4>Error paths</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Handler</th><th>Covered</th><th>Silent</th><th>Evidence</th><th>Parser</th></tr></thead><tbody>{error_path_rows}</tbody></table></div></div>""",
         "test_integrity": f"""<div class="check-detail"><h4>Anti-vacuous mock findings</h4><div class="table-wrap"><table><thead><tr><th>Location</th><th>Rule</th><th>Target</th><th>Finding</th></tr></thead><tbody>{test_integrity_rows}</tbody></table></div></div>""",
         "smoke": f"""<div class="check-detail"><h4>Core user story probes</h4><div class="table-wrap"><table><thead><tr><th>Probe</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{smoke_probe_rows}</tbody></table></div></div>""",
+        "gherkin": f"""<div class="check-detail"><h4>Gherkin scenarios</h4><div class="table-wrap"><table><thead><tr><th>Scenario</th><th>Location</th><th>Steps</th><th>Status</th></tr></thead><tbody>{gherkin_scenario_rows}</tbody></table></div></div>""",
         "file_loc": f"""<div class="check-detail"><h4>Measured files</h4><div class="table-wrap"><table><thead><tr><th>File</th><th>Physical LOC</th><th>Limit</th><th>Status</th></tr></thead><tbody>{file_rows}</tbody></table></div></div>""",
         "mutation": f"""<div class="check-detail"><h4>Mutation evidence</h4><div class="table-wrap"><table><thead><tr><th>ID</th><th>Location</th><th>Change</th><th>Result</th><th>Static</th><th>Time</th></tr></thead><tbody>{mutation_rows}</tbody></table></div></div>""",
         "dependencies": f"""<div class="check-detail"><h4>Architecture boundaries</h4><div class="table-wrap"><table><thead><tr><th>Source</th><th>From module</th><th>Target</th><th>To module</th><th>Broken rule</th></tr></thead><tbody>{dependency_rows}</tbody></table></div></div>""",
@@ -9686,12 +9715,33 @@ def validate_gherkin_run(
     for feature in features:
         command.extend(["--gherkin-feature", str(feature)])
     checked = run_command(command, root, 60, project_execution_env(tools.python_env))
+    scenarios = []
+    if checked.returncode == 0:
+        feature_paths = {
+            (root / runner_feature_path(feature)).resolve() for feature in features
+        }
+        cases = read_gherkin_report(
+            root,
+            report,
+            str(section.get("format", "cucumber-json")),
+            feature_paths,
+        )
+        scenarios = [
+            GherkinScenario(
+                case.name,
+                normalize_report_path(str(case.path), root),
+                case.line,
+                len(case.steps),
+            )
+            for case in cases
+        ]
     return GateResult(
         "gherkin",
         "Gherkin acceptance",
         checked.returncode == 0,
         checked.stdout.strip() or "Gherkin validation produced no evidence.",
         command_results=[runner, checked],
+        gherkin_scenarios=scenarios,
     )
 
 

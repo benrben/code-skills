@@ -7,7 +7,7 @@ import argparse
 import importlib
 import json
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -26,6 +26,7 @@ class Case:
     path: Path
     line: int
     steps: tuple[Step, ...]
+    name: str = field(default="", compare=False)
 
     @property
     def key(self) -> tuple[Path, int]:
@@ -169,7 +170,14 @@ def feature_cases(path: Path) -> list[Case]:
         steps = tuple(pickle_step(step, lines) for step in item["steps"])
         if not steps:
             raise ValueError(f"{path}: scenario {item['name']!r} has no steps")
-        cases.append(Case(Path(item["uri"]), lines[item["astNodeIds"][-1]], steps))
+        cases.append(
+            Case(
+                Path(item["uri"]),
+                lines[item["astNodeIds"][-1]],
+                steps,
+                text_value(item["name"]),
+            )
+        )
     return cases
 
 
@@ -307,6 +315,7 @@ def reported_case(
         path,
         line,
         background + reported_steps(root, path, item.get("steps"), format_name),
+        text_value(item.get("name", "")),
     )
 
 

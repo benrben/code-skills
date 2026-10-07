@@ -4550,6 +4550,9 @@ class QualityGateEndToEndTests(unittest.TestCase):
             self.assertIn("<span>View run details</span>", rendered)
             self.assertEqual(rendered.count("data-copy="), 0)
             self.assertIn("Gherkin acceptance", rendered)
+            self.assertIn("Gherkin scenarios", rendered)
+            self.assertIn("The public workflow succeeds", rendered)
+            self.assertIn("tests/features/public_command.feature:2", rendered)
             self.assertNotIn("Executable UI", rendered)
             self.assertIn("All 1 mutants were killed", rendered)
 
