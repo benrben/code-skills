@@ -70,6 +70,58 @@ class PortableInventoryTests(unittest.TestCase):
             self.assertEqual(inventory.packages, ())
             self.assertEqual(inventory.unsupported, ("yarn.lock",))
 
+    def test_pnpm_lock_reads_registry_packages_and_skips_private_scopes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".npmrc").write_text(
+                "registry = https://registry.npmjs.org/\n"
+                "@internal:registry = https://nexus.example.invalid/npm/\n"
+                "@public:registry=https://registry.npmjs.org/\n",
+                encoding="utf-8",
+            )
+            (root / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n"
+                "      vue:\n        specifier: ^3.5.0\n        version: 3.5.40\n\n"
+                "packages:\n\n"
+                "  '@babel/core@7.29.7':\n    resolution: {integrity: sha512-x}\n\n"
+                "  vue@3.5.40:\n    resolution: {integrity: sha512-y}\n\n"
+                "  /left-pad@1.3.0:\n    resolution: {integrity: sha512-z}\n\n"
+                "  '@public/kit@2.0.0':\n    resolution: {integrity: sha512-p}\n\n"
+                "  '@internal/secret-lib@1.0.0':\n    resolution: {integrity: sha512-q}\n\n"
+                "  local-pkg@link:../local:\n    resolution: {directory: ../local}\n\n"
+                "snapshots:\n\n  '@vitejs/plugin-vue@6.0.7(vite@8.0.0)':\n    dependencies: {}\n",
+                encoding="utf-8",
+            )
+            inventory = scanner.discover_locked_packages(root)
+
+        coordinates = {(item.name, item.version) for item in inventory.packages}
+        self.assertEqual(
+            coordinates,
+            {
+                ("@babel/core", "7.29.7"),
+                ("vue", "3.5.40"),
+                ("left-pad", "1.3.0"),
+                ("@public/kit", "2.0.0"),
+            },
+        )
+        self.assertEqual({item.ecosystem for item in inventory.packages}, {"npm"})
+        self.assertEqual(inventory.lockfiles, ("pnpm-lock.yaml",))
+        self.assertEqual(inventory.unsupported, ())
+
+    def test_pnpm_lock_without_npmrc_reads_every_registry_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "pnpm-lock.yaml").write_text(
+                "packages:\n\n  '@scope/kit@1.0.0':\n    resolution: {}\n",
+                encoding="utf-8",
+            )
+            inventory = scanner.discover_locked_packages(root)
+
+        self.assertEqual(
+            [(item.name, item.version) for item in inventory.packages],
+            [("@scope/kit", "1.0.0")],
+        )
+
     def test_extracts_each_supported_ecosystem_and_ignores_cache_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

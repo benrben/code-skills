@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import itertools
+import json
+import shutil
+import subprocess
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Optional
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional, cast
 
 from portable_graph import (
     DependencyReport,
@@ -271,6 +276,58 @@ def analyze_source_complexity(
     )
 
 
+SCRIPT_COMPLEXITY_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"}
+SCRIPT_COMPLEXITY_HELPER = Path(__file__).with_name("ts_cognitive.mjs")
+
+
+def _script_source(row: dict[str, Any]) -> SourceComplexity:
+    path = row["path"]
+    functions = tuple(
+        FunctionComplexity(path=path, **item) for item in row["functions"]
+    )
+    return SourceComplexity(**{**row, "functions": functions})
+
+
+def _script_blocker(helper: Path, node: Optional[str]) -> Optional[str]:
+    if not helper.is_file():
+        return f"cognitive complexity needs {helper.name}"
+    return None if node else "cognitive complexity needs Node.js on PATH"
+
+
+def _measure_scripts(
+    root: Path, scripts: list[str], command: list[str]
+) -> dict[str, SourceComplexity] | str:
+    """Measured files from one helper run, or the reason none could be measured."""
+    payload = json.dumps({"root": str(root.resolve()), "files": scripts})
+    try:
+        done = subprocess.run(
+            command, input=payload, capture_output=True, text=True, timeout=600
+        )
+    except subprocess.TimeoutExpired as error:
+        return f"cognitive complexity helper timed out after {error.timeout} seconds"
+    if done.returncode != 0:
+        detail = (done.stderr.strip().splitlines() or ["no output"])[-1]
+        return f"cognitive complexity helper failed: {detail}"
+    rows = cast(list[dict[str, Any]], json.loads(done.stdout)["results"])
+    return {row["path"]: _script_source(row) for row in rows}
+
+
+def analyze_script_complexity(
+    root: Path, paths: Iterable[str], helper: Path = SCRIPT_COMPLEXITY_HELPER
+) -> dict[str, SourceComplexity]:
+    """Measure TS/JS/Vue with the project's own TypeScript; failures stay UNSUPPORTED."""
+    scripts = sorted(
+        p for p in paths if Path(p).suffix.lower() in SCRIPT_COMPLEXITY_EXTENSIONS
+    )
+    node = shutil.which("node")
+    blocker = _script_blocker(helper, node)
+    measured = blocker or _measure_scripts(root, scripts, [str(node), str(helper)])
+    if isinstance(measured, dict):
+        return measured
+    unsupported = SourceComplexity("", "typescript", "unsupported", (), measured)
+    return {path: dataclasses.replace(unsupported, path=path) for path in scripts}
+
+
 _COMMENT_PREFIXES = ("#", "//", "/*", "* ", "*/", "--")
 
 
@@ -497,19 +554,32 @@ def _inferred_language(path: str) -> str:
     return {"py": "python"}.get(suffix, suffix or "unknown")
 
 
+def _source_complexity(
+    path: str,
+    source: str,
+    languages: Optional[Mapping[str, str]],
+    measured: Mapping[str, SourceComplexity],
+) -> SourceComplexity:
+    if path in measured:
+        return measured[path]
+    language = (languages or {}).get(path, _inferred_language(path))
+    return analyze_source_complexity(path, source, language)
+
+
 def analyze_portable_sources(
     sources: Mapping[str, str],
     languages: Optional[Mapping[str, str]] = None,
     resolved_edges: Iterable[ResolvedDependency] = (),
     history: Iterable[HistoryInput] = (),
+    script_root: Optional[Path] = None,
 ) -> PortableAnalysisReport:
-    """Run every source-only analyzer without retaining source text in the report."""
+    """Run every source-only analyzer without retaining source text in the report.
+
+    With `script_root`, TS/JS/Vue cognitive complexity is measured through Node.
+    """
+    scripts = analyze_script_complexity(script_root, sources) if script_root else {}
     complexity = tuple(
-        analyze_source_complexity(
-            path,
-            sources[path],
-            (languages or {}).get(path, _inferred_language(path)),
-        )
+        _source_complexity(path, sources[path], languages, scripts)
         for path in sorted(sources)
     )
     complexity_by_path = {

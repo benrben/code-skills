@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -6763,9 +6763,15 @@ def import_specs(path: Path) -> list[tuple[str, int]]:
 
 
 def resolve_import(
-    source: Path, specifier: str, root: Path, source_files: Sequence[Path]
+    source: Path,
+    specifier: str,
+    root: Path,
+    source_files: Sequence[Path],
+    relative_files: Mapping[str, Path] | None = None,
+    names: Mapping[str, Sequence[str]] | None = None,
 ) -> str | None:
-    relative_files = {normalize_path(path, root): path for path in source_files}
+    if relative_files is None:
+        relative_files = {normalize_path(path, root): path for path in source_files}
     clean = (
         specifier.replace("::", "/").replace(".", "/")
         if not specifier.startswith(".")
@@ -6803,9 +6809,10 @@ def resolve_import(
     for candidate in candidate_strings:
         if candidate in relative_files:
             return candidate
+    pool = relative_files if names is None else names.get(clean.rsplit("/", 1)[-1], ())
     suffixes = [
         candidate
-        for candidate in relative_files
+        for candidate in pool
         if candidate.endswith("/" + clean)
         or candidate.endswith("/" + clean + Path(candidate).suffix)
     ]
@@ -7089,10 +7096,17 @@ def resolved_source_dependencies(
     root: Path, source_files: Sequence[Path]
 ) -> tuple[ResolvedDependency, ...]:
     result: set[ResolvedDependency] = set()
+    relative_files = {normalize_path(path, root): path for path in source_files}
+    names: dict[str, list[str]] = {}
+    for candidate in relative_files:
+        for key in {Path(candidate).name, Path(candidate).stem}:
+            names.setdefault(key, []).append(candidate)
     for source in source_files:
         source_name = normalize_path(source, root)
         for specifier, _line in import_specs(source):
-            target = resolve_import(source, specifier, root, source_files)
+            target = resolve_import(
+                source, specifier, root, source_files, relative_files, names
+            )
             if target:
                 result.add(ResolvedDependency(source_name, target))
     return tuple(sorted(result, key=lambda item: (item.source, item.target)))
@@ -7119,6 +7133,7 @@ def run_portable_source_gates(
         languages,
         resolved_source_dependencies(root, source_files),
         history,
+        script_root=root,
     )
 
     cognitive_limit = int(section.get("max_cognitive_complexity", 15))

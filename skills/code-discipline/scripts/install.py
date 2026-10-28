@@ -51,6 +51,7 @@ SKILL_FILES = (
     "scripts/quality",
     "scripts/repo_quality_gate.py",
     "scripts/smoke_check.py",
+    "scripts/ts_cognitive.mjs",
     "scripts/gherkin_check.py",
     "scripts/gherkin_yaml.py",
 )

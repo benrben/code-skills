@@ -1,6 +1,9 @@
 import dataclasses
 import importlib.util
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -127,6 +130,138 @@ def recursive(value):
         with mock.patch.object(analysis.ast, "parse", side_effect=error):
             result = analysis.analyze_python_complexity("broken.py", "ignored")
         self.assertEqual(result.message, "line 9")
+
+
+TYPESCRIPT_SAMPLE = """export function sumOfPrimes(max: number): number {
+  let total = 0;
+  outer: for (let i = 1; i <= max; ++i) {
+    for (let j = 2; j < i; ++j) {
+      if (i % j === 0) {
+        continue outer;
+      }
+    }
+    total += i;
+  }
+  return total;
+}
+export const pick = (a?: string, b?: string) => (a && b) || (a ? a : b);
+class Store {
+  load(x: number) {
+    try { if (x > 1) { return 1; } else if (x < 0) { return 2; } else { return 3; } }
+    catch (e) { return x > 0 && x < 5 && x !== 3 ? 1 : 0; }
+  }
+}
+"""
+VUE_SAMPLE = """<template><div>{{ a && b }}</div></template>
+<script setup lang="ts">
+const label = computed(() => {
+  switch (mode.value) { case 1: return 'a'; default: return 'b'; }
+});
+</script>
+"""
+
+
+def typescript_available(root):
+    node = shutil.which("node")
+    if node is None:
+        return False
+    probe = subprocess.run(
+        [node, "-e", "require('typescript')"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+class ScriptComplexityTests(unittest.TestCase):
+    def write_project(self, root):
+        (root / "package.json").write_text("{}", encoding="utf-8")
+        (root / "a.ts").write_text(TYPESCRIPT_SAMPLE, encoding="utf-8")
+        (root / "C.vue").write_text(VUE_SAMPLE, encoding="utf-8")
+        (root / "bad.ts").write_text("const = ;\n", encoding="utf-8")
+
+    def test_typescript_and_vue_scores_follow_cognitive_rules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_project(root)
+            if not typescript_available(root):
+                self.skipTest("node with a resolvable typescript package is required")
+            result = analysis.analyze_script_complexity(
+                root, ["a.ts", "C.vue", "bad.ts", "README.md"]
+            )
+
+        scores = {
+            (item.path, function.name): (
+                function.cognitive_complexity,
+                function.max_nesting,
+            )
+            for item in result.values()
+            for function in item.functions
+        }
+        self.assertEqual(scores[("a.ts", "sumOfPrimes")], (7, 3))
+        self.assertEqual(scores[("a.ts", "pick")], (3, 1))
+        self.assertEqual(scores[("a.ts", "Store.load")], (6, 2))
+        self.assertEqual(scores[("C.vue", "computed(callback)")], (1, 1))
+        self.assertEqual(result["bad.ts"].status, "parse_error")
+        self.assertNotIn("README.md", result)
+
+    def test_missing_helper_or_node_keeps_scripts_unsupported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = analysis.analyze_script_complexity(
+                root, ["a.ts"], helper=root / "absent.mjs"
+            )
+            with mock.patch.object(analysis.shutil, "which", return_value=None):
+                no_node = analysis.analyze_script_complexity(root, ["b.vue"])
+
+        self.assertEqual(missing["a.ts"].status, "unsupported")
+        self.assertIn("needs absent.mjs", missing["a.ts"].message)
+        self.assertEqual(no_node["b.vue"].status, "unsupported")
+        self.assertIn("Node.js", no_node["b.vue"].message)
+        self.assertEqual(analysis.analyze_script_complexity(Path("."), ["x.py"]), {})
+
+    def test_helper_failures_and_timeouts_keep_scripts_unsupported(self):
+        helper = Path(__file__)
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="boom\nlast line")
+        silent = subprocess.CompletedProcess([], 2, stdout="", stderr="")
+        timeout = subprocess.TimeoutExpired(["node"], 600)
+        outcomes = {}
+        with mock.patch.object(analysis.shutil, "which", return_value="/bin/node"):
+            for label, effect in (
+                ("failed", [failed]),
+                ("silent", [silent]),
+                ("timeout", timeout),
+            ):
+                with mock.patch.object(analysis.subprocess, "run", side_effect=effect):
+                    result = analysis.analyze_script_complexity(
+                        Path("."), ["a.ts"], helper
+                    )
+                outcomes[label] = result["a.ts"]
+
+        self.assertTrue(all(item.status == "unsupported" for item in outcomes.values()))
+        self.assertIn("helper failed: last line", outcomes["failed"].message)
+        self.assertIn("helper failed: no output", outcomes["silent"].message)
+        self.assertIn("helper timed out after 600 seconds", outcomes["timeout"].message)
+
+    def test_portable_sources_use_script_results_only_with_a_root(self):
+        sources = {"a.ts": "export const x = 1;\n", "m.py": "def f():\n    return 1\n"}
+        measured = analysis.SourceComplexity("a.ts", "typescript", "supported", ())
+        with mock.patch.object(
+            analysis, "analyze_script_complexity", return_value={"a.ts": measured}
+        ) as adapter:
+            with_root = analysis.analyze_portable_sources(
+                sources, script_root=Path(".")
+            )
+            without_root = analysis.analyze_portable_sources(sources)
+
+        by_path = {item.path: item.status for item in with_root.complexity}
+        self.assertEqual(by_path, {"a.ts": "supported", "m.py": "supported"})
+        self.assertEqual(adapter.call_count, 1)
+        self.assertEqual(
+            {item.path: item.status for item in without_root.complexity}["a.ts"],
+            "unsupported",
+        )
 
 
 class DuplicationTests(unittest.TestCase):

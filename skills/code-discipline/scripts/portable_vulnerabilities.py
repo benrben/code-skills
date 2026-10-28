@@ -31,7 +31,6 @@ KNOWN_UNSUPPORTED = {
     "gradle.lockfile",
     "mix.lock",
     "pdm.lock",
-    "pnpm-lock.yaml",
     "pubspec.lock",
     "renv.lock",
     "stack.yaml.lock",
@@ -304,6 +303,54 @@ def _gemfile_item(match: re.Match[str] | None, source: str) -> LockedPackage | N
     return _locked("RubyGems", match.group(1), match.group(2), source)
 
 
+PNPM_PACKAGE_KEY = re.compile(
+    r"^  /?['\"]?(?P<name>(?:@[^/@\s]+/)?[^/@\s'\"]+)[@/](?P<version>\d[^(:'\"\s]*)(?:\([^:]*\))?['\"]?:\s*$"
+)
+
+
+PUBLIC_NPM_REGISTRY = "registry.npmjs.org"
+NPMRC_SCOPED_REGISTRY = re.compile(r"^\s*(@[^:\s]+):registry\s*=\s*(\S+)")
+
+
+def _private_npm_scopes(directory: Path) -> set[str]:
+    """Scopes `.npmrc` routes to a non-public registry; OSV has no data and must not see their names."""
+    npmrc = directory / ".npmrc"
+    if not npmrc.is_file():
+        return set()
+    matches = (
+        NPMRC_SCOPED_REGISTRY.match(line)
+        for line in npmrc.read_text(encoding="utf-8").splitlines()
+    )
+    return {
+        match.group(1)
+        for match in matches
+        if match and PUBLIC_NPM_REGISTRY not in match.group(2)
+    }
+
+
+def _pnpm_package(
+    line: str, source: str, private_scopes: set[str]
+) -> LockedPackage | None:
+    match = PNPM_PACKAGE_KEY.match(line)
+    if match is None or match.group("name").split("/")[0] in private_scopes:
+        return None
+    return _locked("npm", match.group("name"), match.group("version"), source)
+
+
+def _pnpm_lock(path: Path, root: Path) -> list[LockedPackage]:
+    """Read registry versions from the top-level `packages:` map (lockfile v6-v9)."""
+    source = _relative(path, root)
+    private_scopes = _private_npm_scopes(path.parent)
+    packages: list[LockedPackage] = []
+    in_packages = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith(" "):
+            in_packages = line.rstrip() == "packages:"
+        elif in_packages and (item := _pnpm_package(line, source, private_scopes)):
+            packages.append(item)
+    return packages
+
+
 LOCKFILE_PARSERS: dict[str, Callable[[Path, Path], list[LockedPackage]]] = {
     "Cargo.lock": _cargo_lock,
     "Gemfile.lock": _gemfile,
@@ -311,6 +358,7 @@ LOCKFILE_PARSERS: dict[str, Callable[[Path, Path], list[LockedPackage]]] = {
     "composer.lock": _composer,
     "go.mod": _go_mod,
     "package-lock.json": _package_lock,
+    "pnpm-lock.yaml": _pnpm_lock,
     "packages.lock.json": _nuget,
     "poetry.lock": _python_toml_lock,
     "pylock.toml": _python_toml_lock,
