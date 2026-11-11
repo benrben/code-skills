@@ -12,7 +12,10 @@ import shlex
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, TextIO, TypeGuard
+from typing import TYPE_CHECKING, Any, TextIO
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeGuard
 
 from gate_types import NOT_APPLICABLE, PASS, plural
 from quality_config import QUALITY_DIRECTORY, REPORT_NAME, STATE_NAME

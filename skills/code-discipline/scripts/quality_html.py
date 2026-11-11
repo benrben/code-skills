@@ -10,7 +10,7 @@ import dataclasses
 import html
 from collections.abc import Sequence
 
-from gate_types import BLOCKED, FAIL, NOT_APPLICABLE, PASS, GateItem
+from gate_types import BLOCKED, FAIL, NOT_APPLICABLE, PASS, GateItem, plural
 from quality_model import GateRun
 
 MAX_ITEMS_PER_GATE = 200
@@ -107,13 +107,12 @@ def _overview(rows: Sequence[GateRun]) -> str:
 def _headline(outcome: GateRun) -> str:
     """A short number for the tile: issues, or the main measurement."""
     measurements = outcome.measurements
-    for key, suffix in (
-        ("line_coverage_percent", "% of lines"),
-        ("executed", " tests ran"),
-    ):
-        value = measurements.get(key)
-        if isinstance(value, (int, float)):
-            return f"{value:g}{suffix}"
+    coverage = measurements.get("line_coverage_percent")
+    if isinstance(coverage, (int, float)):
+        return f"{coverage:g}% of lines"
+    executed = measurements.get("executed")
+    if isinstance(executed, int):
+        return plural(executed, "test") + " ran"
     if outcome.items:
         noun = "issue" if len(outcome.items) == 1 else "issues"
         return f"{len(outcome.items)} {noun}"

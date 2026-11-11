@@ -1,5 +1,7 @@
 """The installer packages exactly the skill files and updates installs safely."""
 
+from __future__ import annotations
+
 import contextlib
 import io
 import json

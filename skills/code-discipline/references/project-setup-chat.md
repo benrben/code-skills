@@ -169,7 +169,7 @@ initialize missing files with the configuration-only entrypoint:
 python3 <skill-directory>/scripts/quality_loop.py --root PROJECT --init
 ```
 
-Use a Python 3.10+ interpreter. This command creates configuration templates
+Use a Python 3.9+ interpreter. This command creates configuration templates
 without running checks or asking questions and refuses to overwrite existing
 files. When files already exist, edit only the requested project settings; do
 not initialize over them. Save the chosen policy before running the first

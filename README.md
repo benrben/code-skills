@@ -5,7 +5,7 @@ an agent finishes a change, ten generic quality gates judge that change and
 send every failure back into its loop, with no project setup for common
 languages. First-time [guided setup](skills/code-discipline/references/project-setup-chat.md)
 explains gates and limits in chat; saved choices are reused, and disabled gates
-stay OFF. The launcher uses Python 3.10+ or downloads a pinned runtime; it
+stay OFF. The launcher uses Python 3.9+ or downloads a pinned runtime; it
 never installs project dependencies.
 
 ## The workflow the skill enforces

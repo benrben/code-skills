@@ -24,7 +24,7 @@ KNOWN_UNSUPPORTED = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class LockedPackage:
     ecosystem: str
     name: str
@@ -38,13 +38,13 @@ class LockedPackage:
         return (self.ecosystem, self.name, self.version)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class VulnerabilityFinding:
     vulnerability_id: str
     package: LockedPackage
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class LockfileReading:
     """The packages read from one lockfile, and whether the file visibly lists
     dependencies. A file that lists dependencies but yields no packages was not
@@ -538,7 +538,7 @@ def _findings_for_batch(
 ) -> list[VulnerabilityFinding]:
     return [
         VulnerabilityFinding(identifier, package)
-        for package, result in zip(batch, results, strict=False)
+        for package, result in zip(batch, results)
         for identifier in _vulnerability_ids(result)
     ]
 

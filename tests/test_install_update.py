@@ -1,5 +1,7 @@
 """Updates hand off to a newer installer and refresh every registered install."""
 
+from __future__ import annotations
+
 import contextlib
 import io
 import json

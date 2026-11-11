@@ -13,7 +13,7 @@ import dataclasses
 import math
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from diff_scope import ChangeSet
 from gate_complexity_indent import INDENT_NESTING_SUFFIXES
@@ -36,7 +36,7 @@ REPORT_ROWS = 20
 
 # Coverage of the lines from ``start`` to ``end`` of ``path`` as a percentage
 # (0..100), or None when the coverage report has no data for them.
-CoverageLookup = Callable[[str, int, int], float | None]
+CoverageLookup = Callable[[str, int, int], Optional[float]]
 
 
 def crap_score(cyclomatic: int, coverage_percent: float) -> float:

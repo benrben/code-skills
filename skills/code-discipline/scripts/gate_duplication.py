@@ -233,12 +233,12 @@ def _candidate_pairs(
         yield from itertools.combinations(occurrences, 2)
         return
     firsts: list[_Occurrence] = [occurrences[0]]
-    for previous, current in itertools.pairwise(occurrences):
+    for previous, current in zip(occurrences, occurrences[1:]):
         if previous.stream == current.stream:
             yield previous, current
         else:
             firsts.append(current)
-    yield from itertools.pairwise(firsts)
+    yield from zip(firsts, firsts[1:])
 
 
 class _MatchFinder:

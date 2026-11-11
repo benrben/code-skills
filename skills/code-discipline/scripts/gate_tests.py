@@ -407,7 +407,7 @@ def _measurements(
 
 def _counts_text(execution: TestExecution) -> str:
     return (
-        f"{execution.executed} tests ran ({execution.parser}): "
+        f"{plural(execution.executed, 'test')} ran ({execution.parser}): "
         f"{execution.passed} passed, {execution.failed} failed, "
         f"{execution.skipped} skipped, {execution.deselected} deselected"
     )

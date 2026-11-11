@@ -21,6 +21,7 @@ import dataclasses
 import re
 from collections import Counter
 from collections.abc import Callable
+from typing import Optional
 
 UNKNOWN_PARSER = "unknown"
 
@@ -105,9 +106,7 @@ def summary_counts(text: str) -> Counter[str]:
 def column_sums(rows: list[tuple[str, ...]]) -> list[int]:
     """Add up each regex group over every match; an absent optional group
     counts as 0."""
-    return [
-        sum(int(value or 0) for value in column) for column in zip(*rows, strict=True)
-    ]
+    return [sum(int(value or 0) for value in column) for column in zip(*rows)]
 
 
 def summed_rows(pattern: re.Pattern[str], text: str) -> list[int] | None:
@@ -130,7 +129,7 @@ def parts_execution(
     )
 
 
-Parser = Callable[[str], TestExecution | None]
+Parser = Callable[[str], Optional[TestExecution]]
 Fields = Callable[[list[int]], dict[str, int]]
 
 

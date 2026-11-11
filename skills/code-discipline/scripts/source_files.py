@@ -106,6 +106,9 @@ EXTENSION_LANGUAGES = {
 # here: committed scripts in ``bin/`` are production code.
 DEFAULT_EXCLUDED_DIRS = frozenset(
     {
+        # Agent tooling, including this skill when installed in a repository.
+        ".agents",
+        ".claude",
         ".git",
         ".hg",
         ".svn",

@@ -1,5 +1,7 @@
 """A local install is complete, project-scoped, and hands off to chat setup."""
 
+from __future__ import annotations
+
 import contextlib
 import io
 import json

@@ -19,7 +19,7 @@ command_path() {
 }
 
 compatible_python() {
-    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' \
         >/dev/null 2>&1
 }
 
@@ -221,7 +221,7 @@ fi
 
 [ -x "$managed_python" ] || fail "uv returned a non-executable Python: $managed_python"
 compatible_python "$managed_python" || \
-    fail "uv-managed Python is older than 3.10: $managed_python"
+    fail "uv-managed Python is older than 3.9: $managed_python"
 
 exec "$managed_python" "$quality_loop" "$@"
 fail "failed to start quality loop with uv-managed Python"

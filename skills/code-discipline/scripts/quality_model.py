@@ -70,7 +70,7 @@ class GateRun(GateOutcome):
     """One gate in one run: its outcome, or why it did not run, and how long
     it took. ``seconds`` is keyword-only."""
 
-    seconds: float | None = dataclasses.field(default=None, kw_only=True)
+    seconds: float | None = None
 
     @classmethod
     def from_outcome(cls, outcome: GateOutcome, seconds: float | None) -> GateRun:

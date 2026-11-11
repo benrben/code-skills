@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 import sys
 import tempfile
@@ -77,12 +79,27 @@ class DiscoveryTests(unittest.TestCase):
             write(root, "node_modules/x/index.js")
             write(root, ".quality/state.json", "{}")
             write(root, "dist/bundle.js")
+            write(root, ".agents/skills/code-discipline/scripts/gate_types.py")
+            write(root, ".claude/skills/code-discipline/scripts/gate_types.py")
             with mock.patch.object(source_files.shutil, "which", return_value=None):
                 found = sorted(
                     source_files.normalize_path(path, root)
                     for path in source_files.walk_files(root)
                 )
             self.assertEqual(found, ["bin/cli.py", "src/a.py"])
+
+    def test_an_installed_skill_is_not_part_of_the_repository_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            write(root, "app/calc.py")
+            write(root, ".agents/skills/code-discipline/scripts/quality_loop.py")
+            write(root, ".claude/settings.json", "{}")
+            found = sorted(
+                source_files.normalize_path(path, root)
+                for path in source_files.walk_files(root)
+            )
+            self.assertEqual(found, ["app/calc.py"])
 
     def test_walk_with_git_honours_ignore_rules(self):
         with tempfile.TemporaryDirectory() as directory:

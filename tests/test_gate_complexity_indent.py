@@ -1,5 +1,7 @@
 """Nesting from indentation for languages lizard's counter treats as flat."""
 
+from __future__ import annotations
+
 import sys
 import unittest
 from pathlib import Path

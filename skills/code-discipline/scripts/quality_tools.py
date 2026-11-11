@@ -18,6 +18,7 @@ import sys
 import sysconfig
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -58,9 +59,11 @@ for name in sys.argv[1:]:
 print(json.dumps(found))
 """
 
-CommandFn = Callable[[Sequence[str], Path, int, Mapping[str, str] | None], CommandRun]
+CommandFn = Callable[
+    [Sequence[str], Path, int, Optional[Mapping[str, str]]], CommandRun
+]
 Download = Callable[[str], bytes]
-Which = Callable[[str], str | None]
+Which = Callable[[str], Optional[str]]
 
 
 @dataclasses.dataclass(frozen=True)

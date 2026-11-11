@@ -11,7 +11,7 @@ Run from the target repository root, in the foreground, and read its exit code:
 ```
 
 The POSIX launcher supports macOS and Linux on x86_64 and arm64. It uses an
-existing Python 3.10+ or downloads pinned, checksum-verified `uv` and a managed
+existing Python 3.9+ or downloads pinned, checksum-verified `uv` and a managed
 Python into the user cache. This bootstrap owns only quality tools. The gate
 never installs or restores project dependencies. It applies offline/no-sync
 settings to project commands, uses offline or no-restore modes for inferred

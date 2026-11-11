@@ -1,5 +1,7 @@
 """`--init` writes configuration only: no checks, no questions, no overwrites."""
 
+from __future__ import annotations
+
 import argparse
 import contextlib
 import io

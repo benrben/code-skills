@@ -1,5 +1,7 @@
 """One quality loop at a time per repository, on POSIX and Windows locks."""
 
+from __future__ import annotations
+
 import errno
 import json
 import os

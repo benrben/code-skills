@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import sys
 import tempfile
@@ -658,7 +660,7 @@ class ExitStatusTests(unittest.TestCase):
 
 class ShellParsingTests(unittest.TestCase):
     def test_tokens_keep_quoted_operators_as_words(self):
-        tokens = shell.tokenize("a '|| true' \"x;y\" b\;c $(d || e) 2>&1 # note")
+        tokens = shell.tokenize("a '|| true' \"x;y\" b\\;c $(d || e) 2>&1 # note")
         self.assertEqual(
             [(token.text, token.operator) for token in tokens],
             [

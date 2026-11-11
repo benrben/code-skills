@@ -9,12 +9,14 @@ their imports) and the bundled thresholds into the scripts folder.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
@@ -149,8 +151,26 @@ def local_imports(source: str, filename: str) -> set[str]:
         raise ValueError(
             f"downloaded {filename} is not valid Python: {error}"
         ) from error
-    standard = {*sys.stdlib_module_names, "__future__"}
-    return {name for name in _imported_names(tree) if name not in standard}
+    return {name for name in _imported_names(tree) if not is_standard_module(name)}
+
+
+def is_standard_module(name: str) -> bool:
+    """True for a standard-library module. Python 3.9 has no
+    ``sys.stdlib_module_names``, so there a module counts as standard when it
+    is built in or loads from the standard library folder."""
+    if name == "__future__" or name in sys.builtin_module_names:
+        return True
+    names: frozenset[str] | None = getattr(sys, "stdlib_module_names", None)
+    if names is not None:
+        return name in names
+    spec = importlib.util.find_spec(name)
+    origin = spec.origin if spec is not None else None
+    stdlib = sysconfig.get_paths()["stdlib"]
+    return (
+        bool(origin)
+        and str(origin).startswith(stdlib)
+        and ("site-packages" not in str(origin))
+    )
 
 
 def _imported_names(tree: ast.AST) -> set[str]:

@@ -34,9 +34,7 @@ def _suffix_score(report_parts: list[str], repo_parts: list[str]) -> int:
 def _common_tail(report_parts: list[str], repo_parts: list[str]) -> int:
     """How many trailing segments the two paths share."""
     count = 0
-    for report_part, repo_part in zip(
-        reversed(report_parts), reversed(repo_parts), strict=False
-    ):
+    for report_part, repo_part in zip(reversed(report_parts), reversed(repo_parts)):
         if report_part != repo_part:
             break
         count += 1

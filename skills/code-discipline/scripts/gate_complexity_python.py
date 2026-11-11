@@ -22,8 +22,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 from collections.abc import Iterator, Mapping
+from typing import Union
 
-DefinitionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+DefinitionNode = Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda]
 
 
 @dataclasses.dataclass(frozen=True)

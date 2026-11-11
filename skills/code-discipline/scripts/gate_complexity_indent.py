@@ -52,9 +52,7 @@ def indent_unit(widths: Sequence[int]) -> int:
     """The usual indentation step: the most common positive increase from
     one line to the next (aligned continuation lines are rarer)."""
     steps = Counter(
-        after - before
-        for before, after in zip(widths, widths[1:], strict=False)
-        if after > before
+        after - before for before, after in zip(widths, widths[1:]) if after > before
     )
     if not steps:
         return 1
@@ -72,7 +70,7 @@ def measure_indent_nesting(lines: Sequence[str]) -> IndentNesting:
     unit = indent_unit(widths)
     depths = [
         max(0, round((width - base) / unit))
-        for line, width in zip(code, widths, strict=False)
+        for line, width in zip(code, widths)
         if _is_control_line(line)
     ]
     if not depths:
