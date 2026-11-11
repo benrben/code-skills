@@ -262,7 +262,7 @@ class UnreadableFileTests(RepositoryTestCase):
         ):
             outcome = self.evaluate([path], diff_scope.repository_changes())
         self.assertEqual("blocked", outcome.status)
-        self.assertEqual("Could not read 1 production file(s): a.py.", outcome.summary)
+        self.assertEqual("Could not read 1 production file: a.py.", outcome.summary)
         self.assertEqual(["Could not read a.py: Permission denied"], outcome.details)
         self.assertEqual(["a.py"], outcome.measurements["unreadable"])
 

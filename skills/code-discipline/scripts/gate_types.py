@@ -8,12 +8,8 @@ independent of the orchestrator.
 from __future__ import annotations
 
 import dataclasses
-import os
-import subprocess
 import sys
-import time
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any, Literal, Protocol
 
 # Gates return the first four. A run also records gates it did not run:
@@ -71,10 +67,6 @@ class GateOutcome:
     @property
     def blocked(self) -> bool:
         return self.status == BLOCKED
-
-    @property
-    def applicable(self) -> bool:
-        return self.status != NOT_APPLICABLE
 
 
 def plural(count: int, noun: str, many: str | None = None) -> str:
@@ -162,37 +154,3 @@ class ToolPython:
 
     executable: str = sys.executable
     env: Mapping[str, str] = dataclasses.field(default_factory=dict)
-
-
-def subprocess_runner(root: Path) -> Runner:
-    """A plain runner for tests and standalone use."""
-
-    def run(
-        command: Sequence[str],
-        timeout_seconds: int,
-        env: Mapping[str, str] | None = None,
-    ) -> CommandRun:
-        started = time.monotonic()
-        try:
-            result = subprocess.run(
-                list(command),
-                cwd=root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, **(env or {})},
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            output = error.stdout or b""
-            text = output.decode("utf-8", errors="replace")
-            elapsed = time.monotonic() - started
-            return CommandRun(tuple(command), 124, text, elapsed, timed_out=True)
-        except OSError as error:
-            elapsed = time.monotonic() - started
-            return CommandRun(tuple(command), 127, str(error), elapsed)
-        text = result.stdout.decode("utf-8", errors="replace")
-        elapsed = time.monotonic() - started
-        return CommandRun(tuple(command), result.returncode, text, elapsed)
-
-    return run

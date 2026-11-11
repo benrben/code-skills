@@ -178,15 +178,6 @@ def scan_lines(lines: Iterable[str]) -> list[tuple[str, int]]:
     return sorted(findings, key=lambda finding: (finding[1], _KIND_ORDER[finding[0]]))
 
 
-def scan_text(text: str) -> list[tuple[str, int]]:
-    """Every ``(kind, line number)`` found in ``text``; never the matched value.
-
-    Lines are split on ``\\n`` only, so numbers match Git, grep and editors
-    even when the text holds form feeds or Unicode line separators.
-    """
-    return scan_lines(text.split("\n"))
-
-
 def scan_file(path: Path) -> list[tuple[str, int]]:
     """Scan one file of any encoding or size; raises ``OSError`` when it
     cannot be read."""

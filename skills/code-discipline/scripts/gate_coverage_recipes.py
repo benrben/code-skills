@@ -576,15 +576,3 @@ def plan_coverage(
     if builder is None:
         return f"no coverage recipe for `{shlex.join(command)}`"
     return builder(plan)
-
-
-def coverage_recipe(
-    root: Path,
-    test_command: Sequence[str],
-    out_dir: Path,
-    tools: CoverageTools,
-    configured: Mapping[str, Any] | None = None,
-) -> Recipe | None:
-    """The recipe, or None; ``plan_coverage`` explains a None."""
-    plan = plan_coverage(root, test_command, out_dir, tools, configured)
-    return plan if isinstance(plan, Recipe) else None

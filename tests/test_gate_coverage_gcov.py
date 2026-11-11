@@ -284,7 +284,7 @@ class CollectTests(unittest.TestCase):
             self.assertEqual(collect.main(arguments, tools.run, missing), 1)
             self.assertEqual(collect.main([], tools.run, tools.which), 2)
         lines = printed.getvalue().splitlines()
-        self.assertTrue(lines[0].startswith("wrote 2 gcov report(s)"))
+        self.assertTrue(lines[0].startswith("wrote 2 gcov reports"))
         self.assertEqual(lines[1:], ["gcov is not on PATH", USAGE])
 
     def test_run_tool_reports_a_tool_that_cannot_start(self) -> None:

@@ -14,7 +14,7 @@ import gate_tests  # noqa: E402
 import gate_tests_command  # noqa: E402
 import gate_tests_parsers  # noqa: E402
 import gate_tests_parsers_other  # noqa: E402
-import gate_types  # noqa: E402
+import quality_commands  # noqa: E402
 from gate_types import CommandRun  # noqa: E402
 
 # Recorded runner output, trimmed to the lines around each summary.
@@ -690,7 +690,7 @@ class Sample(unittest.TestCase):
             root = Path(temporary)
             (root / "test_sample.py").write_text(self.SUITE, encoding="utf-8")
             command = [sys.executable, "-m", "unittest", "discover", "-s", "."]
-            run = gate_types.subprocess_runner(root)(command, 60)
+            run = quality_commands.runner_for(root)(command, 60)
         execution = gate_tests.parse_test_execution(run.output)
         self.assertEqual(run.returncode, 1)
         self.assertEqual(
@@ -853,7 +853,7 @@ class EvaluateTestsTests(unittest.TestCase):
         self.assertEqual(item.metric, "skipped/deselected tests")
         self.assertIn("including 1 expected failures", item.value)
         self.assertIn("3 deselected or filtered out", item.value)
-        self.assertIn("broke 1 threshold(s)", outcome.summary)
+        self.assertIn("broke 1 threshold:", outcome.summary)
 
     def test_skip_value_without_expected_failures(self):
         outcome = self.evaluate(run_of("ok"), execution_of(executed=2, skipped=1))

@@ -22,7 +22,8 @@ import gate_coverage_programs as programs  # noqa: E402
 import gate_coverage_python as python_finder  # noqa: E402
 import gate_coverage_readers as readers  # noqa: E402
 import gate_coverage_recipes as recipes  # noqa: E402
-from gate_types import FunctionInfo, ToolPython, subprocess_runner  # noqa: E402
+from gate_types import FunctionInfo, ToolPython  # noqa: E402
+from quality_commands import runner_for  # noqa: E402
 
 # --- Recorded sample reports -------------------------------------------------
 
@@ -798,7 +799,7 @@ class PythonRecipeTests(RecipeTestCase):
         command = (python, "-m", "unittest", "discover", "-s", "tests", "-t", ".")
         recipe = self.recipe(*command, tools=tools, environ={"PYTHONPATH": "src"})
         recipes.prepare_recipe(recipe)
-        run = subprocess_runner(self.root)
+        run = runner_for(self.root)
         for step in (*recipe.setup, recipe.command):
             result = run(step, 120, recipe.env)
             self.assertEqual(result.returncode, 0, result.output)
@@ -852,7 +853,7 @@ class PythonRecipeTests(RecipeTestCase):
         )
         recipe = self.recipe(*command, environ={"PYTHONPATH": "src"})
         recipes.prepare_recipe(recipe)
-        run = subprocess_runner(self.root)
+        run = runner_for(self.root)
         for step in (*recipe.setup, recipe.command):
             result = run(step, 120, recipe.env)
             self.assertEqual(result.returncode, 0, result.output)
@@ -1040,11 +1041,9 @@ class OtherLanguageRecipeTests(RecipeTestCase):
     def test_unknown_and_empty_commands_explain_what_is_missing(self):
         self.assertIn("no coverage recipe", self.plan("ctest"))
         self.assertIn("no test command", self.plan())
-        self.assertIsNone(
-            recipes.coverage_recipe(self.root, ["ctest"], self.out, self.tools)
-        )
-        self.assertIsNotNone(
-            recipes.coverage_recipe(self.root, ["go", "test"], self.out, self.tools)
+        self.assertIsInstance(
+            recipes.plan_coverage(self.root, ["go", "test"], self.out, self.tools),
+            recipes.Recipe,
         )
 
     def test_windows_executable_suffixes_are_ignored(self):

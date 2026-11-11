@@ -102,23 +102,6 @@ EXTENSION_LANGUAGES = {
     ".vue": "Vue",
 }
 
-MANIFEST_LANGUAGES = {
-    "pyproject.toml": "Python",
-    "setup.py": "Python",
-    "requirements.txt": "Python",
-    "package.json": "JavaScript/TypeScript",
-    "go.mod": "Go",
-    "Cargo.toml": "Rust",
-    "Gemfile": "Ruby",
-    "composer.json": "PHP",
-    "pom.xml": "Java",
-    "build.gradle": "Java/Kotlin",
-    "build.gradle.kts": "Java/Kotlin",
-    "Package.swift": "Swift",
-    "mix.exs": "Elixir",
-    "pubspec.yaml": "Dart",
-}
-
 # Third-party code, tool caches, and generated build output. ``bin`` is not
 # here: committed scripts in ``bin/`` are production code.
 DEFAULT_EXCLUDED_DIRS = frozenset(

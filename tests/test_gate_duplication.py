@@ -271,6 +271,10 @@ def raw(kind: str, value: str, line: int) -> RawToken:
     return RawToken(f"Token.{kind}", value, line)
 
 
+def is_import_line(line: list[RawToken]) -> bool:
+    return gate_duplication_tokens.import_span(line) is not None
+
+
 def tokens(texts: str, first_line: int = 1, per_line: int = 10) -> list[Token]:
     words = texts.split()
     return [
@@ -359,7 +363,7 @@ class NormalizationTests(unittest.TestCase):
         for label, (words, expected) in cases.items():
             with self.subTest(label):
                 line = [raw("Keyword", word, 1) for word in words]
-                self.assertIs(gate_duplication_tokens.is_import_line(line), expected)
+                self.assertIs(is_import_line(line), expected)
 
     def test_swift_attribute_before_import_is_skipped(self) -> None:
         line = [
@@ -368,18 +372,16 @@ class NormalizationTests(unittest.TestCase):
             raw("Keyword.Declaration", "import", 1),
             raw("Name.Class", "Foo", 1),
         ]
-        self.assertTrue(gate_duplication_tokens.is_import_line(line))
+        self.assertTrue(is_import_line(line))
 
     def test_attribute_without_a_name_is_not_skipped(self) -> None:
         line = [raw("Punctuation", "@", 1), raw("Punctuation", "(", 1)]
-        self.assertFalse(gate_duplication_tokens.is_import_line(line))
-        self.assertFalse(
-            gate_duplication_tokens.is_import_line([raw("Name", "pub", 1)])
-        )
+        self.assertFalse(is_import_line(line))
+        self.assertFalse(is_import_line([raw("Name", "pub", 1)]))
 
     def test_unclosed_modifier_group_is_not_an_import(self) -> None:
         line = [raw("Keyword", "pub", 1), raw("Punctuation", "(", 1)]
-        self.assertFalse(gate_duplication_tokens.is_import_line(line))
+        self.assertFalse(is_import_line(line))
 
     def test_loader_call_with_one_string_is_an_import(self) -> None:
         php = [
@@ -393,7 +395,7 @@ class NormalizationTests(unittest.TestCase):
             gate_duplication_tokens.ImportSpan(4, 0),
         )
         dynamic = [raw("Keyword", "require", 1), raw("Punctuation", "(", 1)]
-        self.assertFalse(gate_duplication_tokens.is_import_line(dynamic))
+        self.assertFalse(is_import_line(dynamic))
 
     def test_code_after_an_import_on_the_same_line_is_kept(self) -> None:
         result = gate_duplication_tokens.normalize_tokens(
@@ -456,11 +458,11 @@ class NormalizationTests(unittest.TestCase):
 
     def test_export_of_a_string_is_an_import(self) -> None:
         line = [raw("Keyword", "export", 1), raw("Literal.String", "'a.dart'", 1)]
-        self.assertTrue(gate_duplication_tokens.is_import_line(line))
+        self.assertTrue(is_import_line(line))
 
     def test_import_word_as_a_literal_is_not_an_import(self) -> None:
         line = [raw("Literal.String", "import", 1), raw("Punctuation", ")", 1)]
-        self.assertFalse(gate_duplication_tokens.is_import_line(line))
+        self.assertFalse(is_import_line(line))
 
 
 class WindowHashTests(unittest.TestCase):

@@ -152,15 +152,6 @@ def migrate_thresholds(old: Mapping[str, Any]) -> dict[str, Any]:
     return migrated
 
 
-def sync_thresholds_file(path: Path) -> bool:
-    """Rewrite an older thresholds file as schema 3. True when it changed."""
-    loaded = _read_json_object(path, "thresholds")
-    if loaded.get("schema_version") == THRESHOLDS_SCHEMA_VERSION:
-        return False
-    write_json_atomic(path, load_thresholds(path))
-    return True
-
-
 def validate_thresholds(thresholds: Mapping[str, Any]) -> None:
     """Raise ValueError unless ``thresholds`` is a complete schema 3 document."""
     _check_keys("thresholds", thresholds, {"schema_version", *THRESHOLD_RULES})

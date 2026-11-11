@@ -340,11 +340,6 @@ def _bracket_balance(tokens: Sequence[RawToken]) -> int:
     return balance
 
 
-def is_import_line(tokens: Sequence[RawToken]) -> bool:
-    """True when a line starts with a dependency declaration."""
-    return import_span(tokens) is not None
-
-
 def import_span(tokens: Sequence[RawToken]) -> ImportSpan | None:
     """The leading import statement of a line, or None when the line starts
     with code. Recognized: import keywords (after modifiers such as Rust

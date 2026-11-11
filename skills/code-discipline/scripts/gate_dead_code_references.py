@@ -16,6 +16,16 @@ import source_files
 
 _IDENTIFIER = re.compile(r"[\w$]+")
 
+C_FAMILY = frozenset({"C", "C/C++", "C++", "Objective-C"})
+# The words before a declared name: types, qualifiers, ``::`` scopes, pointer
+# and reference marks, and template brackets. No ``=``, ``(``, ``.``, ``->``.
+_C_DECLARATOR_PREFIX = re.compile(
+    r"(?:(?:~?[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)*(?:::)?|[*&<>,])\s*)+"
+)
+_C_STATEMENT_WORDS = frozenset(
+    "return else case goto throw delete new sizeof co_return co_yield co_await".split()
+)
+
 _NON_CODE_SUFFIXES = frozenset(
     {".md", ".markdown", ".rst", ".txt", ".adoc", ".asciidoc", ".org"}
     | {".csv", ".tsv", ".log", ".svg", ".map", ".lock", ".sum"}
@@ -38,6 +48,13 @@ class ReferenceIndex:
     counts: Counter[str]
     indexed_paths: frozenset[str]
     unreadable: tuple[str, ...] = ()
+    # name -> path -> occurrences on C-family declaration lines (prototypes),
+    # which name a function without calling it.
+    declarations: dict[str, Counter[str]] = dataclasses.field(default_factory=dict)
+
+    def declared_elsewhere(self, name: str, path: str) -> int:
+        found = self.declarations.get(name, Counter())
+        return sum(count for where, count in found.items() if where != path)
 
 
 def is_reference_path(relative: str) -> bool:
@@ -71,6 +88,35 @@ def name_position(text: str, name: str) -> int | None:
     return match.start() if match else None
 
 
+def is_c_declaration(line: str, name: str) -> bool:
+    """True when ``line`` declares ``name`` (``int f(int);``, ``static
+    char *f(void)``) rather than calling it (``f(x);``, ``y = f(x);``,
+    ``return f(x);``, ``Widget w(f(3));``, ``out << f(x);``)."""
+    position = name_position(line, name)
+    if position is None:
+        return False
+    prefix = line[:position].strip()
+    after = line[position + len(name) :].lstrip()
+    return (
+        after.startswith("(")
+        and bool(prefix)
+        and "<<" not in prefix
+        and prefix.split()[0] not in _C_STATEMENT_WORDS
+        and _C_DECLARATOR_PREFIX.fullmatch(prefix) is not None
+    )
+
+
+def _c_declarations(
+    text: str, wanted: frozenset[str], relative: str, into: dict[str, Counter[str]]
+) -> None:
+    for line in text.splitlines():
+        for name in set(identifiers(line)) & wanted:
+            if is_c_declaration(line, name):
+                into.setdefault(name, Counter())[relative] += identifiers(line).count(
+                    name
+                )
+
+
 def build_reference_index(
     root: Path, files: Iterable[Path], names: Iterable[str]
 ) -> ReferenceIndex:
@@ -84,6 +130,7 @@ def build_reference_index(
     counts: Counter[str] = Counter()
     indexed: set[str] = set()
     unreadable: list[str] = []
+    declarations: dict[str, Counter[str]] = {}
     for path in files:
         absolute = path if path.is_absolute() else root / path
         relative = source_files.normalize_path(absolute, root)
@@ -94,7 +141,11 @@ def build_reference_index(
             continue
         indexed.add(relative)
         counts.update(name for name in identifiers(text) if name in wanted)
-    return ReferenceIndex(counts, frozenset(indexed), tuple(sorted(unreadable)))
+        if source_files.language_for(relative) in C_FAMILY:
+            _c_declarations(text, wanted, relative, declarations)
+    return ReferenceIndex(
+        counts, frozenset(indexed), tuple(sorted(unreadable)), declarations
+    )
 
 
 def split_by_tests(root: Path, files: Sequence[Path]) -> tuple[list[Path], list[Path]]:

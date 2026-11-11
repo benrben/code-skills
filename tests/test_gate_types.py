@@ -19,15 +19,14 @@ class GateTypesTests(unittest.TestCase):
         self.assertEqual(bare.describe(), "a.py: lines 700 (limit 600)")
 
     def test_outcome_status_properties(self):
-        for status, passed, applicable, blocked in (
-            (gate_types.PASS, True, True, False),
-            (gate_types.NOT_APPLICABLE, True, False, False),
-            (gate_types.FAIL, False, True, False),
-            (gate_types.BLOCKED, False, True, True),
+        for status, passed, blocked in (
+            (gate_types.PASS, True, False),
+            (gate_types.NOT_APPLICABLE, True, False),
+            (gate_types.FAIL, False, False),
+            (gate_types.BLOCKED, False, True),
         ):
             outcome = gate_types.GateOutcome("k", "Title", status, "summary")
             self.assertEqual(outcome.passed, passed)
-            self.assertEqual(outcome.applicable, applicable)
             self.assertEqual(outcome.blocked, blocked)
 
     def test_outcome_for_items(self):
@@ -55,29 +54,6 @@ class FunctionInfoTests(unittest.TestCase):
         plain = gate_types.FunctionInfo("a.py", "run", "run", 1, 2)
         self.assertEqual(plain.bare_name, "run")
         self.assertEqual(plain.cyclomatic, 1)
-
-
-class SubprocessRunnerTests(unittest.TestCase):
-    def test_runner_reports_output_exit_code_timeout_and_missing_program(self):
-        run = gate_types.subprocess_runner(Path("."))
-        ok = run(
-            [sys.executable, "-c", "import os;print(os.environ['X'])"], 30, {"X": "1"}
-        )
-        self.assertTrue(ok.succeeded)
-        self.assertEqual(ok.output.strip(), "1")
-        failed = run([sys.executable, "-c", "raise SystemExit(3)"], 30)
-        self.assertEqual(failed.returncode, 3)
-        self.assertFalse(failed.succeeded)
-        slow = run(
-            [sys.executable, "-c", "import time;print('x',flush=True);time.sleep(5)"], 1
-        )
-        self.assertTrue(slow.timed_out)
-        self.assertEqual(slow.returncode, 124)
-        missing = run(["definitely-not-a-program-xyz"], 5)
-        self.assertEqual(missing.returncode, 127)
-
-    def test_tool_python_defaults_to_current_interpreter(self):
-        self.assertEqual(gate_types.ToolPython().executable, sys.executable)
 
 
 if __name__ == "__main__":

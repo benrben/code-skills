@@ -26,6 +26,7 @@ from typing import Any, Literal
 import source_files
 from diff_scope import ChangeSet
 from gate_dead_code_references import (
+    C_FAMILY,
     ReferenceIndex,
     build_reference_index,
     identifiers,
@@ -78,7 +79,7 @@ _DECORATOR_LOOKBACK = 10
 _STATEMENT_ENDINGS = (";", "{", "}", ":")
 
 # C declarations may put ``static int`` on the line above the name (GNU style).
-_C_FAMILY = frozenset({"C", "C/C++", "C++", "Objective-C"})
+_C_FAMILY = C_FAMILY
 _SIGNATURE_LOOKBACK = 3
 _NOT_SIGNATURE_START = ("#", "//", "/*", "*")
 
@@ -337,10 +338,11 @@ def reference_count(
     """Occurrences of the function's name outside the function itself.
 
     Mentions inside its own body (recursion, a docstring) and other
-    declarations in its own file (a prototype, an overload) are not callers.
+    declarations in its own file (a prototype, an overload) are not callers,
+    and neither are C-family prototypes in other files (a header).
     """
     name = search_name(function)
-    total = index.counts.get(name, 0)
+    total = index.counts.get(name, 0) - index.declared_elsewhere(name, function.path)
     if function.path not in index.indexed_paths:
         return total
     own_lines = lines[function.start_line - 1 : function.end_line]
@@ -467,7 +469,7 @@ def _outcome(
         KEY,
         TITLE,
         items,
-        _passing_summary(candidates, changes),
+        _passing_summary(candidates, changes, len(notes)),
         f"Functions that no production code calls: {len(items)}.",
         measurements=_measurements(candidates, failing, notes),
     )
@@ -493,13 +495,18 @@ def _with_unreadable(outcome: GateOutcome, unreadable: Sequence[str]) -> GateOut
     return outcome
 
 
-def _passing_summary(candidates: Sequence[Candidate], changes: ChangeSet) -> str:
+def _passing_summary(
+    candidates: Sequence[Candidate], changes: ChangeSet, noted: int
+) -> str:
     if not candidates:
         if changes.incremental:
             return "The change adds no functions and removes no callers."
         return "No functions to check."
     count = len(candidates)
-    return f"Checked functions with a production caller: {count} of {count}."
+    summary = f"Checked functions with a production caller: {count - noted} of {count}."
+    if noted:
+        summary += f" Public, so not failed: {noted}."
+    return summary
 
 
 def _measurements(

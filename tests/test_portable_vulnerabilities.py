@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,22 @@ def load_module():
 
 
 scanner = load_module()
+
+
+def locked_inventory(root: Path) -> SimpleNamespace:
+    """Packages, lockfiles and unsupported lockfiles directly in ``root``."""
+    packages, lockfiles, unsupported = set(), [], []
+    for path in sorted(root.iterdir()):
+        kind = scanner.classify_lockfile(path.name) if path.is_file() else None
+        if kind == "unsupported":
+            unsupported.append(path.name)
+        elif kind == "supported":
+            lockfiles.append(path.name)
+            text = path.read_text(encoding="utf-8")
+            packages.update(scanner.read_lockfile(path.name, text, path.name).packages)
+    return SimpleNamespace(
+        packages=tuple(packages), lockfiles=lockfiles, unsupported=tuple(unsupported)
+    )
 
 
 class PortableInventoryTests(unittest.TestCase):
@@ -51,7 +68,7 @@ class PortableInventoryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            inventory = scanner.discover_locked_packages(root)
+            inventory = locked_inventory(root)
 
             coordinates = {
                 (item.ecosystem, item.name, item.version) for item in inventory.packages
@@ -67,7 +84,7 @@ class PortableInventoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "bun.lock").write_text("{}\n", encoding="utf-8")
-            inventory = scanner.discover_locked_packages(root)
+            inventory = locked_inventory(root)
             self.assertEqual(inventory.packages, ())
             self.assertEqual(inventory.unsupported, ("bun.lock",))
 
@@ -132,7 +149,7 @@ class PortableInventoryTests(unittest.TestCase):
             (ignored / "requirements.txt").write_text("hidden==1\n", encoding="utf-8")
             (root / "notes.txt").write_text("not a lock\n", encoding="utf-8")
 
-            inventory = scanner.discover_locked_packages(root)
+            inventory = locked_inventory(root)
             coordinates = {
                 (item.ecosystem, item.name, item.version) for item in inventory.packages
             }
@@ -163,7 +180,7 @@ class PortableInventoryTests(unittest.TestCase):
             }
             for name, value in cases.items():
                 (root / name).write_text(json.dumps(value), encoding="utf-8")
-            inventory = scanner.discover_locked_packages(root)
+            inventory = locked_inventory(root)
             self.assertEqual(inventory.packages, ())
             self.assertEqual(len(inventory.lockfiles), len(cases))
 

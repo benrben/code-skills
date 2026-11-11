@@ -16,7 +16,8 @@ import gate_project_checks_inference as inference  # noqa: E402
 import gate_project_checks_make as make  # noqa: E402
 import gate_project_checks_safety as safety  # noqa: E402
 import gate_project_checks_shell as shell  # noqa: E402
-from gate_types import CommandRun, subprocess_runner  # noqa: E402
+from gate_types import CommandRun  # noqa: E402
+from quality_commands import runner_for  # noqa: E402
 
 
 def write(root: Path, relative: str, text: str = "") -> Path:
@@ -1076,16 +1077,14 @@ class RunProjectChecksTests(TempRootTest):
         self.assertEqual(outcome.items[0].metric, "unsafe check")
         self.assertEqual(outcome.measurements["checks"][0]["status"], "unsafe")
 
-    def test_real_subprocess_runner(self):
+    def test_real_runner_for(self):
         python = sys.executable
         specs = [
             spec("ok", python, "-c", "print('fine')"),
             spec("bad", python, "-c", "raise ValueError('E1 broken')"),
             spec("missing", str(self.root / "no-such-tool")),
         ]
-        outcome = checks.run_project_checks(
-            self.root, specs, subprocess_runner(self.root), 60
-        )
+        outcome = checks.run_project_checks(self.root, specs, runner_for(self.root), 60)
         statuses = [row["status"] for row in outcome.measurements["checks"]]
         self.assertEqual(statuses, ["pass", "fail", "blocked"])
         self.assertIn("    ValueError: E1 broken", outcome.details)

@@ -131,14 +131,6 @@ class ThresholdTests(TemporaryDirectoryTest):
         with self.assertRaisesRegex(ValueError, "cannot read thresholds"):
             quality_config.load_thresholds(self.root / "missing.json")
 
-    def test_sync_rewrites_schema_2_once(self) -> None:
-        path = self.write_json("old.json", V2_THRESHOLDS)
-        self.assertTrue(quality_config.sync_thresholds_file(path))
-        rewritten = json.loads(path.read_text())
-        self.assertEqual(rewritten["schema_version"], 3)
-        self.assertEqual(rewritten["coverage"]["line_coverage_limit"], 85)
-        self.assertFalse(quality_config.sync_thresholds_file(path))
-
 
 class ConfigTests(TemporaryDirectoryTest):
     def test_defaults_without_a_file(self) -> None:

@@ -40,6 +40,7 @@ from gate_types import (
     GateItem,
     GateOutcome,
     Status,
+    plural,
 )
 
 __all__ = [
@@ -483,7 +484,7 @@ def _verdict(
     broken = "; ".join(
         f"{item.metric} {item.value} (limit {item.limit})" for item in items
     )
-    return FAIL, f"The test run broke {len(items)} threshold(s): {broken}."
+    return FAIL, f"The test run broke {plural(len(items), 'threshold')}: {broken}."
 
 
 def _details(

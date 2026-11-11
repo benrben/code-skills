@@ -322,7 +322,7 @@ def _block_on_unreadable(
     if outcome.status == PASS:
         outcome.status = BLOCKED
         outcome.summary = (
-            f"Could not read {len(unreadable)} production file(s): {names}."
+            f"Could not read {plural(len(unreadable), 'production file')}: {names}."
         )
 
 

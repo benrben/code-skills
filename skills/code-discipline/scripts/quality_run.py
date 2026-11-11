@@ -69,8 +69,6 @@ CHECK_FLAGS: tuple[tuple[str, str, str], ...] = (
     ("vulnerabilities", "vulnerabilities", "known advisories for locked dependencies"),
 )
 FLAG_GATES = {flag: key for flag, key, _ in CHECK_FLAGS}
-NEEDS_TESTS = frozenset({"tests", "coverage", "complexity"})
-NEEDS_FUNCTIONS = frozenset({"coverage", "complexity", "dead_code"})
 
 
 def selected_gates(flags: Sequence[str]) -> frozenset[str] | None:

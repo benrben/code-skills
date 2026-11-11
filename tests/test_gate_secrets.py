@@ -61,6 +61,11 @@ def make_repository(root: Path) -> None:
     git(root, "config", "commit.gpgsign", "false")
 
 
+def scan_text(text: str) -> list[tuple[str, int]]:
+    """Lines split on ``\\n`` only, as Git, grep and editors number them."""
+    return gate_secrets.scan_lines(text.split("\n"))
+
+
 def outcome_text(outcome: gate_types.GateOutcome) -> str:
     parts = [outcome.summary, *outcome.details, repr(outcome.items)]
     parts.append(repr(outcome.measurements))
@@ -76,17 +81,17 @@ class ScanTextTests(unittest.TestCase):
         for kind, token in FAKE_TOKENS.items():
             with self.subTest(kind=kind):
                 text = f"first line\nvalue = '{token}'\n"
-                self.assertEqual(gate_secrets.scan_text(text), [(kind, 2)])
+                self.assertEqual(scan_text(text), [(kind, 2)])
 
     def test_private_key_variants_with_key_material_match(self):
         for label in ("", "EC ", "DSA ", "OPENSSH ", "ENCRYPTED ", "PGP "):
             with self.subTest(label=label):
                 header = "-----BEGIN " + label + "PRIVATE" + " KEY-----"
                 text = f"{header}\n{KEY_MATERIAL}\n"
-                self.assertEqual(gate_secrets.scan_text(text), [("private key", 1)])
+                self.assertEqual(scan_text(text), [("private key", 1)])
         block = "-----BEGIN PGP " + "PRIVATE" + " KEY BLOCK-----"
         text = f"{block}\nVersion: GnuPG v1\nComment: demo\n\n{KEY_MATERIAL}\n"
-        self.assertEqual(gate_secrets.scan_text(text), [("private key", 1)])
+        self.assertEqual(scan_text(text), [("private key", 1)])
 
     def test_private_key_layouts_seen_in_config_files(self):
         layouts = {
@@ -107,7 +112,7 @@ class ScanTextTests(unittest.TestCase):
         for name, text in layouts.items():
             with self.subTest(layout=name):
                 self.assertEqual(
-                    gate_secrets.scan_text(text),
+                    scan_text(text),
                     [("private key", expected_lines[name])],
                 )
 
@@ -122,13 +127,11 @@ class ScanTextTests(unittest.TestCase):
         ]
         for text in harmless:
             with self.subTest(text=text[:30]):
-                self.assertEqual(gate_secrets.scan_text(text), [])
+                self.assertEqual(scan_text(text), [])
 
     def test_two_headers_before_one_body_report_both(self):
         text = f"{PEM_HEADER}\n{PEM_HEADER}\n{KEY_MATERIAL}\n"
-        self.assertEqual(
-            gate_secrets.scan_text(text), [("private key", 1), ("private key", 2)]
-        )
+        self.assertEqual(scan_text(text), [("private key", 1), ("private key", 2)])
 
     def test_tokens_inside_longer_identifiers_do_not_match(self):
         embedded = [
@@ -139,7 +142,7 @@ class ScanTextTests(unittest.TestCase):
         ]
         for text in embedded:
             with self.subTest(text=text[:6]):
-                self.assertEqual(gate_secrets.scan_text(text), [])
+                self.assertEqual(scan_text(text), [])
 
     def test_too_short_and_test_mode_values_do_not_match(self):
         harmless = [
@@ -151,7 +154,7 @@ class ScanTextTests(unittest.TestCase):
         ]
         for text in harmless:
             with self.subTest(text=text[:6]):
-                self.assertEqual(gate_secrets.scan_text(text), [])
+                self.assertEqual(scan_text(text), [])
 
     def test_documentation_placeholders_do_not_match(self):
         examples = [
@@ -160,31 +163,31 @@ class ScanTextTests(unittest.TestCase):
         ]
         for text in examples:
             with self.subTest(text=text[:12]):
-                self.assertEqual(gate_secrets.scan_text(text), [])
+                self.assertEqual(scan_text(text), [])
         mixed = examples[0] + " real=" + AWS_KEY
-        self.assertEqual(gate_secrets.scan_text(mixed), [("AWS access key", 1)])
+        self.assertEqual(scan_text(mixed), [("AWS access key", 1)])
 
     def test_xoxo_in_prose_and_urls_is_not_a_slack_token(self):
         slug = 'url = "https://example.com/blog/' + "xo" + 'xo-love-letters-2024"'
-        self.assertEqual(gate_secrets.scan_text(slug), [])
+        self.assertEqual(scan_text(slug), [])
 
     def test_twilio_key_needs_twilio_on_the_same_line(self):
-        self.assertEqual(gate_secrets.scan_text(f"key = '{TWILIO_SID}'"), [])
+        self.assertEqual(scan_text(f"key = '{TWILIO_SID}'"), [])
         self.assertEqual(
-            gate_secrets.scan_text(f"TWILIO_KEY = '{TWILIO_SID}'"),
+            scan_text(f"TWILIO_KEY = '{TWILIO_SID}'"),
             [(gate_secrets.TWILIO_KIND, 1)],
         )
-        self.assertEqual(gate_secrets.scan_text(f"twilio\nkey = '{TWILIO_SID}'"), [])
+        self.assertEqual(scan_text(f"twilio\nkey = '{TWILIO_SID}'"), [])
 
     def test_one_line_with_two_kinds_reports_both(self):
         line = f"{GITHUB_TOKEN} {AWS_KEY}"
         self.assertEqual(
-            gate_secrets.scan_text(line),
+            scan_text(line),
             [("AWS access key", 1), ("GitHub token", 1)],
         )
 
     def test_results_hold_kinds_and_lines_only(self):
-        findings = gate_secrets.scan_text(f"a\nb\nkey={AWS_KEY}\n")
+        findings = scan_text(f"a\nb\nkey={AWS_KEY}\n")
         self.assertEqual(findings, [("AWS access key", 3)])
         self.assertNotIn(AWS_KEY, repr(findings))
 
@@ -192,9 +195,9 @@ class ScanTextTests(unittest.TestCase):
         for separator in ("\f", "\x0b", "\x1c", "\x1d", "\x1e", "\x85", " "):
             with self.subTest(separator=repr(separator)):
                 text = f"a = 1\n# section{separator}\nkey = '{AWS_KEY}'\n"
-                self.assertEqual(gate_secrets.scan_text(text), [("AWS access key", 3)])
+                self.assertEqual(scan_text(text), [("AWS access key", 3)])
         crlf = f"a = 1\r\n\r\nkey = '{AWS_KEY}'\r\n"
-        self.assertEqual(gate_secrets.scan_text(crlf), [("AWS access key", 3)])
+        self.assertEqual(scan_text(crlf), [("AWS access key", 3)])
 
 
 class ScanFileTests(unittest.TestCase):

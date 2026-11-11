@@ -13,14 +13,10 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, cast
 from urllib.request import Request, urlopen
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
-EXCLUDED_DIRECTORIES = frozenset(
-    ".git .venv venv node_modules vendor target dist build".split()
-)
 # Lockfiles that pin versions in a format this module has no parser for.
 KNOWN_UNSUPPORTED = frozenset(
     "Package.resolved bun.lock bun.lockb cabal.project.freeze conan.lock gems.locked "
@@ -40,13 +36,6 @@ class LockedPackage:
         """Identity without the lockfile path, for comparing two lockfile
         versions."""
         return (self.ecosystem, self.name, self.version)
-
-
-@dataclass(frozen=True, slots=True)
-class DependencyInventory:
-    packages: tuple[LockedPackage, ...]
-    lockfiles: tuple[str, ...]
-    unsupported: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,13 +73,6 @@ class BytesResponse:
 
     def read(self, maximum: int = -1) -> bytes:
         return self.payload if maximum < 0 else self.payload[:maximum]
-
-
-def _walk(root: Path) -> Iterable[Path]:
-    for path in root.rglob("*"):
-        folders = path.relative_to(root).parts[:-1]
-        if path.is_file() and not any(part in EXCLUDED_DIRECTORIES for part in folders):
-            yield path
 
 
 def _locked(
@@ -477,23 +459,6 @@ def read_lockfile(name: str, text: str, source: str) -> LockfileReading:
 
 def _package_order(item: LockedPackage) -> tuple[str, str, str, str]:
     return (item.ecosystem, item.name, item.version, item.source)
-
-
-def discover_locked_packages(root: Path) -> DependencyInventory:
-    packages: list[LockedPackage] = []
-    lockfiles: list[str] = []
-    unsupported: list[str] = []
-    for path in sorted(_walk(root)):
-        relative = path.relative_to(root).as_posix()
-        kind = classify_lockfile(path.name)
-        if kind == "unsupported":
-            unsupported.append(relative)
-        elif kind == "supported":
-            lockfiles.append(relative)
-            text = path.read_text(encoding="utf-8", errors="replace")
-            packages.extend(read_lockfile(path.name, text, relative).packages)
-    unique = sorted(set(packages), key=_package_order)
-    return DependencyInventory(tuple(unique), tuple(lockfiles), tuple(unsupported))
 
 
 def _osv_results(

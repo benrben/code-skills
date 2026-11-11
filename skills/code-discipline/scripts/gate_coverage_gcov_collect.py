@@ -199,7 +199,7 @@ def main(
     except CollectError as error:
         print(error)
         return 1
-    print(f"wrote {count} gcov report(s) to {report}")
+    print(f"wrote {count} gcov {'report' if count == 1 else 'reports'} to {report}")
     return 0
 
 

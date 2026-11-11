@@ -439,6 +439,22 @@ class ReferenceIndexTests(RepositoryFixture):
         documented = 'def _double(x):\n    """_double doubles x."""\n    return x\n'
         self.assertEqual(self.count("b.py", documented, "_double", 1, 3), 0)
 
+    def test_header_prototypes_are_not_references_but_calls_are(self):
+        self.write("calc.h", "int calc_abs(int value);\n")
+        self.write("calc.c", "int calc_abs(int value)\n{\n  return value;\n}\n")
+        self.write("main.c", "int main(void) { return calc_abs(-1); }\n")
+        target = function("calc.c", "calc_abs", 1, 4)
+        lines = (self.root / "calc.c").read_text().splitlines()
+
+        def count(files):
+            index = gate_dead_code_references.build_reference_index(
+                self.root, [Path(name) for name in files], ["calc_abs"]
+            )
+            return gate_dead_code.reference_count(index, target, lines)
+
+        self.assertEqual(count(["calc.h", "calc.c"]), 0)
+        self.assertEqual(count(["calc.h", "calc.c", "main.c"]), 1)
+
     def test_prototypes_and_overloads_in_the_same_file_are_not_references(self):
         source = "static int helper(int);\n\nstatic int helper(int x)\n{\n}\n"
         self.assertEqual(self.count("a.c", source, "helper", 3, 5), 0)
@@ -689,6 +705,51 @@ class IncrementalEvaluationTests(RepositoryFixture):
             outcome.summary.startswith("Functions that no production code calls: 2")
         )
 
+    def test_new_c_function_only_declared_in_a_header_fails(self):
+        self.write("src/calc.h", "int calc_abs(int value);\n")
+        self.write("src/calc.c", "int calc_abs(int value)\n{\n  return value;\n}\n")
+        outcome = self.evaluate(
+            [function("src/calc.c", "calc_abs", 1, 4)],
+            changes(
+                FileChange("src/calc.c", added=frozenset({1, 2, 3, 4})),
+                FileChange("src/calc.h", added=frozenset({1})),
+            ),
+        )
+        self.assertEqual(outcome.status, FAIL)
+        self.assertEqual(outcome.items[0].name, "calc_abs")
+
+
+class CDeclarationTests(unittest.TestCase):
+    def test_declarations_are_recognised(self):
+        declares = gate_dead_code_references.is_c_declaration
+        for line in (
+            "int calc_abs(int value);",
+            "static inline unsigned long calc_abs(void);",
+            "char *calc_abs(const char *s)",
+            "extern int calc_abs (int);",
+            "std::vector<int> calc_abs(int n);",
+            "const Shape &Shape::calc_abs() const;",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(declares(line, "calc_abs"))
+
+    def test_calls_are_not_declarations(self):
+        declares = gate_dead_code_references.is_c_declaration
+        for line in (
+            "calc_abs(x);",
+            "  y = calc_abs(x);",
+            "return calc_abs(x);",
+            "else calc_abs(x);",
+            "Widget w(calc_abs(3));",
+            "std::cout << calc_abs(x);",
+            "if (ok) calc_abs(x);",
+            "obj->calc_abs(x);",
+            "int (*fn)(int) = calc_abs;",
+            "no mention here",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(declares(line, "calc_abs"))
+
 
 class RepositoryEvaluationTests(RepositoryFixture):
     def test_public_python_function_is_only_noted_in_repository_scope(self):
@@ -698,6 +759,11 @@ class RepositoryEvaluationTests(RepositoryFixture):
         )
         self.assertEqual(outcome.status, PASS)
         self.assertIn("public; may be used by other projects", outcome.details[0])
+        self.assertEqual(
+            outcome.summary,
+            "Checked functions with a production caller: 0 of 1. "
+            "Public, so not failed: 1.",
+        )
 
     def test_private_function_fails_in_repository_scope(self):
         self.write("src/app.py", "def _unused():\n    pass\n")
