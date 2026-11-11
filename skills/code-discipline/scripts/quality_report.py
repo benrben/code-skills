@@ -1,503 +1,420 @@
 #!/usr/bin/env python3
-"""Terminal report for one quality-loop run: what passed, what to fix, coverage today."""
+"""Terminal report for one quality-loop run: each gate's result and its issues.
+
+The report reads the state file written from ``quality_model.analysis_state``.
+It shows issues only: where, what, the measured value, and the limit.
+"""
 
 from __future__ import annotations
 
-import json
+import dataclasses
+import shlex
+import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, TextIO, TypeGuard
 
-DETAIL_LIMIT = 8
-FIX_LIMIT = 12
-GAP_LIMIT = 4
-REPOSITORY = "(repository)"
-DEFAULT_LIMITS = {
-    "coverage_limit": 100.0,
-    "branch_coverage_limit": 100.0,
-    "complexity_limit": 6.0,
-    "crap_limit": 6.0,
-}
-HAND_OFF_LINE = (
-    "HAND OFF NOW: the next message is the hand-off — list the deliverables (ticked) "
-    "and quote the QUALITY_LOOP line. Do not add tools, configs, or checks after green."
+from gate_types import NOT_APPLICABLE, PASS, plural
+from quality_config import QUALITY_DIRECTORY, REPORT_NAME, STATE_NAME
+from quality_html import NOT_PASSED, STATUS_LABELS, ReportContext, render_report
+from quality_model import (
+    NOT_RUN,
+    STATE_SCHEMA_VERSION,
+    analysis_from_state,
+    gate_rows,
 )
+
+ISSUE_LINES_PER_GATE = 8
+FIX_LIMIT = 12
+DETAIL_WIDTH = 200
+REPOSITORY = "(repository)"
+LABELS: dict[str, str] = {str(key): label for key, label in STATUS_LABELS.items()}
+ITEMS_SCRIPT = Path(__file__).resolve().with_name("quality_items.py")
+
+HAND_OFF_LINE = (
+    "HAND OFF NOW: the next message is the hand-off — list the deliverables "
+    "(ticked) and quote the QUALITY_LOOP line. Do not add tools, configs, or "
+    "checks after green."
+)
+PASS_LINE = "Ship report is green: every gate that ran passed."
+SELECTED_LINE = "Selected gates are green. This does not certify; run the full report:"
 COMMIT_LINE = "Fast checks are green. Commit this step in one command:"
 COMMIT_COMMAND = '  git add -A && git commit -m "<one line: what this step did>"'
 CONTINUE_LINE = "Then continue; before hand-off run the full ship report:"
-EMPTY_SCOPE_LINE = (
-    "Local-changes scope is empty: everything is committed and nothing was "
-    "measured — this is not a certification."
-)
-MORE_FILES_HINT = "quality_items.py --summary lists them"
+RERUN_LINE = "Rerun after the fixes:"
+MORE_FILES_NOTE = "quality_items.py --summary lists them"
 
 
-def report_header(analysis: Any) -> str:
-    flags = " ".join(f"--{name}" for name in analysis.selection)
-    mode = f"partial ({flags})" if analysis.mode == "partial" else analysis.mode
-    return f"QUALITY REPORT · mode: {mode} · scope: {analysis.scope.description}"
+@dataclasses.dataclass(frozen=True)
+class Issue:
+    """One open issue of a failing gate.
+
+    A failing gate without itemized findings becomes one repository-level
+    issue: its title, its summary, and the first line of each detail.
+    """
+
+    gate: str
+    path: str
+    line: int | None
+    name: str
+    metric: str
+    value: str
+    limit: str
+    details: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> tuple[str, str, str, str, str]:
+        """Identity across runs: line numbers count only for unnamed issues."""
+        position = "" if self.name else str(self.line or "")
+        return (self.gate, self.path, self.name, self.metric, position)
+
+    @property
+    def repository_level(self) -> bool:
+        return self.path == REPOSITORY
+
+    def location(self) -> str:
+        return f"{self.path}:{self.line}" if self.line else self.path
+
+    def describe(self) -> str:
+        """The issue without its location."""
+        if self.repository_level:
+            return f"{self.metric}: {self.value}"
+        head = f"{self.name}: " if self.name else ""
+        return head + self._measurement()
+
+    def text(self) -> str:
+        """``path:line name: metric value (limit L)``."""
+        if self.repository_level:
+            return self.describe()
+        label = f" {self.name}" if self.name else ""
+        return f"{self.location()}{label}: {self._measurement()}"
+
+    def _measurement(self) -> str:
+        value = f" {self.value}" if self.value else ""
+        limit = f" (limit {self.limit})" if self.limit else ""
+        return f"{self.metric}{value}{limit}"
 
 
-def first_line(text: str) -> str:
-    lines = text.strip().splitlines()
-    return lines[0][:200] if lines else ""
+Groups = list[tuple[str, list[Issue]]]
 
 
-def gate_lines(gate: ModuleType, result: Any) -> list[str]:
-    status = gate.gate_status(result)
-    if status == "not_applicable":
-        return [
-            f"[N/A] {result.title}: {result.summary} Nothing to do here; not needed for hand-off."
-        ]
-    lines = [f"[{gate.gate_outcome(result)}] {result.title}: {result.summary}"]
-    if status not in {"fail", "blocked", "unsupported", "needs_context"}:
-        return lines
-    lines.extend(
-        f"    {first_line(detail)}" for detail in result.details[:DETAIL_LIMIT]
-    )
-    return lines
-
-
-def coverage_today(functions: Sequence[Any], limit: float) -> dict[str, Any] | None:
-    measured = [
-        function
-        for function in functions
-        if getattr(function, "coverage_measured", True)
-    ]
-    if not measured:
-        return None
-    gaps: dict[str, int] = {}
-    for function in measured:
-        if function.coverage_percent < limit:
-            gaps[function.path] = gaps.get(function.path, 0) + 1
-    covered = len(measured) - sum(gaps.values())
-    return {
-        "covered": covered,
-        "total": len(measured),
-        "percent": round(100 * covered / len(measured)),
-        "gaps": sorted(gaps.items(), key=lambda item: (-item[1], item[0]))[:GAP_LIMIT],
-    }
-
-
-def coverage_summary_text(summary: dict[str, Any]) -> str:
-    text = (
-        f"{summary['covered']} of {summary['total']} functions fully covered "
-        f"({summary['percent']}%)"
-    )
-    missing = summary["total"] - summary["covered"]
-    if missing == 0:
-        return text
-    where = ", ".join(f"{path} ({count})" for path, count in summary["gaps"])
-    return f"{text} · {missing} not covered — most in: {where}"
-
-
-def coverage_today_line(
-    analysis: Any, previous: tuple[str, dict[str, Any]] | None
-) -> str:
-    limit = float(analysis.thresholds.get("metrics", {}).get("coverage_limit", 100))
-    summary = coverage_today(analysis.functions, limit)
-    if summary:
-        return f"Coverage today: {coverage_summary_text(summary)}"
-    if previous:
-        generated_at, older = previous
-        return (
-            f"Coverage today: not measured in this run — last measured {generated_at}: "
-            f"{coverage_summary_text(older)}"
-        )
-    return "Coverage today: not measured yet — run --fast or --coverage."
-
-
-def previous_measurement(
-    state_path: Path,
-) -> tuple[str, dict[str, Any]] | None:
-    """Coverage summary from the previous state file, for runs that measure nothing."""
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    functions = [
-        SimpleNamespace(**item)
-        for item in state.get("metrics", {}).get("functions", [])
-    ]
-    limit = float(
-        state.get("thresholds", {}).get("metrics", {}).get("coverage_limit", 100)
-    )
-    summary = coverage_today(functions, limit)
-    return (str(state.get("generated_at", "earlier")), summary) if summary else None
-
-
-def metric_limits(state: dict[str, Any]) -> dict[str, float]:
-    metrics = state.get("thresholds", {}).get("metrics", {})
-    return {
-        key: float(metrics.get(key, default)) for key, default in DEFAULT_LIMITS.items()
-    }
-
-
-def branch_failure(item: dict[str, Any], limits: dict[str, float]) -> bool:
-    if "branch_coverage_measured" not in item:
-        return False
-    if not item["branch_coverage_measured"]:
-        return True
-    return (
-        float(item.get("branch_coverage_percent", 100))
-        < limits["branch_coverage_limit"]
+def is_current_state(
+    state: Mapping[str, Any] | None,
+) -> TypeGuard[Mapping[str, Any]]:
+    return isinstance(state, Mapping) and (
+        state.get("schema_version") == STATE_SCHEMA_VERSION
     )
 
 
-def branch_hint(item: dict[str, Any], limits: dict[str, float]) -> str | None:
-    if not branch_failure(item, limits):
-        return None
-    if item["branch_coverage_measured"]:
-        return "add tests for the uncovered branch outcomes"
-    return "configure the coverage adapter to report branch outcomes"
+def gate_failed(gate: Mapping[str, Any]) -> bool:
+    """A gate that ran and did not pass (FAIL or BLOCKED)."""
+    status = str(gate.get("status", ""))
+    return status not in NOT_RUN and status not in (PASS, NOT_APPLICABLE)
 
 
-def branch_failure_text(item: dict[str, Any], failed: bool) -> str:
-    if not failed:
-        return ""
-    if not item["branch_coverage_measured"]:
-        return ", branch coverage not measured"
-    return f", branch coverage {item.get('branch_coverage_percent', 0):g}%"
+def first_line(text: object) -> str:
+    lines = str(text).strip().splitlines()
+    return lines[0][:DETAIL_WIDTH] if lines else ""
 
 
-def function_metric(below_coverage: bool, branch_failed: bool) -> str:
-    if below_coverage:
-        return "coverage"
-    if branch_failed:
-        return "branch coverage"
-    return "complexity"
+def _line_number(value: object) -> int | None:
+    return value if isinstance(value, int) and value > 0 else None
 
 
-def coverage_hint(item: dict[str, Any], limits: dict[str, float]) -> str | None:
-    if item["coverage_percent"] >= limits["coverage_limit"]:
-        return None
-    missing = item.get("total_lines", 0) - item.get("covered_lines", 0)
-    if missing > 0:
-        return f"add a test that reaches its {missing} uncovered lines"
-    return "add a test that reaches its untested paths"
-
-
-def function_hint(item: dict[str, Any], limits: dict[str, float]) -> str:
-    hints: list[str] = []
-    coverage = coverage_hint(item, limits)
-    if coverage:
-        hints.append(coverage)
-    branch = branch_hint(item, limits)
-    if branch:
-        hints.append(branch)
-    if item["complexity"] > limits["complexity_limit"]:
-        hints.append(
-            f"complexity {item['complexity']} > {limits['complexity_limit']:g}: "
-            "split it into smaller functions"
-        )
-    if item.get("crap_score", 0) > limits["crap_limit"]:
-        hints.append(
-            f"CRAP {item['crap_score']:g} > {limits['crap_limit']:g}: "
-            "cover it or simplify it"
-        )
-    return "; ".join(hints) or "cover it or simplify it"
-
-
-def function_record(item: dict[str, Any], limits: dict[str, float]) -> dict[str, Any]:
-    below_coverage = item["coverage_percent"] < limits["coverage_limit"]
-    branch_failed = branch_failure(item, limits)
-    branch_text = branch_failure_text(item, branch_failed)
-    return {
-        "kind": "function",
-        "path": item["path"],
-        "line": item["line"],
-        "key": f"function {item['path']} {item['name']}",
-        "text": (
-            f"{item['path']}:{item['line']} {item['name']} — "
-            f"coverage {item['coverage_percent']:g}%{branch_text}, "
-            f"complexity {item['complexity']}"
-        ),
-        "hint": function_hint(item, limits),
-        "metric": function_metric(below_coverage, branch_failed),
-    }
-
-
-def file_record(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "kind": "file",
-        "path": item["path"],
-        "line": 1,
-        "key": f"file {item['path']}",
-        "text": f"{item['path']} — {item['lines']} lines (max {item['limit']})",
-        "hint": f"split the file: {item['lines']} lines, max {item['limit']}",
-        "metric": "file size",
-    }
-
-
-def mutant_record(item: dict[str, Any]) -> dict[str, Any]:
-    text = f"{item['path']}:{item['line']} surviving mutant `{item['change']}`"
-    return {
-        "kind": "mutant",
-        "path": item["path"],
-        "line": item["line"],
-        "key": f"mutant {text}",
-        "text": text,
-        "hint": f"add a test that fails when the code changes `{item['change']}`",
-        "metric": "mutant",
-    }
-
-
-def dependency_record(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "kind": "dependency",
-        "path": item["source"],
-        "line": item["line"],
-        "key": f"dependency {item['source']} -> {item['target']}",
-        "text": f"{item['source']}:{item['line']} -> {item['target']}: {item['rule']}",
-        "hint": (
-            f"remove the import of {item['target']} or allow the edge "
-            "in the dependency rules"
-        ),
-        "metric": "dependency",
-    }
-
-
-def test_integrity_record(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "kind": "test integrity",
-        "path": item["path"],
-        "line": item["line"],
-        "key": f"test integrity {item['path']} {item['line']} {item['kind']}",
-        "text": f"{item['path']}:{item['line']} {item['kind']} — {item['detail']}",
-        "hint": "use the real production subsystem in the composed-root test",
-        "metric": "test integrity",
-    }
-
-
-def scope_record(detail: str) -> dict[str, Any]:
-    return {
-        "kind": "scope",
-        "path": detail.split(" — ", 1)[0],
-        "line": 0,
-        "key": f"scope {detail}",
-        "text": detail,
-        "hint": "remove the exclude entry; give the file a startup or smoke test instead",
-        "metric": "scope",
-    }
-
-
-def check_record(item: dict[str, Any]) -> dict[str, Any]:
-    details = [first_line(detail) for detail in item.get("details", [])[:20]]
-    return {
-        "kind": "check",
-        "path": REPOSITORY,
-        "line": 0,
-        "key": f"check {item['key']}",
-        "text": f"{item['title']}: {item['summary']}",
-        "hint": details[0] if details else "read the command output in the report",
-        "metric": item["title"],
-        "details": details,
-    }
-
-
-def check_records(
-    checks: Sequence[dict[str, Any]], itemized: set[str] | frozenset[str]
-) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for item in checks:
-        if item["key"] in itemized:
-            continue
-        if item["key"] == "scope":
-            records.extend(scope_record(detail) for detail in item.get("details", []))
-            continue
-        records.append(check_record(item))
-    return records
-
-
-def itemized_gates(failures: dict[str, Any]) -> set[str]:
-    """Gates whose failures are already listed item by item above the check summaries."""
-    sources = (
-        ("quality", "functions"),
-        ("file_loc", "files"),
-        ("mutation", "surviving_mutants"),
-        ("dependencies", "dependencies"),
-        ("test_integrity", "test_integrity"),
+def item_issue(gate_key: str, item: Mapping[str, Any]) -> Issue:
+    return Issue(
+        gate_key,
+        str(item.get("path") or REPOSITORY),
+        _line_number(item.get("line")),
+        str(item.get("name") or ""),
+        str(item.get("metric") or ""),
+        str(item.get("value") or ""),
+        str(item.get("limit") or ""),
     )
-    return {key for key, field in sources if failures.get(field)}
 
 
-def check_failure_items(
-    checks: Sequence[dict[str, Any]], itemized: set[str] | frozenset[str] = frozenset()
-) -> list[str]:
-    return [record["text"] for record in check_records(checks, itemized)]
-
-
-def item_records(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every open item as a record: path, line, key, text, hint, metric."""
-    failures = state["failures"]
-    limits = metric_limits(state)
-    records = [function_record(item, limits) for item in failures["functions"]]
-    records.extend(file_record(item) for item in failures["files"])
-    records.extend(mutant_record(item) for item in failures["surviving_mutants"])
-    records.extend(dependency_record(item) for item in failures["dependencies"])
-    records.extend(
-        test_integrity_record(item) for item in failures.get("test_integrity", [])
+def gate_issue(gate: Mapping[str, Any]) -> Issue:
+    details = tuple(
+        line for line in (first_line(d) for d in gate.get("details") or []) if line
     )
-    records.extend(check_records(failures["checks"], itemized_gates(failures)))
-    return records
+    key = str(gate.get("key", ""))
+    return Issue(
+        key,
+        REPOSITORY,
+        None,
+        "",
+        str(gate.get("title") or key),
+        str(gate.get("summary") or ""),
+        "",
+        details,
+    )
 
 
-def to_fix_items(state: dict[str, Any]) -> list[str]:
-    return [record["text"] for record in item_records(state)]
+def gate_issues(gate: Mapping[str, Any]) -> list[Issue]:
+    if not gate_failed(gate):
+        return []
+    key = str(gate.get("key", ""))
+    items = gate.get("items") or []
+    if items:
+        return [item_issue(key, item) for item in items]
+    return [gate_issue(gate)]
 
 
-def files_in_order(
-    records: Sequence[dict[str, Any]],
-) -> list[tuple[str, list[dict[str, Any]]]]:
-    """Files with open items: most items first, repository-level items last."""
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for record in records:
-        groups.setdefault(record["path"], []).append(record)
+def issues_from_state(state: Mapping[str, Any]) -> list[Issue]:
+    """Every open issue of every failing gate, in gate order."""
+    return [issue for gate in state.get("gates") or [] for issue in gate_issues(gate)]
+
+
+def files_in_order(issues: Sequence[Issue]) -> Groups:
+    """Files with open issues: most issues first, repository-level issues last."""
+    groups: dict[str, list[Issue]] = {}
+    for issue in issues:
+        groups.setdefault(issue.path, []).append(issue)
     return sorted(
         groups.items(),
         key=lambda entry: (entry[0] == REPOSITORY, -len(entry[1]), entry[0]),
     )
 
 
-def metric_breakdown(records: Sequence[dict[str, Any]]) -> str:
+def metric_breakdown(issues: Sequence[Issue]) -> str:
     counts: dict[str, int] = {}
-    for record in records:
-        counts[record["metric"]] = counts.get(record["metric"], 0) + 1
+    for issue in issues:
+        counts[issue.metric] = counts.get(issue.metric, 0) + 1
     ordered = sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
     return " · ".join(f"{count} {metric}" for metric, count in ordered)
 
 
-def file_line(number: int, path: str, records: Sequence[dict[str, Any]]) -> str:
-    noun = "item" if len(records) == 1 else "items"
-    return f"  {number}. {path} — {len(records)} {noun} ({metric_breakdown(records)})"
+def file_line(number: int, path: str, issues: Sequence[Issue]) -> str:
+    return (
+        f"  {number}. {path} — {plural(len(issues), 'issue')} "
+        f"({metric_breakdown(issues)})"
+    )
 
 
-def grouped_fix_lines(records: Sequence[dict[str, Any]]) -> list[str]:
-    groups = files_in_order(records)
-    lines = [
-        f"  {len(records)} items in {len(groups)} files — one file per cycle, top first"
-    ]
+def summary_header(issues: Sequence[Issue], groups: Groups) -> str:
+    return (
+        f"{plural(len(issues), 'issue')} in {plural(len(groups), 'file')} "
+        "— one file per cycle, top first"
+    )
+
+
+def grouped_fix_lines(issues: Sequence[Issue]) -> list[str]:
+    groups = files_in_order(issues)
+    lines = [f"  {summary_header(issues, groups)}"]
     lines.extend(
-        file_line(number, path, items)
-        for number, (path, items) in enumerate(groups[:FIX_LIMIT], 1)
+        file_line(number, path, grouped)
+        for number, (path, grouped) in enumerate(groups[:FIX_LIMIT], 1)
     )
     if len(groups) > FIX_LIMIT:
         lines.append(
-            f"  … and {len(groups) - FIX_LIMIT} more files ({MORE_FILES_HINT})"
+            f"  … and {len(groups) - FIX_LIMIT} more files ({MORE_FILES_NOTE})"
         )
     return lines
 
 
-def to_fix_lines(state: dict[str, Any]) -> list[str]:
-    records = item_records(state)
-    if len(records) <= FIX_LIMIT:
-        return [
-            f"  {number}. {record['text']}" for number, record in enumerate(records, 1)
-        ]
-    return grouped_fix_lines(records)
+def fix_list_lines(issues: Sequence[Issue]) -> list[str]:
+    if len(issues) > FIX_LIMIT:
+        return grouped_fix_lines(issues)
+    return [f"  {number}. {issue.text()}" for number, issue in enumerate(issues, 1)]
 
 
-def item_keys(state: dict[str, Any]) -> set[str]:
-    return {record["key"] for record in item_records(state)}
+def state_root(state: Mapping[str, Any]) -> Path:
+    return Path(str(state.get("root") or "."))
 
 
-def previous_item_keys(state_path: Path) -> set[str] | None:
-    """Open-item keys from the previous state file, for the 'Since last run' line."""
-    try:
-        return item_keys(json.loads(state_path.read_text(encoding="utf-8")))
-    except (OSError, ValueError, KeyError, TypeError):
+def default_state_path(root: Path) -> Path:
+    return root / QUALITY_DIRECTORY / STATE_NAME
+
+
+def state_path_for(state: Mapping[str, Any]) -> Path:
+    """Where this state file lives: next to its HTML report."""
+    explicit = state.get("state_path")
+    if explicit:
+        return Path(str(explicit))
+    html = state.get("html")
+    if html:
+        return Path(str(html)).with_name(STATE_NAME)
+    return default_state_path(state_root(state))
+
+
+def html_path_for(state: Mapping[str, Any]) -> Path:
+    html = state.get("html")
+    if html:
+        return Path(str(html))
+    return state_root(state) / QUALITY_DIRECTORY / REPORT_NAME
+
+
+def next_file_command(state: Mapping[str, Any]) -> str:
+    root = state_root(state)
+    command = ["python3", str(ITEMS_SCRIPT), "--root", str(root)]
+    state_path = state_path_for(state)
+    if state_path != default_state_path(root):
+        command.extend(["--state", str(state_path)])
+    command.append("--next")
+    return shlex.join(command)
+
+
+def status_label(status: str) -> str:
+    return LABELS.get(status, status.upper())
+
+
+def gate_issue_texts(gate: Mapping[str, Any]) -> list[str]:
+    items = gate.get("items") or []
+    if items:
+        return [item_issue(str(gate.get("key", "")), item).text() for item in items]
+    return list(gate_issue(gate).details)
+
+
+def gate_lines(gate: Mapping[str, Any]) -> list[str]:
+    title = gate.get("title") or gate.get("key", "")
+    status = str(gate.get("status", ""))
+    lines = [f"[{status_label(status)}] {title}: {gate.get('summary', '')}"]
+    if not gate_failed(gate):
+        return lines
+    texts = gate_issue_texts(gate)
+    lines.extend(f"  {text}" for text in texts[:ISSUE_LINES_PER_GATE])
+    if len(texts) > ISSUE_LINES_PER_GATE:
+        lines.append(f"  … and {len(texts) - ISSUE_LINES_PER_GATE} more")
+    return lines
+
+
+def coverage_measurement(state: Mapping[str, Any]) -> str | None:
+    """The coverage this run measured, or None when coverage did not run."""
+    for gate in state.get("gates") or []:
+        if gate.get("key") != "coverage" or gate.get("status") in NOT_RUN:
+            continue
+        values = gate.get("measurements") or {}
+        line = values.get("line_coverage_percent")
+        if not isinstance(line, (int, float)):
+            return None
+        text = (
+            f"{line:g}% of lines ({values.get('covered_lines', 0)}/"
+            f"{values.get('total_lines', 0)})"
+        )
+        branch = values.get("branch_coverage_percent")
+        if isinstance(branch, (int, float)):
+            text += (
+                f", {branch:g}% of branches ({values.get('covered_branches', 0)}/"
+                f"{values.get('total_branches', 0)})"
+            )
+        return text
+    return None
+
+
+def coverage_today_line(
+    state: Mapping[str, Any], previous_state: Mapping[str, Any] | None
+) -> str:
+    current = coverage_measurement(state)
+    if current:
+        return f"Coverage today: {current}"
+    if is_current_state(previous_state):
+        earlier = coverage_measurement(previous_state)
+        if earlier:
+            when = previous_state.get("generated_at") or "earlier"
+            return (
+                "Coverage today: not measured in this run — "
+                f"last measured {when}: {earlier}"
+            )
+    return "Coverage today: not measured in this run."
+
+
+def delta_line(
+    issues: Sequence[Issue], previous_state: Mapping[str, Any] | None
+) -> str | None:
+    if not is_current_state(previous_state):
         return None
-
-
-def delta_line(previous: set[str] | None, current: set[str]) -> str | None:
-    if previous is None:
-        return None
-    fixed = len(previous - current)
-    new = len(current - previous)
-    return f"Since last run: fixed {fixed} · remaining {len(current)} · new {new}"
-
-
-def next_file_line(state_path: Path) -> str:
-    script = Path(__file__).with_name("quality_items.py")
-    return f"Next file:  python3 {script} --state {state_path} --next"
-
-
-def whole_repository_command(command: str) -> str:
-    """Strip incremental-scope flags so the suggestion certifies the whole repository."""
-    parts = [part for part in command.split() if part != "--local-changes"]
-    if "--commit" in parts:
-        index = parts.index("--commit")
-        del parts[index : index + 2]
-    return " ".join(parts)
-
-
-def empty_incremental_scope(state: dict[str, Any]) -> bool:
-    scope = state.get("scope") or {}
-    return scope.get("kind") in ("local_changes", "commit") and not scope.get(
-        "changed_files"
+    previous = {issue.key for issue in issues_from_state(previous_state)}
+    current = {issue.key for issue in issues}
+    return (
+        f"Since last run: fixed {len(previous - current)} · "
+        f"remaining {len(issues)} · new {len(current - previous)}"
     )
 
 
-def next_step_lines(state: dict[str, Any], analysis: Any) -> list[str]:
-    if state["status"] == "selected_pass":
-        return [
-            "Selected checks are green. This does not certify: run the full ship report:",
-            f"  {state['full_rerun_command']}",
-        ]
-    if state["status"] == "ready_for_full":
-        return [
-            COMMIT_LINE,
-            COMMIT_COMMAND,
-            CONTINUE_LINE,
-            f"  {state['full_rerun_command']}",
-        ]
-    if empty_incremental_scope(state):
-        return [
-            EMPTY_SCOPE_LINE,
-            "Run the whole-repository ship report:",
-            f"  {whole_repository_command(state['full_rerun_command'])}",
-        ]
-    if state["status"] == "pass":
-        return [
-            "Ship report is green: every executed check passed.",
-            HAND_OFF_LINE,
-        ]
-    return ["Fix the items above, then rerun:", f"  {state['rerun_command']}"]
+def command_lines(heading: str, command: object) -> list[str]:
+    text = str(command or "")
+    return [heading, f"  {text}"] if text else []
 
 
-def print_fix_block(
-    state: dict[str, Any], state_path: Path, previous_items: set[str] | None
-) -> int:
-    records = item_records(state)
-    delta = delta_line(previous_items, {record["key"] for record in records})
+def next_step_lines(state: Mapping[str, Any]) -> list[str]:
+    status = state.get("status")
+    full = state.get("full_rerun_command")
+    if status == "pass":
+        return [PASS_LINE, HAND_OFF_LINE]
+    if status == "selected_pass":
+        return command_lines(SELECTED_LINE, full)
+    if status == "ready_for_full":
+        return [COMMIT_LINE, COMMIT_COMMAND, *command_lines(CONTINUE_LINE, full)]
+    return command_lines(RERUN_LINE, state.get("rerun_command"))
+
+
+def header_line(state: Mapping[str, Any]) -> str:
+    mode = state.get("mode") or "full"
+    scope = state.get("scope") or "whole repository"
+    return f"QUALITY REPORT · {mode} · {scope}"
+
+
+def fix_block(state: Mapping[str, Any], issues: Sequence[Issue]) -> list[str]:
+    if not issues:
+        return []
+    return [
+        NOT_PASSED,
+        *fix_list_lines(issues),
+        f"Next file: {next_file_command(state)}",
+    ]
+
+
+def report_lines(
+    state: Mapping[str, Any], previous_state: Mapping[str, Any] | None = None
+) -> list[str]:
+    """Every line of the terminal report."""
+    issues = issues_from_state(state)
+    lines = [header_line(state)]
+    for gate in state.get("gates") or []:
+        lines.extend(gate_lines(gate))
+    lines.extend(f"Note: {note}" for note in state.get("notes") or [])
+    lines.append(coverage_today_line(state, previous_state))
+    lines.extend(fix_block(state, issues))
+    delta = delta_line(issues, previous_state)
     if delta:
-        print(delta)
-    if records:
-        print("To fix:")
-        print("\n".join(to_fix_lines(state)))
-        print(next_file_line(state_path))
-    return len(records)
+        lines.append(delta)
+    lines.extend(next_step_lines(state))
+    lines.extend(
+        [
+            f"QUALITY_LOOP={str(state.get('status') or 'error').upper()}",
+            f"ITEMS_TO_FIX={len(issues)}",
+            f"STATE={state_path_for(state)}",
+            f"HTML={html_path_for(state)}",
+        ]
+    )
+    return lines
 
 
 def print_report(
-    gate: ModuleType,
-    analysis: Any,
     state: dict[str, Any],
-    state_path: Path,
-    html_path: Path,
-    print_prompt: bool,
-    previous: tuple[str, dict[str, Any]] | None = None,
-    previous_items: set[str] | None = None,
+    *,
+    previous_state: dict[str, Any] | None = None,
+    stream: TextIO | None = None,
 ) -> None:
-    print(report_header(analysis))
-    for result in analysis.gates:
-        print("\n".join(gate_lines(gate, result)))
-    print(coverage_today_line(analysis, previous))
-    count = print_fix_block(state, state_path, previous_items)
-    print("\n".join(next_step_lines(state, analysis)))
-    print(f"QUALITY_LOOP={state['status'].upper()}")
-    print(f"ITEMS_TO_FIX={count}")
-    print(f"STATE={state_path}")
-    print(f"HTML={html_path}")
-    if print_prompt and state["fix_prompt"]:
-        print("\n" + state["fix_prompt"])
+    """Print the terminal report (``stream`` defaults to standard output)."""
+    output = stream if stream is not None else sys.stdout
+    output.write("\n".join(report_lines(state, previous_state)) + "\n")
+    output.flush()
+
+
+def verdict_label(status: str) -> str:
+    return status.replace("_", " ").upper()
+
+
+def render_html(state: Mapping[str, Any]) -> str:
+    """The HTML report for a schema-2 state; raises ValueError for older states."""
+    analysis = analysis_from_state(state)
+    context = ReportContext(
+        repository=analysis.root,
+        scope=analysis.scope,
+        generated_at=analysis.generated_at,
+        verdict=verdict_label(str(state.get("status") or analysis.status)),
+        command=analysis.rerun_command,
+        notes=tuple(analysis.notes),
+    )
+    return render_report(context, gate_rows(analysis))

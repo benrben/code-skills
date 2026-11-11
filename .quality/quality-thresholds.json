@@ -1,59 +1,13 @@
 {
-  "schema_version": 2,
-  "format_lint": {
-    "max_violations": 0
-  },
-  "types": {
-    "max_errors": 0
-  },
-  "contracts": {
-    "max_violations": 0
-  },
-  "metrics": {
-    "max_test_failures": 0,
-    "coverage_limit": 100,
-    "branch_coverage_limit": 100,
-    "complexity_limit": 6,
-    "crap_limit": 6
-  },
-  "slow_tests": {
-    "max_test_seconds": 5,
-    "max_suite_seconds": 300
-  },
-  "extensibility": {
-    "contract_coverage_limit": 100,
-    "max_core_to_extension_dependencies": 0
-  },
-  "error_handling": {
-    "failure_path_coverage_limit": 100,
-    "max_silent_handlers": 0
-  },
-  "file_loc": {
-    "max_lines": 600
-  },
-  "dead_code": {
-    "max_findings": 0
-  },
-  "flaky_tests": {
-    "runs": 3,
-    "max_failures": 0
-  },
-  "mutation": {
-    "max_surviving_mutants": 0
-  },
-  "dependencies": {
-    "max_violations": 0
-  },
-  "test_execution": {
-    "min_executed": 1,
-    "max_skipped": 0
-  },
-  "portable_analysis": {
-    "max_cognitive_complexity": 15,
-    "max_nesting_depth": 4,
-    "max_duplication_percent": 5,
-    "max_dependency_cycles": 0,
-    "max_secret_findings": 0,
-    "max_known_vulnerabilities": 0
-  }
+  "schema_version": 3,
+  "shortcuts": {"max_findings": 0},
+  "secrets": {"max_findings": 0},
+  "file_loc": {"max_lines": 600},
+  "project_checks": {"max_failures": 0},
+  "tests": {"min_executed": 1, "max_skipped": 0, "max_failures": 0},
+  "coverage": {"line_coverage_limit": 90, "branch_coverage_limit": 90},
+  "complexity": {"cyclomatic_limit": 10, "cognitive_limit": 15, "nesting_limit": 4, "crap_limit": 30},
+  "duplication": {"min_tokens": 50, "min_lines": 5, "max_new_clones": 0},
+  "dead_code": {"max_findings": 0},
+  "vulnerabilities": {"max_findings": 0}
 }

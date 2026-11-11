@@ -1,4 +1,4 @@
 interface:
   display_name: "Code Discipline"
-  short_description: "Project quality gates with guided setup"
-  default_prompt: "Use $code-discipline to implement and verify this change with this project's saved quality policy. For first-time setup, explain gate and threshold choices in chat and save them only for this project."
+  short_description: "Ten generic quality gates for agent changes, with guided setup"
+  default_prompt: "Use $code-discipline to implement and verify this change with this project's saved quality policy, then repair until the full gate run passes. For first-time setup, explain gate and threshold choices in chat and save them only for this project."

@@ -18,6 +18,9 @@ CORE_PATH = (
 
 
 def load_core() -> ModuleType:
+    scripts = str(CORE_PATH.parent)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
     spec = importlib.util.spec_from_file_location(
         "code_discipline_quality_gate", CORE_PATH
     )

@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 GITHUB_REPOSITORY = "benrben/code-skills"
 DEFAULT_REF = "refs/heads/main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}"
@@ -28,6 +28,24 @@ INSTALLER_FILE = "scripts/install.py"
 HANDOFF_ENV = "CODE_DISCIPLINE_INSTALLER_HANDOFF"
 UPDATE_TARGET_ENV = "CODE_DISCIPLINE_UPDATE_TARGET"
 REGISTRY_ENV = "CODE_DISCIPLINE_INSTALL_REGISTRY"
+THRESHOLDS_SCHEMA = 3
+# Every packaged file. A test compares this list with the skill directory.
+SCRIPT_MODULES = """
+diff_scope gate_complexity gate_complexity_indent gate_complexity_lizard
+gate_complexity_python gate_coverage
+gate_coverage_data gate_coverage_gcov gate_coverage_gcov_collect gate_coverage_paths
+gate_coverage_programs gate_coverage_python gate_coverage_readers gate_coverage_recipes
+gate_dead_code gate_dead_code_references gate_duplication gate_duplication_tokens
+gate_file_size gate_project_checks gate_project_checks_inference
+gate_project_checks_make gate_project_checks_safety gate_project_checks_shell
+gate_secrets gate_shortcuts gate_shortcuts_handlers gate_shortcuts_markers
+gate_shortcuts_text gate_tests gate_tests_command gate_tests_native gate_tests_parsers
+gate_tests_parsers_other gate_types gate_vulnerabilities gate_vulnerabilities_manifests
+install install_local portable_vulnerabilities project_setup quality_commands
+quality_config quality_html quality_items quality_loop quality_model quality_report
+quality_run quality_run_tests quality_self_update quality_tools quality_update
+repo_quality_gate source_files
+""".split()
 SKILL_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -35,24 +53,8 @@ SKILL_FILES = (
     "references/project-setup-chat.md",
     "references/quality-loop.md",
     "references/repository-setup.md",
-    "scripts/install.py",
-    "scripts/install_local.py",
-    "scripts/quality_loop.py",
-    "scripts/quality_report.py",
-    "scripts/quality_charts.py",
-    "scripts/quality_update.py",
-    "scripts/quality_items.py",
-    "scripts/portable_analysis.py",
-    "scripts/portable_graph.py",
-    "scripts/portable_vulnerabilities.py",
-    "scripts/project_profile.py",
-    "scripts/project_setup.py",
-    "scripts/project_quality.py",
     "scripts/quality",
-    "scripts/repo_quality_gate.py",
-    "scripts/smoke_check.py",
-    "scripts/gherkin_check.py",
-    "scripts/gherkin_yaml.py",
+    *(f"scripts/{module}.py" for module in SCRIPT_MODULES),
 )
 PYTHON_FILES = tuple(path for path in SKILL_FILES if path.endswith(".py"))
 EXECUTABLE_FILES = (*PYTHON_FILES, "scripts/quality")
@@ -205,7 +207,10 @@ def validate_staged_thresholds(directory: Path) -> None:
     thresholds = json.loads(
         (directory / "quality-thresholds.json").read_text(encoding="utf-8")
     )
-    if not isinstance(thresholds, dict) or thresholds.get("schema_version") != 2:
+    if (
+        not isinstance(thresholds, dict)
+        or thresholds.get("schema_version") != THRESHOLDS_SCHEMA
+    ):
         raise RuntimeError("downloaded quality-thresholds.json is invalid")
 
 
@@ -398,12 +403,14 @@ def update_flag(args: argparse.Namespace) -> str | None:
     return None
 
 
-def handoff_needed(args: argparse.Namespace, payloads: Mapping[str, bytes]) -> bool:
-    # A stale installer may reject a newer skill layout (for example a bumped
-    # thresholds schema), so an update runs the downloaded installer instead.
+def newer_installer(args: argparse.Namespace, commit: str) -> bytes | None:
+    # An update fetches the target installer before the rest of the skill: a
+    # stale installer knows a stale file list and validation rules, so it hands
+    # off to the downloaded installer whenever the two differ.
     if update_flag(args) is None or os.environ.get(HANDOFF_ENV):
-        return False
-    return payloads[INSTALLER_FILE] != current_installer().read_bytes()
+        return None
+    installer = download_file(raw_url(commit, INSTALLER_FILE))
+    return None if installer == current_installer().read_bytes() else installer
 
 
 def run_downloaded_installer(
@@ -545,26 +552,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         commit = resolve_reference(args.ref)
-        payloads = download_skill(commit)
-        if handoff_needed(args, payloads):
+        installer = newer_installer(args, commit)
+        if installer is not None:
             return run_downloaded_installer(
-                payloads[INSTALLER_FILE],
-                str(update_flag(args)),
-                update_target(),
-                commit,
+                installer, str(update_flag(args)), update_target(), commit
             )
+        payloads = download_skill(commit)
         if args.update_all:
             results = update_registered_installs(payloads)
         else:
             results = [install_from_args(args, payloads)]
         finish_installations(results, commit)
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-        json.JSONDecodeError,
-        SyntaxError,
-    ) as error:
+    except (OSError, RuntimeError, ValueError, SyntaxError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     return 0

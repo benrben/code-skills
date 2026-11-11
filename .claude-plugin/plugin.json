@@ -2,13 +2,13 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "code-skills",
   "displayName": "Code Discipline",
-  "version": "2.3.0",
-  "description": "Engineering discipline with reusable formatting, type, contract, test, dead-code, mutation, flake, and architecture gates.",
+  "version": "3.0.0",
+  "description": "Engineering discipline with ten generic quality gates for any language: no shortcuts, secrets, file size, project checks, tests, coverage, complexity, duplication, dead code, and vulnerable dependencies.",
   "author": {
     "name": "Ben Reich",
     "url": "https://github.com/benrben"
   },
   "homepage": "https://github.com/benrben/code-skills",
   "repository": "https://github.com/benrben/code-skills",
-  "keywords": ["engineering", "quality", "coverage", "mutation-testing", "architecture"]
+  "keywords": ["engineering", "quality", "quality-gates", "coverage", "complexity", "duplication", "dead-code", "secrets", "vulnerabilities"]
 }

@@ -16,8 +16,8 @@ available.
 ## Bootstrap
 
 1. Inspect manifests, lockfiles, existing scripts, formatter/linter/type/test
-   configuration, coverage output, schemas, and module layout. Record existing
-   worktree changes before editing.
+   configuration, and coverage output. Record existing worktree changes before
+   editing.
 2. Inspect whether the repository's runtime and dependencies are already
    available. Do not restore them. A missing runtime, incomplete offline cache,
    or absent dependency produces `BLOCKED` evidence with the missing
@@ -28,318 +28,275 @@ available.
    executing checks:
 
    ```bash
-   python3 <skill-directory>/scripts/repo_quality_gate.py --root . --init
+   python3 <skill-directory>/scripts/quality_loop.py --root . --init
    ```
+
+   `<skill-directory>/scripts/quality --root . --init` does the same through the
+   launcher. `--init` writes `.quality/quality-gate.json` for gate choices,
+   commands, and adapters and `.quality/quality-thresholds.json` for every
+   numeric limit, creates a git repository when none exists, and exits. It runs
+   no checks, asks no questions, and never overwrites an existing file.
 
    Save each gate's ON/OFF choice in `quality-gate.json` under `gates` and numeric
    limits in `quality-thresholds.json`. Preserve these project choices on later
    runs. Do not edit bundled defaults or other projects. An enabled gate needs
    real evidence; missing tooling must not silently disable it.
 
-   The terminal convenience command `<skill-directory>/scripts/quality --root . --init`
-   remains available for a baseline-first setup. It performs a read-only scan, then creates
-   `.quality/project-profile.json` for detected facts and confirmed product
-   intent, `.quality/quality-gate.json` for commands/adapters,
-   `.quality/quality-thresholds.json` for every numeric quality goal, and a
-   generated `.quality/quality-dependencies.json` skeleton (workspace packages
-   become modules with the directions their manifests declare; otherwise one
-   module). For npm workspaces it writes per-package Vitest coverage commands
-   merged through `--merge-lcov`. Mutation testing and flaky detection start
-   off; enable them with explicit project choices when asked. It runs and prints the baseline before asking at most three product,
-   runtime, or risk questions. Detection is evidence, not architecture intent.
-   In CI or an agent workflow use `--non-interactive`; answer printed questions
-   with repeatable `--answer KEY=VALUE` arguments. Use `--setup product`,
-   `--setup runtime`, or `--setup risk` to resume one group, and
-   `--show-profile` for a read-only preview. When a skill update adds
-   a goal, the next loop run writes it into `.quality/quality-thresholds.json`
-   with the bundled default and reports it; values already there never change.
+   A thresholds file from an older skill version (`schema_version` 2) is
+   migrated: `metrics.coverage_limit` and `metrics.branch_coverage_limit`
+   become the `coverage` limits, `metrics.complexity_limit`,
+   `metrics.crap_limit`, `portable_analysis.max_cognitive_complexity`, and
+   `portable_analysis.max_nesting_depth` become the `complexity` limits,
+   `file_loc.max_lines` is kept, and `test_execution.min_executed` and
+   `max_skipped` move to `tests`. Other old limits are dropped. The runner
+   migrates in memory and writes the file back only in flows that already
+   write thresholds, such as `--init`.
 4. Configure non-mutating, non-installing check commands as JSON argument arrays. Use
    `["bash", "-lc", "..."]` only when a check truly requires pipes, globbing,
    command substitution, or another shell feature.
 5. Run `--fast` until every executed check is green, then run without `--fast`.
-   Put that exact full command in CI. Never make CI and local development use
-   different thresholds.
+   `--fast` defers only the vulnerability check, which needs network access, so
+   a fast run never certifies. Put that exact full command in CI. Never make CI
+   and local development use different thresholds.
 
-The project profile covers product behavior, integration, performance,
-reliability, UI/accessibility, security, supply chain, infrastructure, data
-safety, observability, operations, governance, and language semantics. Static
-and repository metrics run immediately. Production and organization metrics
-need confirmed values or adapter commands. A missing value stays visible as
-`NEEDS CONTEXT`, `NOT CONFIGURED`, or `UNSUPPORTED`; the report never replaces
-it with a guessed number.
+## How the gates judge a change
 
-## Configure each quality area
+The ten gates are generic: they work for any language without project setup,
+and they use only what the repository already has or pinned tools the skill
+installs into its own cache. With `--local-changes` or `--commit REF` they judge
+the agent's change: the lines it added or edited, the functions containing
+them, the files it grew, and the dependency versions it introduced. Without
+those flags every file counts. They run in this order: no shortcuts, secrets,
+file size, project checks, tests, coverage, complexity, duplication, dead code,
+and vulnerable dependencies.
 
-### 1. Formatter and lint
+A gate that cannot measure reports `BLOCKED` with the missing prerequisite,
+never PASS. Only project checks (no declared commands) and vulnerable
+dependencies (no dependency manifest) may be `NOT APPLICABLE`; every other
+gate must measure.
 
-Use the repository's already installed formatter and linter, or the skill's
-isolated pinned analyzer. Add check-mode commands under `format_lint.commands`;
-commands must report drift and must not rewrite files or dependencies. Prefer
-existing project scripts when they already cover the full production scope.
+## Configure each gate
 
-- Python: Ruff (`ruff format --check .`, `ruff check .`) or the repository's
-  established Black/isort/linter combination.
-- JavaScript/TypeScript: Prettier check plus ESLint, usually through package
-  scripts such as `format:check` and `lint`.
-- Go: a check around `gofmt -l` plus `go vet` or the established linter.
-- Rust: `cargo fmt --check` and `cargo clippy --all-targets --all-features
-  -- -D warnings`.
+### 1. No shortcuts
 
-### 2. Static types
+This gate catches ways an agent can make the other checks pass without doing
+the work. It needs no tools. It fails on:
 
-Use the strictest mode the repository currently promises and include every
-production package. Configure `types.commands`; do not silently narrow it to the
-changed file because unchanged callers must still type-check.
+- New suppression, skip, or focus markers on added lines of any changed text
+  file, including tests and configuration. Examples are `# type: ignore`,
+  `# noqa`, `@ts-ignore`, `eslint-disable`, `//nolint`, `#[allow(`,
+  `@SuppressWarnings`, `rubocop:disable`, `pragma: no cover`,
+  `istanbul ignore`, `@pytest.mark.skip`, `.skip(`, `.only(`, `xit(`,
+  `t.Skip(`, `#[ignore]`, `@Disabled`, and `XCTSkip`.
+- New error handlers in production files that silently swallow a failure: a
+  Python `except` whose body is only `pass`, `...`, `continue`, or `return`; an
+  empty `catch` or one that only returns `null`, `nil`, or `undefined`; a
+  JavaScript `.catch(() => {})`; an empty Go `if err != nil {}` or `_ = err`;
+  and a Ruby `rescue` followed directly by `end` or `nil`.
+- Production files hidden from the checks by source settings.
+- A change to `.quality/quality-gate.json` or `.quality/quality-thresholds.json`.
+  Policy belongs to the user. After the user confirms the change, rerun with
+  `--allow-policy-change`. Generated `.quality/` files are never findings.
 
-- Python: mypy or pyright with repository-owned configuration.
-- TypeScript: `tsc --noEmit` against the production `tsconfig`.
-- Go and Rust: the normal compile/check command (`go test`/`go vet`, `cargo
-  check --all-targets --all-features`) can serve as the type gate when it covers
-  the complete build.
+A changed check configuration, such as `tsconfig.json`, an ESLint or Ruff
+config, `pyproject.toml`, or `package.json`, is listed for review but does not
+fail: confirm the change does not weaken checks. The fix for a finding is to
+remove the marker and fix its cause, raise or visibly handle the error, or
+restore the source settings.
 
-### 3. Contracts and schemas
+Limits: markers are matched as text, so a disguised suppression is not caught,
+and a marker that existed before the change is not reported in change scope.
 
-Commit schemas and compatibility policy. The runner automatically discovers
-OpenAPI documents and `*.schema.json`; install the matching validator or add
-repository-specific commands under `contracts.commands`. Add consumer/provider,
-database migration, protobuf, GraphQL, or generated-client compatibility checks
-when those are real public contracts. A syntax-only schema check is insufficient
-when compatibility is the actual promise.
+### 2. Secrets
 
-### 4. Tests, coverage, and complexity
+This gate stops a credential from reaching history. It needs no tools. It
+scans every line of every changed text file, including `.env`, YAML, JSON,
+TOML, tests, and docs, so a secret already present in a touched file still
+fails. It recognizes private key blocks and the token formats of AWS, GitHub,
+GitLab, Slack, Stripe, Anthropic, OpenAI, Google API keys, npm, PyPI, Hugging
+Face, SendGrid, and Twilio. Reports name the kind and line, never the value.
+Remove the secret, rotate it, and load it from the environment instead.
 
-Set `test.command` to one deterministic command that runs the complete required
-suite, prints a supported native test-count summary, and exits nonzero on any
-failure. Use a coverage provider already present in the project or installed in
-the skill cache. Prefer a supported report (Coverage.py JSON, Istanbul
-JSON, LCOV, Cobertura/JaCoCo XML, or Go cover profile); otherwise configure a
-normalized `metrics.command` and `metrics.report` containing every production
-function. Inferred Go tests use `go test -json ./...` so individual pass, fail,
-and skip events remain machine-verifiable without another tool.
+Limits: only these known formats are detected. Generic passwords and other
+high-entropy strings are not.
 
-The numeric goals live only in `.quality/quality-thresholds.json`:
-`metrics.coverage_limit`, `metrics.branch_coverage_limit`,
-`metrics.complexity_limit`, and `metrics.crap_limit`. Legacy `craap_limit` and
-`--craap` are accepted as aliases; new configuration and reports use CRAP. The default requires
-100% executable-line and branch coverage, cyclomatic complexity at most 6, and
-CRAP at most 6 per function. Do not use file-average coverage or omit hard
-functions from an adapter report.
+### 3. File size
 
-The built-in metrics use these exact rules:
+File size requires no external tool. The runner counts physical lines in every
+selected production source file, including code, comments, and blank lines.
+`file_loc.max_lines` in `.quality/quality-thresholds.json` defaults to 600. In
+change scope a file fails when the change pushes it over the limit, a new file
+starts over it, or a file that is already over it grows. In whole-repository
+scope every production file over the limit fails. A failure is a design prompt
+to split cohesive responsibilities while preserving behavior; never minify
+code, remove useful documentation, or exclude a file to evade it.
 
-- Function coverage is `covered executable lines / reported executable lines`.
-  A line is covered when its hit count is greater than zero. Named nested
-  function lines belong only to the nested function, not its parent. This is
-  line coverage. Branch coverage is a separate per-function pass condition:
-  `covered branch outcomes / reported branch outcomes`. A function with no
-  decisions has 100% branch coverage. A function with decisions fails when the
-  configured coverage report does not contain branch data.
-- Python complexity starts at 1. It adds paths for conditionals, loops,
-  exceptions, Boolean operators, comprehensions, and non-default `match`
-  cases. Each comprehension `for` and filter adds one. Each extra OR-pattern
-  alternative adds one. An unguarded wildcard or capture case is the default
-  and adds nothing. Named nested functions are measured separately; lambda
-  paths belong to the containing function.
-- Python `.pyi` functions, `@overload` declarations, and stub-body
-  `@abstractmethod` declarations have no coverage requirement, but their
-  complexity is still checked. A normal function whose body is `pass` is not a
-  stub and still requires coverage.
-- CRAP is always recalculated by the gate, including for normalized adapters:
+### 4. Project checks
+
+This gate runs the lint, type, format, and build commands the repository
+already declares, so an agent cannot finish with code the project's own tools
+reject. It uses only the repository's tools and never installs any:
+
+- `package.json` scripts named `lint`, `typecheck`, `type-check`, `types`,
+  `check-types`, `tsc`, `format:check`, `check-format`, `fmt:check`,
+  `prettier:check`, `check`, or `build`, run through the repository's package
+  manager. A TypeScript project without a type script also runs the local
+  `node_modules/.bin/tsc --noEmit` when it exists.
+- Python: `ruff check .` and `ruff format --check .`, and `mypy`, each only
+  when configured and installed in the project environment.
+- Go: `go vet ./...` and `gofmt -l .` (any listed file fails).
+- Rust: `cargo check --all-targets --frozen --offline`, plus
+  `cargo fmt --check` when rustfmt is available.
+- .NET: `dotnet build --no-restore`. Swift: `swift build`.
+- Makefile targets `lint`, `typecheck`, or `check`.
+
+Commands under `project_checks.commands` in `.quality/quality-gate.json`
+replace inference. Each command must exit 0. Use the strictest mode the
+repository currently promises and include every production package; do not
+narrow a check to the changed file, because unchanged callers must still pass.
+A command that cannot fail or that rewrites files, such as one with `--fix`,
+`--write`, or `|| true`, is rejected. A missing executable reports `BLOCKED`, a
+timeout fails, and a repository without any such command is `NOT APPLICABLE`.
+
+### 5. Tests
+
+This gate runs the test suite once and proves that tests really ran. Set
+`test.command` to one deterministic command that runs the complete required
+suite and exits nonzero on any failure; otherwise the runner infers the usual
+command for Python, Node, Go, Rust, Maven, Gradle, .NET, Ruby, PHP, Swift,
+Dart, Elixir, and C/C++ (CMake with CTest, or Meson, built in a directory of
+the run's own). It reads the runner's own summary. When the console has no
+summary, configure `test.junit` with the JUnit XML report globs.
+
+The gate fails when the command fails or times out, when any test fails, when
+any test is skipped, deselected, or filtered out, when fewer than
+`tests.min_executed` tests run, or when the test count drops below the last
+full run. If the user approved removing tests, rerun with
+`--allow-test-removal`. Output without a recognizable summary reports
+`BLOCKED`. Make the suite deterministic: isolated temporary state, controlled
+clocks and randomness, unique ports, and cleanup that runs on failure.
+
+### 6. Coverage
+
+This gate checks that tests reach the code the change added or edited, so an
+agent cannot add untested behavior. It reads the coverage report from the same
+test run; tests never run twice. The measured lines are the changed lines that
+the report marks as executable. A changed production file the tests never
+loaded counts all lines inside its functions as uncovered. Line coverage must
+reach `coverage.line_coverage_limit` and branch coverage
+`coverage.branch_coverage_limit` (90% each by default). When the runtime
+reports no branch data, branch coverage is shown as not reported. A change with
+no executable lines, such as documentation only, passes. A missing or stale
+report after a successful test run reports `BLOCKED`.
+
+The runner wraps the test command with the language's coverage tool:
+
+| Language | How coverage is measured | Tools |
+| --- | --- | --- |
+| Python | coverage.py with branch measurement | pinned coverage.py in the skill cache |
+| JavaScript/TypeScript | Jest or Vitest built-in coverage; other Node test commands use V8 coverage converted by c8 | the project's Jest or Vitest coverage package; pinned c8 in the skill cache |
+| Go | `go test -coverprofile` | Go toolchain |
+| Rust | `cargo llvm-cov` | cargo-llvm-cov in the skill cache |
+| Java/Kotlin (Maven, Gradle) | JaCoCo agent and report | pinned JaCoCo jars in the skill cache |
+| .NET | `XPlat Code Coverage` collector | the `coverlet.collector` package in the test projects |
+| Ruby | Ruby's built-in `Coverage` module | none |
+| Swift | `swift test --enable-code-coverage` | Swift toolchain |
+| PHP | PHPUnit Cobertura report | the pcov or Xdebug PHP extension |
+| C/C++ (CMake, Meson) | `--coverage` build read with gcov or `llvm-cov gcov` | CMake or Meson, a C/C++ compiler, and its gcov |
+
+PHP without pcov or Xdebug cannot produce a report. Coverage reports `BLOCKED`
+for it until the project installs the PHP extension or configures an adapter. Set `coverage.command`, `coverage.report`, and
+`coverage.format` in `.quality/quality-gate.json`; a configured adapter always
+wins. Supported formats are `coverage-json`, `istanbul-json`, `lcov`,
+`cobertura`, `jacoco`, `go-cover`, `llvm-cov-json`, `ruby-coverage`, and
+`gcov`.
+`{root}` and `{out_dir}` are substituted in configured values.
+
+### 7. Complexity
+
+This gate stops a change from leaving functions too hard to follow or test. It
+uses lizard, a pinned analyzer the skill installs into its cache, which reads
+most mainstream languages. For each function the change touches it checks:
+
+- cyclomatic complexity (independent paths), at most `complexity.cyclomatic_limit` (10);
+- cognitive complexity (how hard the control flow is to follow), at most
+  `complexity.cognitive_limit` (15);
+- nesting depth, at most `complexity.nesting_limit` (4); control structures,
+  `catch`/`except`, ternaries, and lambdas add a level, a `try` body and a
+  `with` block do not (for Ruby, Lua, Erlang, Fortran, PL/SQL, and Structured
+  Text, nesting and its cognitive increments come from the indentation of
+  lines that start with a control keyword);
+- CRAP, at most `complexity.crap_limit` (30), using the function's line coverage:
 
   ```text
-  CRAP = complexity^2 * (1 - coverage/100)^3 + complexity
+  CRAP = complexity^2 * (1 - coverage)^3 + complexity
   ```
 
-  The uncovered fraction is limited to the range 0 through 1. Pass/fail uses
-  the unrounded score, so reports retain enough digits to explain a strict
-  `CRAP <= limit` result.
+A fully covered function scores its complexity. Without coverage data CRAP is
+not computed, and the report says so. Lizard's own forgiveness comments are
+ignored so they cannot hide a function. Files lizard cannot read are listed as
+not analyzed. Limits: lizard parses quickly without compiling, so unusual
+syntax can be measured approximately.
 
-With the default 100% coverage limit, every passing function has
-`CRAP = complexity`. The CRAP value still ranks failures by risk, but it adds
-an independent pass condition only when a repository chooses a coverage limit
-below 100% or a CRAP limit different from its complexity limit.
+### 8. Duplication
 
-### 4.1 Branch and slow-test adapters
+This gate catches new copy-pasted code. It uses Pygments, a pinned tokenizer
+in the skill cache. It compares code tokens rather than text, so renamed
+variables, changed literals, inserted blank lines, and comments do not hide a
+copy, and identical import blocks are ignored. The change is compared against
+every production file, so copying existing code is caught. A repeated stretch
+counts when it spans at least `duplication.min_tokens` tokens (50) and
+`duplication.min_lines` lines (5) on each side. The gate fails on any copy that
+touches a changed line. Limits: it finds copies with the same structure, not
+code that does the same thing differently. Files without a Pygments lexer are
+skipped.
 
-Prefer branch data from the repository's existing coverage tool. Python uses
-Coverage.py with `coverage run --branch` followed by `coverage json`. JavaScript
-and TypeScript use Istanbul JSON or LCOV with branch records. JVM projects use
-Cobertura or JaCoCo XML. Go cover profiles contain line/block coverage only, so
-use a normalized metrics adapter when branch coverage is required. Each
-normalized function may provide `covered_branches`, `total_branches`,
-`branch_coverage_percent`, and `branch_coverage_measured`.
+### 9. Dead code
 
-Slow-test detection needs no extra Python package when the runner can print
-timings: add `--durations 0` to `unittest` or `--durations=0` to pytest. For any
-other runner, generate JUnit XML and configure:
+This gate catches functions the change leaves unused: new functions nothing
+calls, and functions whose last caller the change removed. It reuses lizard's
+function list and needs no other tool. A function is unused when no
+production file mentions its name. A call from a test does not count: a
+function that only tests call is reported as "only tests call it". Entry points
+such as `main`, constructors, and tests are not reported. Decorated or
+annotated functions, methods, and exported or public functions are listed for
+review rather than failed, because frameworks or other packages may call them.
+A private function with no references fails, and so does a new top-level
+Python or Ruby function. Delete the function or call it from the code that
+needs it. Limits: the search is by name, so a function called only through a
+string or reflection can be reported, and an unrelated use of the same name
+hides one.
 
-```json
-{
-  "slow_tests": {
-    "enabled": true,
-    "report": "build/junit.xml",
-    "format": "junit",
-    "require_individual_timings": true
-  }
-}
-```
+### 10. Vulnerable dependencies
 
-The gate also accepts normalized JSON with a `tests` array. Every row contains
-`name`, `path`, `duration_seconds`, and optional `status`. The limits are
-`slow_tests.max_test_seconds` and `slow_tests.max_suite_seconds` in the
-threshold file. When individual timings are unavailable, the complete-suite
-limit is still enforced unless `require_individual_timings` is true.
-
-### 4.2 Extensibility and error handling
-
-Extensibility uses built-in commands and import analysis, so there is no
-required package. Configure one scenario for each supported extension type,
-plus the stable core and replaceable extension paths:
-
-```json
-{
-  "extensibility": {
-    "enabled": true,
-    "required": true,
-    "scenarios": [
-      {"name": "loads a third-party plug-in", "command": ["npm", "run", "test:plugin"]}
-    ],
-    "core": ["src/core/**"],
-    "extensions": ["src/plugins/**"]
-  }
-}
-```
-
-Contract coverage is the percentage of configured scenarios that pass. The
-dependency check fails when stable core files import replaceable extension
-files. Set the goals with `extensibility.contract_coverage_limit` and
-`extensibility.max_core_to_extension_dependencies`.
-
-Error handling is built in. The Python AST scanner finds `except` handlers;
-the generic scanner recognizes brace-style `catch` handlers and Go
-`err != nil` blocks. It reports two independent metrics: coverage of handler
-entry lines, and high-confidence silent handlers whose body is empty or only
-`pass`. For a brace-style `catch`, LCOV `BRDA` evidence on the catch entry has
-priority: the catch is covered only when that branch outcome ran. The scanner
-falls back to covered handler lines when the report has no catch-branch data.
-The HTML labels the evidence as `branch`, `line`, or `unmeasured`. Python
-`except` and Go error blocks use line evidence because their native reports do
-not identify a portable catch outcome. Configure the limits with
-`error_handling.failure_path_coverage_limit` and
-`error_handling.max_silent_handlers`. Failure-path coverage requires the same
-fresh line-coverage report used by the function gate.
-
-### 4.3 Composed-test integrity
-
-The built-in anti-vacuous-mock check needs no package. It applies only to test
-files identified as composed-root tests. Its intentionally narrow rules reject:
-
-- `vi.mock` or `jest.mock` of a relative production module inside the same
-  package; and
-- a canvas/render context replaced with `null`.
-
-External package mocks and lower-level tests outside the configured root-test
-patterns are allowed. Configure the patterns for the repository's application
-shells:
-
-```json
-{
-  "test_integrity": {
-    "enabled": true,
-    "required": true,
-    "composed_root_tests": ["**/App.test.*", "**/Root.test.*"],
-    "forbid_same_package_mocks": true,
-    "forbid_null_render_surfaces": true
-  }
-}
-```
-
-This is a structural guard, not a general mock detector. A composed-root test
-should use the real same-package modules and a usable render surface so it can
-observe repaint, synchronization, and composition failures.
-
-### 5. Dead code
-
-Install and configure a high-confidence detector, then place its complete command
-under `dead_code.commands`. Use the repository's public-entrypoint and framework
-configuration to avoid false positives; do not add broad exclusions merely to
-make it green.
-
-- Python: Vulture with an intentional minimum confidence and explicit source
-  roots.
-- JavaScript/TypeScript: Knip or the repository's established unused-export
-  checker.
-- Other ecosystems: use the language's maintained unused-code analyzer or a
-  normalized project script.
-
-### 6. Flaky-test detection
-
-Make the baseline suite deterministic first: isolated temporary state, controlled
-clocks/randomness, unique ports, awaited background work, and cleanup that runs
-on failure. The full gate repeats `test.command`; the repeat count is
-`flaky_tests.runs` in `.quality/quality-thresholds.json` (default 3). Do not use retries,
-quarantine, or order randomization as a substitute for fixing known flakes.
-
-### 7. Mutation testing
-
-Set `mutation.test_command` to the real assertion-bearing test command. For
-Vitest, the gate may use Stryker only when its core and Vitest runner are already
-installed; it never runs `npm install`. A dedicated `vitest.mutation.config.*`
-may select fast unit tests, but the separate baseline command must still run the
-complete suite. Other stacks use the portable mutation engine unless a
-normalized adapter is configured. The final run must be uncapped, and every
-in-scope mutant must be killed.
-
-### 8. Module boundaries
-
-Create `.quality/quality-dependencies.json` from intended architecture, not current
-imports. Every production file must match exactly one named module. For every
-module, declare the modules it may import and explicit denied directions where
-useful. The built-in checker handles common imports; configure
-`dependencies.command` plus `dependencies.edges_report` for unsupported syntax.
-Prove one deliberately forbidden edge fails before trusting the CI rule.
-
-### 9. Runs (smoke)
-
-For an interactive app, configure `smoke.story` with the command that drives
-the complete core workflow from outside the process and writes structured JSON.
-Use `{report_dir}` when the probe accepts an output directory, or `{report}`
-when it accepts the exact file. Set `minimum_probes` to the expected story
-length and keep `fail_on_page_errors` enabled. The report must contain a
-`steps` array whose rows have `step` (or `name`) and Boolean `ok`, plus an
-optional `page_errors` array. The file must be created or changed by the current
-run; stale evidence fails.
-
-The repository owner prepares whatever its probe needs before the quality run.
-For Playwright this includes the package, browser, and operating-system libraries;
-the gate reports a blocker when any is missing and never installs them.
-The probe must start or attach to the real app, exercise the public UI/API, and
-clean up its process. For a CLI or library, configure `smoke.commands` with its
-real entry point. The simpler bundled `scripts/smoke_check.py` remains suitable
-when loading one page is the complete user story. The ship report is red until
-the configured smoke check passes.
-
-## File LOC
-
-File LOC requires no external tool. The runner counts physical lines in every
-selected production source file, including code, comments, and blank lines.
-`file_loc.max_lines` in `.quality/quality-thresholds.json` defaults to 600. A failure is
-a design prompt to split cohesive responsibilities while preserving behavior;
-never minify code, remove useful documentation, or exclude a file to evade it.
+This gate stops a change from adding a dependency version with a known
+vulnerability. It reads the repository's lockfiles, including
+`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`,
+`Pipfile.lock`, `Cargo.lock`, `go.mod`, `Gemfile.lock`, `composer.lock`, and
+`packages.lock.json`, and queries the OSV advisory database, so it needs
+network access. Other lockfiles, such as `bun.lock`, `mix.lock`, and
+`Package.resolved`, report `BLOCKED`. In change scope it runs only when a
+manifest or lockfile changed and checks only new or changed versions. A
+manifest with dependencies but no lockfile fails, because its versions cannot
+be checked; add a lockfile. Ecosystems without a readable lockfile, such as
+Maven, Gradle without dependency locking, or .NET without
+`packages.lock.json`, report `BLOCKED`, and a library crate without
+`Cargo.lock` is only noted. A network failure reports `BLOCKED`. A repository
+without any dependency manifest is `NOT APPLICABLE`. `--fast` defers this
+gate.
 
 ## Verify the environment
 
 Run these in order and retain the generated JSON state and HTML report:
 
 ```bash
-<skill-directory>/scripts/quality --root . --fast --no-install
-<skill-directory>/scripts/quality --root . --no-install
+<skill-directory>/scripts/quality --root . --fast
+<skill-directory>/scripts/quality --root .
 ```
 
-Use `--no-install` for the proof after setup: success then demonstrates that the
-repository and CI environment contain every required tool rather than depending
-on an ephemeral agent cache. Confirm all configured commands appear in command
-evidence, all applicable gates pass, thresholds in `.quality/quality-gate-state.json`
-match `.quality/quality-thresholds.json`, and the full command exits 0. If a gate is
-`NOT APPLICABLE` but the repository needs it, add its command and set its
-`required` flag in `.quality/quality-gate.json`.
+The first run installs any missing pinned tools into the skill cache. Add
+`--no-install` to prove the cache and repository already contain every required
+tool; a missing tool then reports `BLOCKED`. Confirm all configured commands
+appear in command evidence, all applicable gates pass, thresholds in
+`.quality/quality-gate-state.json` match `.quality/quality-thresholds.json`, and
+the full command exits 0.

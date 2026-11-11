@@ -1,15 +1,39 @@
 {
+  "gates": {
+    "shortcuts": true,
+    "secrets": true,
+    "file_loc": true,
+    "project_checks": true,
+    "tests": true,
+    "coverage": true,
+    "complexity": true,
+    "duplication": true,
+    "dead_code": true,
+    "vulnerabilities": true
+  },
   "source": {
-    "include": [
-      "repo_quality_gate.py",
-      "skills/code-discipline/scripts/*.py"
-    ],
+    "include": [],
     "exclude": [
-      "tests/**"
-    ],
-    "extensions": [
-      ".py",
-      ".pyi"
+      "tests/**",
+      "test/**",
+      "spec/**",
+      "e2e/**",
+      "**/tests/**",
+      "**/test/**",
+      "**/__tests__/**",
+      "**/__mocks__/**",
+      "**/*_test.*",
+      "**/test_*.*",
+      "**/*.test.*",
+      "**/*.spec.*",
+      "**/*_spec.*",
+      "**/*.test-d.*",
+      "**/*Test.java",
+      "**/*Tests.java",
+      "**/*Test.kt",
+      "**/*Tests.kt",
+      "**/*Tests.cs",
+      "**/*Tests.swift"
     ]
   },
   "test": {
@@ -19,15 +43,11 @@
       "unittest",
       "discover",
       "-s",
-      "tests",
-      "--durations",
-      "0"
+      "tests"
     ],
-    "timeout_seconds": 600
+    "timeout_seconds": 900
   },
-  "format_lint": {
-    "enabled": true,
-    "required": true,
+  "project_checks": {
     "commands": [
       [
         ".venv/bin/python",
@@ -47,14 +67,7 @@
         "repo_quality_gate.py",
         "skills/code-discipline/scripts",
         "tests"
-      ]
-    ],
-    "timeout_seconds": 300
-  },
-  "types": {
-    "enabled": true,
-    "required": true,
-    "commands": [
+      ],
       [
         ".venv/bin/python",
         "-m",
@@ -70,184 +83,12 @@
     ],
     "timeout_seconds": 600
   },
-  "contracts": {
-    "enabled": true,
-    "required": true,
-    "commands": [
-      [
-        ".venv/bin/check-jsonschema",
-        "--schemafile",
-        "schemas/plugin-manifest.schema.json",
-        ".codex-plugin/plugin.json",
-        ".claude-plugin/plugin.json"
-      ]
-    ],
-    "patterns": [
-      "schemas/*.schema.json"
-    ],
-    "timeout_seconds": 300
-  },
-  "metrics": {
-    "command": null,
-    "report": null,
-    "coverage_commands": [
-      [
-        ".venv/bin/python",
-        "-m",
-        "coverage",
-        "erase"
-      ],
-      [
-        ".venv/bin/python",
-        "-m",
-        "coverage",
-        "run",
-        "--branch",
-        "-m",
-        "unittest",
-        "discover",
-        "-s",
-        "tests"
-      ],
-      [
-        ".venv/bin/python",
-        "-m",
-        "coverage",
-        "combine"
-      ],
-      [
-        ".venv/bin/python",
-        "-m",
-        "coverage",
-        "json",
-        "--ignore-errors",
-        "-o",
-        ".quality/coverage.json"
-      ]
-    ],
-    "coverage_report": ".quality/coverage.json",
-    "coverage_format": "coverage-json",
-    "timeout_seconds": 600
-  },
-  "slow_tests": {
-    "enabled": true,
-    "require_individual_timings": true,
-    "timeout_seconds": 600
-  },
-  "extensibility": {
-    "enabled": true,
-    "required": true,
-    "scenarios": [
-      {
-        "name": "normalized metrics adapter accepts a custom language",
-        "command": [
-          ".venv/bin/python",
-          "-m",
-          "unittest",
-          "tests.test_repo_quality_gate.QualityGateEndToEndTests.test_complete_generic_adapter_run_passes_and_writes_html"
-        ]
-      }
-    ],
-    "core": [
-      "skills/code-discipline/scripts/repo_quality_gate.py"
-    ],
-    "extensions": [
-      "skills/code-discipline/scripts/quality_report.py"
-    ],
-    "timeout_seconds": 300
-  },
-  "error_handling": {
-    "enabled": true
-  },
-  "mutation": {
-    "enabled": false,
-    "engine": "builtin",
-    "incremental": true,
-    "test_command": [
-      ".venv/bin/python",
-      "-m",
-      "unittest",
-      "tests.test_repo_quality_gate",
-      "--failfast"
-    ],
-    "test_files": [
-      "tests/test_repo_quality_gate.py"
-    ],
-    "timeout_seconds": 600,
-    "max_mutants": 0,
-    "workers": "auto",
-    "operators": {
-      "==": "!=",
-      "!=": "==",
-      "<=": ">",
-      ">=": "<",
-      "<": ">",
-      ">": "<",
-      "+": "-",
-      "-": "+"
-    },
-    "exclude": []
-  },
-  "dead_code": {
-    "enabled": true,
-    "required": true,
-    "commands": [
-      [
-        ".venv/bin/python",
-        "-m",
-        "vulture",
-        "repo_quality_gate.py",
-        "skills/code-discipline/scripts",
-        "--min-confidence",
-        "100"
-      ]
-    ],
-    "timeout_seconds": 300
-  },
-  "flaky_tests": {
-    "enabled": false,
-    "timeout_seconds": 600
-  },
-  "dependencies": {
-    "command": null,
-    "edges_report": null,
-    "rules": ".quality/quality-dependencies.json",
-    "timeout_seconds": 300
-  },
+  "coverage": {},
   "tools": {
     "auto_install": false,
     "cache_dir": null
   },
-  "smoke": {
-    "enabled": true,
-    "commands": [
-      [
-        ".venv/bin/python",
-        "skills/code-discipline/scripts/quality_loop.py",
-        "--version"
-      ],
-      [
-        ".venv/bin/python",
-        "skills/code-discipline/scripts/smoke_check.py",
-        "--version"
-      ]
-    ],
-    "timeout_seconds": 120
-  },
-  "gherkin": {
-    "enabled": true,
-    "command": [
-      ".venv/bin/python",
-      "-m",
-      "behave",
-      "tests/features",
-      "--format",
-      "json",
-      "--outfile",
-      "{report}"
-    ],
-    "report": ".quality/gherkin.json",
-    "format": "behave-json",
-    "timeout_seconds": 300
+  "setup": {
+    "completed": true
   }
 }

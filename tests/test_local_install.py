@@ -11,13 +11,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.test_repo_quality_gate import load_script
-
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "skills/code-discipline"
-SCRIPT = SOURCE / "scripts/install_local.py"
 LAUNCHER = SOURCE / "scripts/quality"
-local = load_script("local_install_tests", SCRIPT)
+if str(SOURCE / "scripts") not in sys.path:
+    sys.path.insert(0, str(SOURCE / "scripts"))
+
+import install_local as local  # noqa: E402
 
 
 class LocalInstallTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class LocalInstallTests(unittest.TestCase):
             quality = root / ".quality"
             quality.mkdir(parents=True)
             config = quality / "quality-gate.json"
-            config.write_text('{"gates":{"quality":false}}\n')
+            config.write_text('{"gates":{"tests":false}}\n')
             git = root / ".git"
             git.mkdir()
             head = git / "HEAD"
@@ -56,7 +56,7 @@ class LocalInstallTests(unittest.TestCase):
                 (root / ".claude/skills/code-discipline").resolve(), target
             )
             self.assertEqual(json.loads(registry.read_text()), [str(target)])
-            self.assertEqual(config.read_text(), '{"gates":{"quality":false}}\n')
+            self.assertEqual(config.read_text(), '{"gates":{"tests":false}}\n')
             self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
             self.assertFalse((quality / "quality-thresholds.json").exists())
             self.assertIn("continue setup in this chat, before handoff", result.stdout)

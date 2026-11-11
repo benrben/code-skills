@@ -1,3 +1,4 @@
+import http.client
 import importlib.util
 import json
 import sys
@@ -65,10 +66,10 @@ class PortableInventoryTests(unittest.TestCase):
     def test_unsupported_lockfiles_are_explicit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "yarn.lock").write_text("left-pad@1.0.0:\n", encoding="utf-8")
+            (root / "bun.lock").write_text("{}\n", encoding="utf-8")
             inventory = scanner.discover_locked_packages(root)
             self.assertEqual(inventory.packages, ())
-            self.assertEqual(inventory.unsupported, ("yarn.lock",))
+            self.assertEqual(inventory.unsupported, ("bun.lock",))
 
     def test_extracts_each_supported_ecosystem_and_ignores_cache_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -173,6 +174,343 @@ class PortableInventoryTests(unittest.TestCase):
         self.assertIsNone(scanner._locked("npm", "x", "latest", "lock"))
         item = scanner._locked("Go", "example.com/x", "v1.2.0", "go.mod")
         self.assertEqual(item.version, "1.2.0")
+
+
+YARN_CLASSIC = """# yarn lockfile v1
+
+
+"@babel/code-frame@^7.0.0", "@babel/code-frame@^7.10.4":
+  version "7.12.13"
+  resolved "https://registry.yarnpkg.com/@babel/code-frame/-/code-frame-7.12.13.tgz"
+  dependencies:
+    "@babel/highlight" "^7.12.13"
+
+lodash@^4.17.20:
+  version "4.17.21"
+"""
+
+YARN_BERRY = """__metadata:
+  version: 6
+  cacheKey: 8
+
+"lodash@npm:^4.17.20":
+  version: 4.17.21
+  resolution: "lodash@npm:4.17.21"
+
+"my-app@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "my-app@workspace:."
+"""
+
+PNPM_V9 = """lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.17.20
+        version: 4.17.21
+
+packages:
+
+  '@babel/core@7.24.0':
+    resolution: {integrity: sha512-x}
+
+  lodash@4.17.21:
+    resolution: {integrity: sha512-y}
+
+snapshots:
+
+  ignored@1.0.0: {}
+"""
+
+PNPM_V6 = """lockfileVersion: '6.0'
+
+packages:
+  /@babel/core@7.0.0(supports-color@5.5.0):
+    resolution: {integrity: sha512-x}
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-y}
+"""
+
+PNPM_V5 = """lockfileVersion: 5.4
+
+packages:
+  /@babel/core/7.0.0:
+    resolution: {integrity: sha512-x}
+  /react-dom/17.0.2_react@17.0.2:
+    resolution: {integrity: sha512-y}
+  github.com/owner/repo/abcdef:
+    resolution: {tarball: x}
+"""
+
+GRADLE_LOCK = """# This is a Gradle generated file for dependency locking.
+# Manual edits can break the build and are not advised.
+com.google.guava:guava:31.1-jre=compileClasspath,runtimeClasspath
+org.slf4j:slf4j-api:2.0.9=runtimeClasspath
+empty=annotationProcessor
+"""
+
+
+PYLOCK = """lock-version = "1.0"
+created-by = "pip"
+
+[[packages]]
+name = "django"
+version = "1.11.0"
+
+[[packages.wheels]]
+name = "Django-1.11-py2.py3-none-any.whl"
+url = "https://files.example/Django-1.11-py2.py3-none-any.whl"
+
+[[packages]]
+name = "urllib3"
+version = "1.24.1"
+
+[packages.sdist]
+name = "urllib3-1.24.1.tar.gz"
+url = "https://files.example/urllib3-1.24.1.tar.gz"
+"""
+
+CARGO_WITH_PATCH = """[[package]]
+name = "anyhow"
+version = "1.0.75"
+
+[[package]]
+name = "time"
+version = "0.1.43"
+dependencies = [
+ "libc",
+]
+
+[[patch.unused]]
+name = "foo"
+version = "0.1.0"
+"""
+
+GO_MOD_BLOCKS = """module example.com/app
+
+go 1.21
+
+require (
+\tgithub.com/gin-gonic/gin v1.6.0
+\tgolang.org/x/net v0.17.0 // indirect
+\texample.com/local v1.0.0
+\texample.com/pinned v1.0.0
+\texample.com/broken v1.0.0
+)
+
+require example.com/single v2.0.0
+
+exclude (
+\tgolang.org/x/net v0.7.0
+)
+
+exclude golang.org/x/text v0.3.0
+
+replace (
+\tgithub.com/gin-gonic/gin => github.com/myfork/gin v1.9.1
+\texample.com/local => ../local
+\texample.com/pinned v0.9.0 => example.com/fork v0.9.1
+)
+
+replace example.com/broken v1.0.0 => example.com/fixed
+retract v1.0.1
+"""
+
+
+def coordinates(packages):
+    return {(item.ecosystem, item.name, item.version) for item in packages}
+
+
+class LockfileFormatTests(unittest.TestCase):
+    def test_package_lock_v1_reads_the_nested_dependency_tree(self):
+        text = json.dumps(
+            {
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "express": {
+                        "version": "4.17.1",
+                        "dependencies": {"qs": {"version": "6.7.0"}},
+                    },
+                    "broken": "not a mapping",
+                    "lodash": {"version": "4.17.20"},
+                },
+            }
+        )
+        reading = scanner.read_lockfile("package-lock.json", text, "package-lock.json")
+        self.assertEqual(
+            coordinates(reading.packages),
+            {
+                ("npm", "express", "4.17.1"),
+                ("npm", "qs", "6.7.0"),
+                ("npm", "lodash", "4.17.20"),
+            },
+        )
+        self.assertTrue(reading.lists_dependencies)
+        self.assertFalse(reading.unreadable)
+
+    def test_package_lock_v2_prefers_the_flat_packages_map(self):
+        text = json.dumps(
+            {
+                "lockfileVersion": 2,
+                "packages": {
+                    "": {"name": "app"},
+                    "node_modules/a": {"version": "1.0.0"},
+                    "node_modules/a/node_modules/b": {"version": "2.0.0"},
+                    "packages/local": {"version": "0.0.1"},
+                },
+                "dependencies": {"stale": {"version": "9.9.9"}},
+            }
+        )
+        reading = scanner.read_lockfile("npm-shrinkwrap.json", text, "x")
+        self.assertEqual(
+            coordinates(reading.packages),
+            {("npm", "a", "1.0.0"), ("npm", "b", "2.0.0")},
+        )
+
+    def test_package_lock_without_dependencies_lists_nothing(self):
+        text = json.dumps({"lockfileVersion": 3, "packages": {"": {"name": "app"}}})
+        reading = scanner.read_lockfile("package-lock.json", text, "x")
+        self.assertEqual(reading.packages, ())
+        self.assertFalse(reading.lists_dependencies)
+        self.assertEqual(
+            scanner.read_lockfile("package-lock.json", "[]", "x").packages, ()
+        )
+
+    def test_listed_packages_without_versions_are_unreadable(self):
+        text = json.dumps(
+            {"packages": {"": {}, "node_modules/x": {"resolved": "file:x"}}}
+        )
+        reading = scanner.read_lockfile("package-lock.json", text, "x")
+        self.assertTrue(reading.unreadable)
+
+    def test_yarn_classic_and_berry_lockfiles(self):
+        classic = scanner.read_lockfile("yarn.lock", YARN_CLASSIC, "yarn.lock")
+        self.assertEqual(
+            coordinates(classic.packages),
+            {("npm", "@babel/code-frame", "7.12.13"), ("npm", "lodash", "4.17.21")},
+        )
+        berry = scanner.read_lockfile("yarn.lock", YARN_BERRY, "yarn.lock")
+        self.assertEqual(coordinates(berry.packages), {("npm", "lodash", "4.17.21")})
+        self.assertTrue(berry.lists_dependencies)
+
+    def test_yarn_lockfile_with_only_a_workspace_lists_nothing(self):
+        text = '__metadata:\n  version: 6\n\n"app@workspace:.":\n  version: 0.0.0\n'
+        reading = scanner.read_lockfile("yarn.lock", text, "yarn.lock")
+        self.assertEqual(reading.packages, ())
+        self.assertFalse(reading.lists_dependencies)
+        self.assertIsNone(scanner._yarn_name("noversion:"))
+
+    def test_pnpm_lockfiles_of_each_key_style(self):
+        expected = {
+            PNPM_V9: {("npm", "@babel/core", "7.24.0"), ("npm", "lodash", "4.17.21")},
+            PNPM_V6: {("npm", "@babel/core", "7.0.0"), ("npm", "left-pad", "1.3.0")},
+            PNPM_V5: {("npm", "@babel/core", "7.0.0"), ("npm", "react-dom", "17.0.2")},
+        }
+        for text, wanted in expected.items():
+            with self.subTest(text=text[:25]):
+                reading = scanner.read_lockfile("pnpm-lock.yaml", text, "pnpm")
+                self.assertEqual(coordinates(reading.packages), wanted)
+                self.assertTrue(reading.lists_dependencies)
+
+    def test_gradle_lockfiles_use_maven_coordinates(self):
+        reading = scanner.read_lockfile(
+            "buildscript-gradle.lockfile", GRADLE_LOCK, "gradle.lockfile"
+        )
+        self.assertEqual(
+            coordinates(reading.packages),
+            {
+                ("Maven", "com.google.guava:guava", "31.1-jre"),
+                ("Maven", "org.slf4j:slf4j-api", "2.0.9"),
+            },
+        )
+        self.assertTrue(reading.lists_dependencies)
+
+    def test_requirement_ranges_do_not_count_as_listed_versions(self):
+        reading = scanner.read_lockfile(
+            "requirements.txt", "requests>=2\n# flask==1\n", "requirements.txt"
+        )
+        self.assertEqual(reading.packages, ())
+        self.assertFalse(reading.unreadable)
+
+    def test_lockfile_classification_and_unknown_names(self):
+        self.assertEqual(scanner.classify_lockfile("yarn.lock"), "supported")
+        self.assertEqual(scanner.classify_lockfile("requirements-dev.txt"), "supported")
+        self.assertEqual(scanner.classify_lockfile("gradle.lockfile"), "supported")
+        self.assertEqual(scanner.classify_lockfile("bun.lockb"), "unsupported")
+        self.assertIsNone(scanner.classify_lockfile("package.json"))
+        with self.assertRaisesRegex(ValueError, "no parser"):
+            scanner.read_lockfile("package.json", "{}", "package.json")
+        with self.assertRaises(ValueError):
+            scanner.read_lockfile("package-lock.json", "{not json", "x")
+
+    def test_requirement_pins_allow_spaces_and_triple_equals(self):
+        text = (
+            "flask==2.3.3\nDjango == 1.11.0\nurllib3===1.24.1\n"
+            "requests[socks] == 2.31.0 ; python_version > '3'\n"
+            "wild==1.*\nranged==1.0,!=1.0.1\nloose>=2\n"
+        )
+        reading = scanner.read_lockfile("requirements.txt", text, "requirements.txt")
+        self.assertEqual(
+            coordinates(reading.packages),
+            {
+                ("PyPI", "flask", "2.3.3"),
+                ("PyPI", "Django", "1.11.0"),
+                ("PyPI", "urllib3", "1.24.1"),
+                ("PyPI", "requests", "2.31.0"),
+            },
+        )
+        spaced = scanner.read_lockfile("requirements.txt", "a == 1.0\n", "r")
+        self.assertTrue(spaced.lists_dependencies)
+
+    def test_toml_lockfiles_ignore_keys_of_nested_tables(self):
+        pylock = scanner.read_lockfile("pylock.toml", PYLOCK, "pylock.toml")
+        self.assertEqual(
+            coordinates(pylock.packages),
+            {("PyPI", "django", "1.11.0"), ("PyPI", "urllib3", "1.24.1")},
+        )
+        cargo = scanner.read_lockfile("Cargo.lock", CARGO_WITH_PATCH, "Cargo.lock")
+        self.assertEqual(
+            coordinates(cargo.packages),
+            {("crates.io", "anyhow", "1.0.75"), ("crates.io", "time", "0.1.43")},
+        )
+
+    def test_go_mod_reads_require_after_replace_and_ignores_exclude(self):
+        reading = scanner.read_lockfile("go.mod", GO_MOD_BLOCKS, "go.mod")
+        self.assertEqual(
+            coordinates(reading.packages),
+            {
+                ("Go", "github.com/myfork/gin", "1.9.1"),
+                ("Go", "golang.org/x/net", "0.17.0"),
+                ("Go", "example.com/pinned", "1.0.0"),
+                ("Go", "example.com/single", "2.0.0"),
+            },
+        )
+
+    def test_npm_workspace_links_are_not_packages(self):
+        text = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "root", "workspaces": ["packages/*"]},
+                    "node_modules/a": {"resolved": "packages/a", "link": True},
+                    "packages/a": {"version": "1.0.0"},
+                },
+            }
+        )
+        reading = scanner.read_lockfile("package-lock.json", text, "x")
+        self.assertEqual(reading.packages, ())
+        self.assertFalse(reading.lists_dependencies)
+        self.assertFalse(reading.unreadable)
+        single = '{"packages": {"node_modules/x": {"version": "1.0.0"}}}'
+        reading = scanner.read_lockfile("package-lock.json", single, "x")
+        self.assertEqual(coordinates(reading.packages), {("npm", "x", "1.0.0")})
+
+    def test_coordinate_ignores_the_lockfile_path(self):
+        first = scanner.LockedPackage("npm", "a", "1", "one.lock")
+        second = scanner.LockedPackage("npm", "a", "1", "two.lock")
+        self.assertEqual(first.coordinate, second.coordinate)
 
 
 class OsvQueryTests(unittest.TestCase):
@@ -303,6 +641,28 @@ class OsvQueryTests(unittest.TestCase):
             mock.patch.object(scanner.shutil, "which", return_value="/usr/bin/curl"),
             mock.patch.object(scanner.subprocess, "run", return_value=completed),
             self.assertRaisesRegex(OSError, "denied"),
+        ):
+            scanner.query_osv((package,), opener=scanner.urlopen)
+
+    def test_protocol_errors_also_fall_back_to_curl(self):
+        package = scanner.LockedPackage("npm", "x", "1", "package-lock.json")
+        completed = scanner.subprocess.CompletedProcess([], 0, b'{"results":[{}]}', b"")
+        broken = http.client.IncompleteRead(b"x", 100)
+        with (
+            mock.patch.object(scanner, "urlopen", side_effect=broken),
+            mock.patch.object(scanner.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(scanner.subprocess, "run", return_value=completed),
+        ):
+            self.assertEqual(scanner.query_osv((package,), opener=scanner.urlopen), ())
+
+    def test_a_hung_curl_raises_os_error(self):
+        package = scanner.LockedPackage("npm", "x", "1", "package-lock.json")
+        hung = scanner.subprocess.TimeoutExpired(["curl"], 25)
+        with (
+            mock.patch.object(scanner, "urlopen", side_effect=OSError("bad CA")),
+            mock.patch.object(scanner.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(scanner.subprocess, "run", side_effect=hung),
+            self.assertRaisesRegex(OSError, "curl did not finish"),
         ):
             scanner.query_osv((package,), opener=scanner.urlopen)
 

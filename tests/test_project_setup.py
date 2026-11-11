@@ -1,7 +1,10 @@
+"""`--init` writes configuration only: no checks, no questions, no overwrites."""
+
 import argparse
-import importlib.util
+import contextlib
 import io
-import os
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,712 +13,258 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_DIRECTORY = ROOT / "skills/code-discipline/scripts"
-SCRIPT = SCRIPT_DIRECTORY / "project_setup.py"
+SCRIPTS = ROOT / "skills" / "code-discipline" / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import project_setup  # noqa: E402
 
 
-def load_module():
-    sys.path.insert(0, str(SCRIPT_DIRECTORY))
-    spec = importlib.util.spec_from_file_location("project_setup_test", SCRIPT)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load project setup module")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+def fake_config(
+    *,
+    config: Path | None,
+    thresholds: Path | None,
+    git_message: str | None = None,
+    error: Exception | None = None,
+) -> SimpleNamespace:
+    def write_config(root: Path) -> Path | None:
+        if error is not None:
+            raise error
+        return config
+
+    return SimpleNamespace(
+        CONFIG_NAME=".quality/quality-gate.json",
+        THRESHOLDS_NAME=".quality/quality-thresholds.json",
+        bundled_thresholds_path=lambda: Path("/skill/quality-thresholds.json"),
+        write_initial_config=mock.Mock(side_effect=write_config),
+        write_initial_thresholds=mock.Mock(return_value=thresholds),
+        ensure_git_repository=mock.Mock(return_value=git_message),
+        load_config=mock.Mock(return_value={"source": {}}),
+    )
 
 
-setup = load_module()
-
-
-def arguments(**overrides):
-    values = {
-        "init": False,
-        "setup": None,
-        "answer": [],
-        "non_interactive": False,
-        "config": None,
-        "thresholds": None,
-        "artifact_dir": None,
-        "html": None,
-        "gate_script": None,
-        "no_install": False,
-        "fast": False,
-        "mutation_workers": "auto",
-        "print_prompt": False,
-    }
-    values.update(overrides)
-    return argparse.Namespace(**values)
-
-
-def run_files(root, **overrides):
-    values = {
-        "config": root / ".quality/quality-gate.json",
-        "thresholds": root / ".quality/quality-thresholds.json",
-        "artifact_dir": root / ".quality",
-        "html": root / ".quality/report.html",
-        "state": root / ".quality/state.json",
-        "gate_script": root / "gate.py",
-        "profile": root / ".quality/project-profile.json",
-        "explicit_config": False,
-        "explicit_thresholds": False,
-        "explicit_artifacts": False,
-        "explicit_html": False,
-        "explicit_gate_script": False,
-    }
-    values.update(overrides)
-    return setup.RunFiles(**values)
-
-
-def question(category="risk"):
-    return {
-        "key": "security_level",
-        "category": category,
-        "prompt": "Which security level applies?",
-        "reason": "It selects the required controls.",
-        "options": ["Internal", "Personal", "Decide later"],
-        "recommended": "Internal",
-    }
+def run_init(
+    module: SimpleNamespace, args: argparse.Namespace | None = None
+) -> tuple[int, str, str]:
+    output, errors = io.StringIO(), io.StringIO()
+    with (
+        mock.patch.object(project_setup, "quality_config", module),
+        contextlib.redirect_stdout(output),
+        contextlib.redirect_stderr(errors),
+    ):
+        code = project_setup.run_init(Path("/repo"), args or argparse.Namespace())
+    return code, output.getvalue(), errors.getvalue()
 
 
 class SetupArgumentTests(unittest.TestCase):
-    def test_arguments_support_progressive_and_noninteractive_modes(self):
+    def test_only_the_init_flag_is_added(self):
         parser = argparse.ArgumentParser()
+        project_setup.add_setup_arguments(parser)
+        self.assertFalse(parser.parse_args([]).init)
+        self.assertTrue(parser.parse_args(["--init"]).init)
+        for removed in ("--setup", "--answer", "--show-profile", "--non-interactive"):
+            with self.subTest(flag=removed):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args([removed])
 
-        setup.add_setup_arguments(parser)
 
-        defaults = parser.parse_args([])
-        self.assertFalse(defaults.init)
-        self.assertIsNone(defaults.setup)
-        self.assertFalse(defaults.show_profile)
-        self.assertEqual(defaults.answer, [])
-        self.assertFalse(defaults.non_interactive)
-
-        selected = parser.parse_args(
-            [
-                "--init",
-                "--setup",
-                "runtime",
-                "--show-profile",
-                "--answer",
-                "security_level=Internal",
-                "--answer",
-                'stories=["Publish"]',
-                "--non-interactive",
-            ]
+class RunInitTests(unittest.TestCase):
+    def test_reports_written_files_and_git_setup_then_runs_nothing(self):
+        module = fake_config(
+            config=Path("/repo/.quality/quality-gate.json"),
+            thresholds=Path("/repo/.quality/quality-thresholds.json"),
+            git_message="Initialized a git repository in /repo",
         )
-        self.assertTrue(selected.init)
-        self.assertEqual(selected.setup, "runtime")
-        self.assertTrue(selected.show_profile)
+        code, output, errors = run_init(module)
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        lines = output.splitlines()
+        self.assertEqual(lines[0], "Wrote /repo/.quality/quality-gate.json")
         self.assertEqual(
-            selected.answer,
-            ["security_level=Internal", 'stories=["Publish"]'],
+            lines[1],
+            "Wrote /repo/.quality/quality-thresholds.json "
+            "(defaults from /skill/quality-thresholds.json)",
         )
-        self.assertTrue(selected.non_interactive)
-        self.assertEqual(parser.parse_args(["--setup"]).setup, "all")
-        with mock.patch("sys.stderr", new_callable=io.StringIO):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["--setup", "language"])
+        self.assertEqual(lines[2], "Initialized a git repository in /repo")
+        self.assertIn("No checks ran", lines[3])
+        module.write_initial_config.assert_called_once_with(Path("/repo"))
+        module.write_initial_thresholds.assert_called_once_with(Path("/repo"))
+        module.ensure_git_repository.assert_called_once_with(Path("/repo"))
 
-    def test_answer_parser_accepts_json_plain_text_and_last_value(self):
-        self.assertEqual(setup.parse_setup_answers([]), {})
-        self.assertEqual(
-            setup.parse_setup_answers(
-                [
-                    'critical_user_stories=["Publish"]',
-                    'performance={"mode":"measure_only"}',
-                    "enabled=true",
-                    "security_level=Internal",
-                    " security_level =Personal",
-                    "empty=",
-                ]
-            ),
-            {
-                "critical_user_stories": ["Publish"],
-                "performance": {"mode": "measure_only"},
-                "enabled": True,
-                "security_level": "Personal",
-                "empty": "",
-            },
-        )
-        with self.assertRaisesRegex(ValueError, "KEY=VALUE"):
-            setup.parse_setup_answers(["invalid"])
-        with self.assertRaisesRegex(ValueError, "key cannot be empty"):
-            setup.parse_setup_answers(["  =value"])
+    def test_existing_files_are_kept_and_reported(self):
+        code, output, _ = run_init(fake_config(config=None, thresholds=None))
+        self.assertEqual(code, 0)
+        self.assertIn("Kept existing /repo/.quality/quality-gate.json", output)
+        self.assertIn("Kept existing /repo/.quality/quality-thresholds.json", output)
+        self.assertNotIn("Wrote", output)
+        self.assertNotIn("git", output)
+
+    def test_write_errors_exit_2_without_claiming_success(self):
+        for error in (OSError("read-only file system"), ValueError("bad defaults")):
+            with self.subTest(error=error):
+                module = fake_config(config=None, thresholds=None, error=error)
+                code, output, errors = run_init(module)
+                self.assertEqual(code, 2)
+                self.assertEqual(output, "")
+                self.assertEqual(errors, f"error: {error}\n")
+                module.ensure_git_repository.assert_not_called()
+
+    def test_custom_paths_are_noted_because_init_writes_the_defaults(self):
+        args = argparse.Namespace(config="custom.json", thresholds=None)
+        _, output, _ = run_init(fake_config(config=None, thresholds=None), args)
+        self.assertIn("--config custom.json applies only to quality runs", output)
+        self.assertNotIn("--thresholds", output)
+        args = argparse.Namespace(config=None, thresholds="limits.json")
+        _, output, _ = run_init(fake_config(config=None, thresholds=None), args)
+        self.assertIn("--thresholds limits.json applies only", output)
 
 
-class ProfileQuestionTests(unittest.TestCase):
-    def test_saved_and_detected_profiles_preserve_confirmed_answers(self):
-        existing = SimpleNamespace(as_dict=mock.Mock(return_value={"facts": {}}))
-        detected = object()
+def seeded_root(temporary: str, files: int) -> Path:
+    root = Path(temporary)
+    for index in range(files):
+        (root / f"module_{index}.py").write_text("VALUE = 1\n", encoding="utf-8")
+    return root
+
+
+def git(root: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t"]
+        + list(arguments),
+        check=True,
+        capture_output=True,
+    )
+
+
+class InitScaleTests(unittest.TestCase):
+    def test_small_repositories_get_no_warning(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "profile.json"
-            with mock.patch.object(setup, "load_profile") as load:
-                self.assertIsNone(setup.saved_profile(path))
-            load.assert_not_called()
+            root = seeded_root(temporary, 3)
+            self.assertIsNone(project_setup.init_scale_message(root, {}))
 
-            path.write_text("{}", encoding="utf-8")
-            with mock.patch.object(setup, "load_profile", return_value=existing):
-                self.assertIs(setup.saved_profile(path), existing)
+    def test_new_project_with_many_files_gets_the_rule_1_warning(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = seeded_root(temporary, 11)
+            message = project_setup.init_scale_message(root, {})
+            self.assertIsNotNone(message)
+            self.assertIn("WARNING: 11 source files", str(message))
+            self.assertIn("Rule 1", str(message))
+            self.assertIn("rule 9", str(message))
 
-        with mock.patch.object(setup, "saved_profile", return_value=existing):
-            with mock.patch.object(
-                setup, "detect_profile", return_value=detected
-            ) as detect:
-                self.assertIs(setup.detected_profile(Path("root"), path), detected)
-        existing.as_dict.assert_called_once_with()
-        detect.assert_called_once_with(Path("root"), {"facts": {}})
+    def test_repository_with_history_gets_the_adoption_message(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = seeded_root(temporary, 12)
+            git(root, "init", "-q")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "one")
+            (root / "extra.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "two")
+            self.assertEqual(project_setup.commit_count(root), 2)
+            message = project_setup.init_scale_message(root, {})
+            self.assertIn("Existing repository: 13 source files", str(message))
+            self.assertIn("quality_items.py", str(message))
 
-        with mock.patch.object(setup, "saved_profile", return_value=None):
-            with mock.patch.object(
-                setup, "detect_profile", return_value=detected
-            ) as detect:
-                setup.detected_profile(Path("root"), path)
-        detect.assert_called_once_with(Path("root"), None)
+    def test_commit_count_is_zero_without_git_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(project_setup.commit_count(Path(temporary)), 0)
 
-    def test_questions_filter_and_print_clear_next_actions(self):
-        profile = object()
-        questions = [question("risk"), {**question("product"), "key": "story"}]
-        with mock.patch.object(setup, "profile_questions", return_value=questions):
-            self.assertEqual(setup.pending_questions(profile, "all"), questions)
-            self.assertEqual(setup.pending_questions(profile, "risk"), [questions[0]])
-            self.assertEqual(
-                setup.pending_questions(profile, "product"), [questions[1]]
-            )
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                setup.print_pending_questions(profile, "runtime")
-            self.assertEqual(
-                output.getvalue(),
-                "Project setup has no pending questions in this group.\n",
-            )
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                setup.print_pending_questions(profile, "risk")
-        self.assertIn("Decisions needed", output.getvalue())
-        self.assertIn(
-            "security_level: Which security level applies?", output.getvalue()
-        )
-        self.assertIn("It selects the required controls.", output.getvalue())
-
-    def test_prompt_policy_requires_terminal_outside_ci(self):
-        args = arguments()
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(sys.stdin, "isatty", return_value=True):
-                with mock.patch.object(sys.stdout, "isatty", return_value=True):
-                    self.assertTrue(setup.can_prompt(args))
-                    self.assertFalse(setup.can_prompt(arguments(non_interactive=True)))
-
-            with mock.patch.object(sys.stdin, "isatty", return_value=False):
-                self.assertFalse(setup.can_prompt(args))
-
-            with mock.patch.object(sys.stdin, "isatty", return_value=True):
-                with mock.patch.object(sys.stdout, "isatty", return_value=False):
-                    self.assertFalse(setup.can_prompt(args))
-
-        with mock.patch.dict(os.environ, {"CI": "1"}, clear=True):
-            self.assertFalse(setup.can_prompt(args))
-
-    def test_prompt_answers_labels_recommendation_and_selects_values(self):
-        profile = object()
-        questions = [
-            question(),
-            {
-                **question(),
-                "key": "security_notes",
-                "prompt": "Any notes?",
-                "recommended": "Personal",
-            },
-        ]
-        with mock.patch.object(setup, "pending_questions", return_value=questions):
-            with mock.patch("builtins.input", side_effect=["2", "custom"]):
-                with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                    answers = setup.prompt_answers(profile, "risk")
-        self.assertEqual(
-            answers,
-            {"security_level": "Personal", "security_notes": "custom"},
-        )
-        self.assertIn("Internal (recommended)", output.getvalue())
-        self.assertIn("Personal (recommended)", output.getvalue())
-        self.assertIn("Why: It selects the required controls.", output.getvalue())
-
-        with mock.patch.object(setup, "pending_questions", return_value=[]):
-            self.assertEqual(setup.prompt_answers(profile, "all"), {})
-
-    def test_selected_answer_handles_boundaries_custom_and_deferred(self):
-        options = ["A", "B"]
-        self.assertEqual(setup.selected_answer("1", options), "A")
-        self.assertEqual(setup.selected_answer("2", options), "B")
-        self.assertEqual(setup.selected_answer("0", options), "0")
-        self.assertEqual(setup.selected_answer("3", options), "3")
-        self.assertEqual(setup.selected_answer("custom", options), "custom")
-        self.assertEqual(setup.selected_answer("", options), "Decide later")
-
-
-class InitializationTests(unittest.TestCase):
-    def test_initialization_is_idempotent_and_always_ensures_git(self):
-        class FakeGate:
-            DEPENDENCIES_NAME = ".quality/quality-dependencies.json"
-
-            def __init__(self):
-                self.events = []
-
-            def write_initial_thresholds(self, path):
-                self.events.append(("thresholds", path))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("{}", encoding="utf-8")
-
-            def default_thresholds(self):
-                self.events.append(("defaults",))
-                return {"metric": 1}
-
-            def write_initial_config(self, root, path, thresholds):
-                self.events.append(("config", root, path, thresholds))
-                path.write_text("{}", encoding="utf-8")
-
-            def write_initial_dependencies(self, root, path):
-                self.events.append(("dependencies", root, path))
-                if path.exists():
-                    return False
-                path.write_text("{}", encoding="utf-8")
-                return True
-
-            def ensure_git_repository(self, root):
-                self.events.append(("git", root))
-
+    def test_threshold_scales_with_package_manifests_outside_dependencies(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            files = run_files(root)
-            gate = FakeGate()
+            self.assertEqual(project_setup.init_scale_threshold(root), 10)
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            for name in ("a", "b"):
+                package = root / "packages" / name
+                package.mkdir(parents=True)
+                (package / "package.json").write_text("{}", encoding="utf-8")
+            nested = root / "node_modules" / "x"
+            nested.mkdir(parents=True)
+            (nested / "package.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(project_setup.init_scale_threshold(root), 20)
 
-            first = setup.initialize_gate_files(
-                gate, root, files.config, files.thresholds
-            )
-            second = setup.initialize_gate_files(
-                gate, root, files.config, files.thresholds
-            )
-
-        self.assertEqual(
-            first,
-            [
-                str(files.thresholds),
-                str(files.config),
-                str(root / FakeGate.DEPENDENCIES_NAME),
-            ],
-        )
-        self.assertEqual(second, [])
-        self.assertEqual(
-            [event[0] for event in gate.events],
-            [
-                "thresholds",
-                "defaults",
-                "config",
-                "dependencies",
-                "git",
-                "dependencies",
-                "git",
-            ],
-        )
-
-    def test_show_profile_prints_json_without_writing(self):
-        profile = SimpleNamespace(to_json=mock.Mock(return_value='{"ok": true}\n'))
-        with mock.patch.object(setup, "detected_profile", return_value=profile):
-            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                result = setup.show_profile(Path("root"), Path("profile"))
-        self.assertEqual(result, 0)
-        self.assertEqual(output.getvalue(), '{"ok": true}\n')
-        profile.to_json.assert_called_once_with()
-
-    def test_setup_request_detection_covers_each_trigger(self):
-        self.assertFalse(setup.setup_requested(arguments()))
-        self.assertTrue(setup.setup_requested(arguments(init=True)))
-        self.assertTrue(setup.setup_requested(arguments(setup="risk")))
-        self.assertTrue(
-            setup.setup_requested(arguments(answer=["security_level=Internal"]))
-        )
-
-    def test_setup_before_handles_noop_answers_and_full_initialization(self):
-        root = Path("root")
-        files = run_files(root)
-        profile = object()
-        merged = object()
-
-        with mock.patch.object(setup, "detected_profile") as detect:
-            self.assertIsNone(
-                setup.setup_before_baseline(arguments(), mock.Mock(), root, files)
-            )
-        detect.assert_not_called()
-
-        with mock.patch.object(setup, "detected_profile", return_value=profile):
-            with mock.patch.object(
-                setup, "merge_answers", return_value=merged
-            ) as merge:
-                with mock.patch.object(
-                    setup,
-                    "initialize_gate_files",
-                    return_value=["config.json", "thresholds.json"],
-                ) as initialize:
-                    with mock.patch.object(setup, "write_profile") as write:
-                        with mock.patch(
-                            "sys.stdout", new_callable=io.StringIO
-                        ) as output:
-                            result = setup.setup_before_baseline(
-                                arguments(
-                                    init=True,
-                                    answer=["security_level=Internal"],
-                                ),
-                                mock.Mock(),
-                                root,
-                                files,
-                            )
-        self.assertIs(result, merged)
-        merge.assert_called_once_with(profile, {"security_level": "Internal"})
-        initialize.assert_called_once()
-        write.assert_called_once_with(files.profile, merged)
-        self.assertIn("Wrote config.json", output.getvalue())
-        self.assertIn(f"Profile: {files.profile}", output.getvalue())
-
-        answer_only = object()
-        with mock.patch.object(setup, "detected_profile", return_value=profile):
-            with mock.patch.object(
-                setup, "merge_answers", return_value=answer_only
-            ) as merge:
-                with mock.patch.object(setup, "initialize_gate_files") as initialize:
-                    with mock.patch.object(setup, "write_profile") as write:
-                        result = setup.setup_before_baseline(
-                            arguments(answer=["empty=Decide later"]),
-                            mock.Mock(),
-                            root,
-                            files,
-                        )
-        self.assertIs(result, answer_only)
-        merge.assert_called_once_with(profile, {"empty": "Decide later"})
-        initialize.assert_not_called()
-        write.assert_called_once_with(files.profile, answer_only)
-
-        with mock.patch.object(setup, "detected_profile", return_value=profile):
-            with mock.patch.object(setup, "initialize_gate_files") as initialize:
-                with mock.patch.object(setup, "write_profile"):
-                    setup.setup_before_baseline(
-                        arguments(setup="product"), mock.Mock(), root, files
-                    )
-        initialize.assert_called_once()
-
-    def test_safe_setup_surfaces_expected_errors(self):
-        expected = object()
-        with mock.patch.object(setup, "setup_before_baseline", return_value=expected):
-            self.assertEqual(
-                setup.safe_setup_before_baseline(
-                    arguments(), mock.Mock(), Path("root"), run_files(Path("root"))
-                ),
-                (expected, True),
-            )
-
-        for error in (OSError("disk"), ValueError("answer"), TypeError("profile")):
-            with self.subTest(error=type(error).__name__):
-                with mock.patch.object(
-                    setup, "setup_before_baseline", side_effect=error
-                ):
-                    with mock.patch("sys.stderr", new_callable=io.StringIO) as output:
-                        result = setup.safe_setup_before_baseline(
-                            arguments(),
-                            mock.Mock(),
-                            Path("root"),
-                            run_files(Path("root")),
-                        )
-                self.assertEqual(result, (None, False))
-                self.assertIn(str(error), output.getvalue())
-
-
-class RunWiringTests(unittest.TestCase):
-    def test_threshold_selection_uses_bundle_only_for_missing_default(self):
-        root = Path("root")
-        bundled = Path("bundled.json")
-        gate = SimpleNamespace(bundled_thresholds_path=mock.Mock(return_value=bundled))
-        missing = run_files(root)
-
-        self.assertEqual(setup.active_thresholds_path(gate, missing), bundled)
-        gate.bundled_thresholds_path.assert_called_once_with()
-
-        explicit = run_files(root, explicit_thresholds=True)
-        self.assertEqual(
-            setup.active_thresholds_path(gate, explicit), explicit.thresholds
-        )
-
+    def test_configured_source_settings_limit_the_count(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "thresholds.json"
-            path.write_text("{}", encoding="utf-8")
-            existing = run_files(root, thresholds=path)
-            self.assertEqual(setup.active_thresholds_path(gate, existing), path)
-        gate.bundled_thresholds_path.assert_called_once_with()
+            root = seeded_root(temporary, 11)
+            config = root / ".quality" / "quality-gate.json"
+            module = fake_config(config=None, thresholds=None)
+            module.load_config.return_value = {"source": {"include": ["module_1.py"]}}
+            with mock.patch.object(project_setup, "quality_config", module):
+                self.assertEqual(
+                    project_setup.configured_source(config),
+                    {"include": ["module_1.py"]},
+                )
+                module.load_config.assert_called_once_with(None)
+                config.parent.mkdir()
+                config.write_text("{}", encoding="utf-8")
+                module.load_config.return_value = {"source": ["not", "a", "map"]}
+                self.assertEqual(project_setup.configured_source(config), {})
+                module.load_config.assert_called_with(config)
 
-    def test_run_file_resolution_tracks_paths_and_explicit_options(self):
-        root = Path("/project")
-        defaults = arguments()
-        default_gate = Path("/skill/gate.py")
-        resolved_artifacts = (
-            root / ".quality",
-            root / ".quality/report.html",
-            root / ".quality/state.json",
-        )
-
-        def resolve_path(value, current_root, default):
-            self.assertEqual(current_root, root)
-            return current_root / value if value else default
-
-        resolve_artifacts = mock.Mock(return_value=resolved_artifacts)
-        files = setup.resolve_run_files(
-            defaults,
-            root,
-            ".quality",
-            ".quality/project-profile.json",
-            default_gate,
-            resolve_path,
-            resolve_artifacts,
-        )
-        self.assertEqual(files.config, root / ".quality/quality-gate.json")
-        self.assertEqual(files.thresholds, root / ".quality/quality-thresholds.json")
-        self.assertEqual(files.artifact_dir, resolved_artifacts[0])
-        self.assertEqual(files.html, resolved_artifacts[1])
-        self.assertEqual(files.state, resolved_artifacts[2])
-        self.assertEqual(files.gate_script, default_gate)
-        self.assertEqual(files.profile, root / ".quality/project-profile.json")
-        self.assertFalse(files.explicit_config)
-        self.assertFalse(files.explicit_thresholds)
-        self.assertFalse(files.explicit_artifacts)
-        self.assertFalse(files.explicit_html)
-        self.assertFalse(files.explicit_gate_script)
-        resolve_artifacts.assert_called_once_with(defaults, root)
-
-        explicit_args = arguments(
-            config="config.json",
-            thresholds="limits.json",
-            artifact_dir="artifacts",
-            html="report.html",
-            gate_script="custom-gate.py",
-        )
-        explicit = setup.resolve_run_files(
-            explicit_args,
-            root,
-            ".quality",
-            "profile.json",
-            default_gate,
-            resolve_path,
-            lambda _args, current_root: (
-                current_root / "artifacts",
-                current_root / "report.html",
-                current_root / "state.json",
-            ),
-        )
-        self.assertTrue(explicit.explicit_config)
-        self.assertTrue(explicit.explicit_thresholds)
-        self.assertTrue(explicit.explicit_artifacts)
-        self.assertTrue(explicit.explicit_html)
-        self.assertTrue(explicit.explicit_gate_script)
-
-    def test_rerun_command_receives_scope_selection_and_all_paths(self):
-        root = Path("root")
-        files = run_files(
-            root,
-            explicit_config=True,
-            explicit_thresholds=True,
-            explicit_artifacts=True,
-            explicit_html=True,
-            explicit_gate_script=True,
-        )
-        args = arguments(no_install=True, fast=True, mutation_workers="3")
-        build = mock.Mock(return_value="quality --rerun")
-        scope = mock.Mock(return_value=["--commit", "HEAD"])
-        selections = mock.Mock(return_value=("tests", "coverage"))
-
-        result = setup.rerun_for(
-            args, root, files, Path("active-thresholds.json"), build, scope, selections
-        )
-
-        self.assertEqual(result, "quality --rerun")
-        build.assert_called_once_with(
-            root,
-            files.config,
-            True,
-            Path("active-thresholds.json"),
-            True,
-            files.artifact_dir,
-            True,
-            files.html,
-            True,
-            files.gate_script,
-            True,
-            ["--commit", "HEAD"],
-            True,
-            True,
-            "3",
-            ("tests", "coverage"),
-        )
-        scope.assert_called_once_with(args)
-        selections.assert_called_once_with(args)
-
-    def test_artifact_refresh_loads_active_inputs_and_attaches_profile(self):
-        root = Path("root")
-        analysis = object()
-        thresholds = {"coverage": 100}
-        config = {"smoke": {}}
-        writer = mock.Mock(return_value={"ok": True})
-        gate = SimpleNamespace(
-            load_thresholds=mock.Mock(return_value=(thresholds, ["note"])),
-            load_config=mock.Mock(return_value=(config, ["config note"])),
-            attach_project_quality=mock.Mock(),
-        )
-
-        missing = run_files(root)
-        setup.refresh_project_profile_artifacts(
-            gate,
-            analysis,
-            root,
-            missing,
-            Path("active.json"),
-            1,
-            "run failed",
-            writer,
-        )
-        gate.load_thresholds.assert_called_once_with(Path("active.json"))
-        gate.load_config.assert_called_once_with(None, thresholds)
-        gate.attach_project_quality.assert_called_once_with(analysis, root, config)
-        writer.assert_called_once_with(
-            gate, analysis, missing.html, missing.state, 1, "run failed"
-        )
-
+    def test_init_prints_the_scale_warning_after_the_written_files(self):
         with tempfile.TemporaryDirectory() as temporary:
-            config_path = Path(temporary) / "quality-gate.json"
-            config_path.write_text("{}", encoding="utf-8")
-            existing = run_files(root, config=config_path)
-            setup.refresh_project_profile_artifacts(
-                gate,
-                analysis,
-                root,
-                existing,
-                Path("active.json"),
-                0,
-                None,
-                writer,
-            )
-        self.assertEqual(
-            gate.load_config.call_args_list[-1].args, (config_path, thresholds)
-        )
-
-    def test_setup_after_noninteractive_empty_and_answered_paths(self):
-        root = Path("root")
-        files = run_files(root)
-        profile = object()
-        analysis = object()
-        writer = mock.Mock()
-
-        with mock.patch.object(setup, "can_prompt", return_value=False):
-            with mock.patch.object(setup, "print_pending_questions") as pending:
-                setup.setup_after_baseline(
-                    arguments(setup="risk"),
-                    mock.Mock(),
-                    analysis,
-                    root,
-                    files,
-                    Path("limits.json"),
-                    profile,
-                    0,
-                    None,
-                    writer,
-                )
-        pending.assert_called_once_with(profile, "risk")
-        writer.assert_not_called()
-
-        with mock.patch.object(setup, "can_prompt", return_value=True):
-            with mock.patch.object(setup, "prompt_answers", return_value={}) as prompt:
-                setup.setup_after_baseline(
-                    arguments(),
-                    mock.Mock(),
-                    analysis,
-                    root,
-                    files,
-                    Path("limits.json"),
-                    profile,
-                    0,
-                    None,
-                    writer,
-                )
-        prompt.assert_called_once_with(profile, "all")
-
-        merged = object()
-        gate = mock.Mock()
-        with mock.patch.object(setup, "can_prompt", return_value=True):
-            with mock.patch.object(
-                setup,
-                "prompt_answers",
-                return_value={"security_level": "Internal"},
+            root = seeded_root(temporary, 11)
+            module = fake_config(config=None, thresholds=None)
+            output = io.StringIO()
+            with (
+                mock.patch.object(project_setup, "quality_config", module),
+                contextlib.redirect_stdout(output),
             ):
-                with mock.patch.object(
-                    setup, "merge_answers", return_value=merged
-                ) as merge:
-                    with mock.patch.object(setup, "write_profile") as write:
-                        with mock.patch.object(
-                            setup, "refresh_project_profile_artifacts"
-                        ) as refresh:
-                            with mock.patch(
-                                "sys.stdout", new_callable=io.StringIO
-                            ) as output:
-                                setup.setup_after_baseline(
-                                    arguments(setup="risk"),
-                                    gate,
-                                    analysis,
-                                    root,
-                                    files,
-                                    Path("limits.json"),
-                                    profile,
-                                    2,
-                                    "adapter failed",
-                                    writer,
-                                )
-        merge.assert_called_once_with(profile, {"security_level": "Internal"})
-        write.assert_called_once_with(files.profile, merged)
-        refresh.assert_called_once_with(
-            gate,
-            analysis,
-            root,
-            files,
-            Path("limits.json"),
-            2,
-            "adapter failed",
-            writer,
-        )
-        self.assertIn(str(files.html), output.getvalue())
+                self.assertEqual(project_setup.run_init(root, argparse.Namespace()), 0)
+            lines = output.getvalue().splitlines()
+            self.assertTrue(lines[2].startswith("WARNING: 11 source files"))
 
-    def test_print_analysis_delegates_complete_report_context(self):
-        root = Path("root")
-        files = run_files(root)
-        args = arguments(print_prompt=True)
-        gate = object()
-        analysis = object()
-        state = {"status": "PASS"}
-        previous = object()
-        previous_items = object()
-        printer = mock.Mock()
 
-        setup.print_analysis(
-            args,
-            gate,
-            analysis,
-            state,
-            files,
-            previous,
-            previous_items,
-            printer,
-        )
+class InitIntegrationTests(unittest.TestCase):
+    def test_real_configuration_module_writes_once_and_initializes_git(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(project_setup.run_init(root, argparse.Namespace()), 0)
+            quality = root / ".quality"
+            thresholds = json.loads(
+                (quality / "quality-thresholds.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(thresholds["schema_version"], 3)
+            self.assertTrue((quality / "quality-gate.json").is_file())
+            self.assertTrue((root / ".git").exists())
+            self.assertIn("Wrote", output.getvalue())
+            (quality / "quality-gate.json").write_text("{}\n", encoding="utf-8")
+            again = io.StringIO()
+            with contextlib.redirect_stdout(again):
+                self.assertEqual(project_setup.run_init(root, argparse.Namespace()), 0)
+            self.assertNotIn("Wrote", again.getvalue())
+            self.assertEqual(
+                (quality / "quality-gate.json").read_text(encoding="utf-8"), "{}\n"
+            )
 
-        printer.assert_called_once_with(
-            gate,
-            analysis,
-            state,
-            files.state,
-            files.html,
-            True,
-            previous,
-            previous_items,
-        )
+    def test_loop_init_writes_configuration_without_running_checks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "example.py").write_text(
+                "raise RuntimeError('do not run before choices')\n", encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "quality_loop.py"),
+                    "--root",
+                    str(root),
+                    "--init",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            quality = root / ".quality"
+            self.assertTrue((quality / "quality-gate.json").is_file())
+            self.assertTrue((quality / "quality-thresholds.json").is_file())
+            self.assertFalse((quality / "quality-gate-state.json").exists())
+            self.assertFalse((quality / "quality-gate-report.html").exists())
+            self.assertNotIn("QUALITY_LOOP=", result.stdout)
 
 
 if __name__ == "__main__":

@@ -1,34 +1,46 @@
 #!/usr/bin/env python3
-"""Refresh a repository's pinned engine and render its saved quality measurements."""
+"""Refresh a repository's pinned toolchain and re-render its saved HTML report.
+
+The installer runs this after an update. The HTML is rendered again from the
+saved state file, so measurements, timestamps, and pass/fail results stay as
+they were. A state file from an older quality loop is left alone: one loop run
+writes a current one.
+"""
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import json
+import contextlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import types
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Any, Sequence, Union, cast, get_args, get_origin, get_type_hints
+from typing import Any
 
-import quality_loop
-
-import repo_quality_gate as gate
+from quality_config import QUALITY_DIRECTORY, REPORT_NAME, STATE_NAME
+from quality_model import read_state, write_json_atomic
+from quality_report import is_current_state, render_html
 
 UPSTREAM = "https://github.com/benrben/code-skills.git"
 SKILL_PATH = "skills/code-discipline"
+LEGACY_STATE_MESSAGE = (
+    "Saved state comes from an older quality loop; run the loop once to "
+    "refresh the HTML report"
+)
+
+RunLock = Callable[[Path], contextlib.AbstractContextManager[None]]
 
 
 def repository_root(target: Path) -> Path | None:
+    """The repository that holds a repo-local skill install, if it has .quality/."""
     if target.parent.name != "skills" or target.parent.parent.name != ".agents":
         return None
     root = target.parent.parent.parent.resolve()
-    if (root / ".quality").is_dir():
+    if (root / QUALITY_DIRECTORY).is_dir():
         return root
     return None
 
@@ -54,9 +66,9 @@ def git(directory: Path, *arguments: str) -> str:
 
 
 def read_manifest(path: Path) -> dict[str, Any]:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Toolchain manifest must be an object: {path}")
+    manifest = read_state(path)
+    if manifest is None:
+        raise ValueError(f"Toolchain manifest must be a JSON object: {path}")
     if (
         manifest.get("repository") != UPSTREAM
         or manifest.get("skillPath") != SKILL_PATH
@@ -112,7 +124,7 @@ def replace_toolchain(
         cache.rename(backup)
     try:
         staging.rename(cache)
-        gate.write_json_atomic(manifest_path, manifest)
+        write_json_atomic(manifest_path, manifest)
     except Exception:
         if cache.exists():
             cache.rename(staging)
@@ -122,7 +134,7 @@ def replace_toolchain(
 
 
 def update_toolchain(root: Path, commit: str) -> None:
-    manifest_path = root / ".quality/toolchain.json"
+    manifest_path = root / QUALITY_DIRECTORY / "toolchain.json"
     if not manifest_path.exists():
         return
     manifest = read_manifest(manifest_path)
@@ -149,67 +161,59 @@ def update_toolchain(root: Path, commit: str) -> None:
     print(f"Updated pinned toolchain at {cache} to {commit}")
 
 
-def _restore_union(annotation: Any, value: Any) -> Any:
-    if value is None:
-        return None
-    candidates = [item for item in get_args(annotation) if item is not type(None)]
-    return restore_value(candidates[0], value)
-
-
-def _restore_dataclass(annotation: Any, value: Any) -> Any:
-    hints = get_type_hints(annotation)
-    return cast(Any, annotation)(
-        **{key: restore_value(hints[key], item) for key, item in value.items()}
-    )
-
-
-def _restore_collection(origin: Any, annotation: Any, value: Any) -> Any:
-    element_type = get_args(annotation)[0]
-    return origin(restore_value(element_type, item) for item in value)
-
-
-def restore_value(annotation: Any, value: Any) -> Any:
-    origin = get_origin(annotation)
-    if origin in (Union, types.UnionType):
-        return _restore_union(annotation, value)
-    if dataclasses.is_dataclass(annotation):
-        return _restore_dataclass(annotation, value)
-    if origin in (list, tuple):
-        return _restore_collection(origin, annotation, value)
-    return value
-
-
-def refresh_report(root: Path) -> None:
-    state_path = root / ".quality/quality-gate-state.json"
-    if not state_path.is_file():
-        return
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    if "report" not in state:
-        print(f"Existing HTML needs one quality-loop run to save render data: {root}")
-        return
-    report = restore_value(gate.AnalysisReport, state["report"])
-    if Path(report.root).resolve() != root.resolve():
-        raise ValueError(f"Saved report belongs to another repository: {state_path}")
-    destination = root / ".quality/quality-gate-report.html"
-    rendered = gate.html_report(report)
+def write_text_atomic(destination: Path, text: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix=".report-update-", dir=destination.parent
     ) as temporary:
-        staging = Path(temporary) / "report.html"
-        staging.write_text(rendered, encoding="utf-8")
+        staging = Path(temporary) / destination.name
+        staging.write_text(text, encoding="utf-8")
         os.replace(staging, destination)
+
+
+def refresh_report(root: Path) -> int:
+    """Re-render the HTML report from the saved state; 0 unless it is foreign."""
+    quality = root / QUALITY_DIRECTORY
+    state_path = quality / STATE_NAME
+    if not state_path.is_file():
+        return 0
+    state = read_state(state_path)
+    if not is_current_state(state):
+        print(f"{LEGACY_STATE_MESSAGE}: {root}")
+        return 0
+    saved_root = Path(str(state.get("root") or ""))
+    if saved_root.resolve() != root.resolve():
+        print(
+            f"Saved state belongs to another repository: {state_path}",
+            file=sys.stderr,
+        )
+        return 2
+    destination = quality / REPORT_NAME
+    write_text_atomic(destination, render_html(state))
     print(
-        f"Refreshed HTML at {destination} (measurements unchanged: {report.generated_at})"
+        f"Refreshed HTML at {destination} "
+        f"(measurements unchanged: {state.get('generated_at', '')})"
     )
+    return 0
 
 
-def update_repository(target: Path, commit: str) -> None:
+@contextlib.contextmanager
+def loop_run_lock(root: Path) -> Iterator[None]:
+    """The quality loop's repository lock, so an update never overlaps a run."""
+    import quality_loop
+
+    with quality_loop.repository_run_lock(root):
+        yield
+
+
+def update_repository(
+    target: Path, commit: str, *, run_lock: RunLock = loop_run_lock
+) -> int:
     root = repository_root(target)
     if root is None:
-        return
-    with quality_loop.repository_run_lock(root):
+        return 0
+    with run_lock(root):
         update_toolchain(root, commit)
-        refresh_report(root)
+        return refresh_report(root)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -220,18 +224,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if not re.fullmatch(r"[a-f0-9]{40}", args.ref):
             raise ValueError("Update requires a full commit")
-        update_repository(args.skill, args.ref)
+        return update_repository(args.skill, args.ref)
     except (
         OSError,
         ValueError,
         RuntimeError,
-        TypeError,
-        KeyError,
         subprocess.TimeoutExpired,
     ) as error:
         print(f"Repository update failed: {error}", file=sys.stderr)
         return 2
-    return 0
 
 
 if __name__ == "__main__":

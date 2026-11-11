@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one machine-readable repository quality-gate round."""
+"""Run one round of the repository quality loop: ten generic gates, one report."""
 
 from __future__ import annotations
 
@@ -12,77 +12,366 @@ import json
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Iterator, Sequence, TextIO
+from typing import Any, TextIO
 
-SCRIPT_DIRECTORY = Path(__file__).resolve().parent
-if str(SCRIPT_DIRECTORY) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIRECTORY))
-
-from project_profile import PROFILE_NAME  # noqa: E402
-from project_setup import (  # noqa: E402
-    active_thresholds_path,
-    add_setup_arguments,
-    print_analysis,
-    rerun_for,
-    resolve_run_files,
-    safe_setup_before_baseline,
-    setup_after_baseline,
-    show_profile,
+import diff_scope
+import project_setup
+import quality_report
+import quality_run
+from diff_scope import ChangeSet
+from gate_types import BLOCKED
+from quality_commands import runner_for
+from quality_config import (
+    CONFIG_NAME,
+    QUALITY_DIRECTORY,
+    REPORT_NAME,
+    STATE_NAME,
+    THRESHOLDS_NAME,
+    VERSION,
+    load_config,
+    load_thresholds,
 )
-from quality_report import (  # noqa: E402
-    previous_item_keys,
-    previous_measurement,
-    print_report,
+from quality_model import (
+    FAST,
+    FULL,
+    PARTIAL,
+    Analysis,
+    GateRun,
+    analysis_state,
+    read_state,
+    write_json_atomic,
 )
+from quality_tools import bootstrap_tools
 
-from repo_quality_gate import analysis_state, write_json_atomic  # noqa: E402
-from repo_quality_gate import command_state as command_state  # noqa: E402
-from repo_quality_gate import gate_status as gate_status  # noqa: E402
-from repo_quality_gate import state_fix_prompt as state_fix_prompt  # noqa: E402
-from repo_quality_gate import state_status as state_status  # noqa: E402
-
-VERSION = "5.0.0"
-QUALITY_DIRECTORY = ".quality"
-DEFAULT_GATE_SCRIPT = Path(__file__).resolve().with_name("repo_quality_gate.py")
-CHECK_FLAGS: tuple[tuple[str, str], ...] = (
-    ("lint", "formatter and linter"),
-    ("types", "static type checker"),
-    ("contracts", "contract/schema validation"),
-    ("tests", "the test suite only"),
-    ("coverage", "tests plus per-function coverage"),
-    ("branches", "tests plus per-function branch coverage"),
-    ("complexity", "static complexity per function, no tests"),
-    ("crap", "tests, coverage and complexity (CRAP per function)"),
-    ("slow-tests", "suite and individual-test duration"),
-    ("extension-contracts", "configured extension scenarios"),
-    ("extension-deps", "core-to-extension dependency direction"),
-    ("failure-paths", "coverage of error-handling paths"),
-    ("silent-errors", "empty or silent error handlers"),
-    ("test-integrity", "vacuous same-package mocks and null render surfaces"),
-    ("loc", "file size"),
-    ("dead-code", "unused code"),
-    ("deps", "module boundaries"),
-    ("test-count", "native executed, passed, failed, and skipped test counts"),
-    ("cognitive", "cognitive complexity and nesting depth"),
-    ("duplication", "exact normalized duplicate source blocks"),
-    ("cycles", "dependency cycles plus module fan-in and fan-out"),
-    ("secrets", "high-confidence credential formats without secret values"),
-    ("vulnerabilities", "known advisories for locked dependencies"),
-    ("hotspots", "Git change frequency and source complexity"),
-    ("smoke", "start the application once and load it (the ship report requires it)"),
-    ("gherkin", "execute every Gherkin acceptance scenario and step"),
-    ("flaky", "repeated test runs (off unless requested)"),
-    ("mutation", "mutation testing (off unless requested)"),
-)
+CHECK_FLAGS = quality_run.CHECK_FLAGS
+RunAnalysis = Callable[..., Analysis]
 
 
 class ConcurrentRunError(RuntimeError):
     """Raised when another quality loop already owns a repository."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RunFiles:
+    config: Path
+    thresholds: Path | None
+    artifact_dir: Path
+    html: Path
+    state: Path
+
+
+# --- Command line -------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=".", help="repository root")
+    parser.add_argument("--config", help=f"configuration (default: ROOT/{CONFIG_NAME})")
+    parser.add_argument(
+        "--thresholds",
+        help=f"thresholds (default: ROOT/{THRESHOLDS_NAME}, then the bundled ones)",
+    )
+    project_setup.add_setup_arguments(parser)
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
+        "--artifact-dir",
+        help=f"report directory (default: the repository's {QUALITY_DIRECTORY}/)",
+    )
+    output.add_argument(
+        "--html", help="HTML report path; the JSON state is written beside it"
+    )
+    parser.add_argument(
+        "--gate-script", help="alternate engine module with run_analysis (development)"
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--commit",
+        nargs="?",
+        const="HEAD",
+        metavar="REF",
+        help="judge the lines one commit changed (default REF: HEAD)",
+    )
+    scope.add_argument(
+        "--local-changes",
+        action="store_true",
+        help="judge the lines in staged, unstaged, and untracked changes",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="defer the vulnerability lookup; never certifies",
+    )
+    parser.add_argument(
+        "--no-install",
+        action="store_true",
+        help="install nothing; analysis tools come from the current interpreter",
+    )
+    parser.add_argument(
+        "--allow-policy-change",
+        action="store_true",
+        help="the user approved this change to .quality policy files",
+    )
+    parser.add_argument(
+        "--allow-test-removal",
+        action="store_true",
+        help="the user approved running fewer tests than the last full run",
+    )
+    checks = parser.add_argument_group(
+        "select checks", "combinable; omit all of them for the full report"
+    )
+    for flag, _, description in CHECK_FLAGS:
+        checks.add_argument(f"--{flag}", action="store_true", help=description)
+    parser.add_argument("--version", action="version", version=VERSION)
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def selection_names(args: argparse.Namespace) -> tuple[str, ...]:
+    return tuple(
+        flag
+        for flag, _, _ in CHECK_FLAGS
+        if getattr(args, flag.replace("-", "_"), False)
+    )
+
+
+def resolve_from_root(value: str, root: Path) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def resolve_run_files(args: argparse.Namespace, root: Path) -> RunFiles:
+    config = resolve_from_root(args.config or CONFIG_NAME, root)
+    thresholds = resolve_from_root(args.thresholds or THRESHOLDS_NAME, root)
+    if args.html is not None:
+        html = resolve_from_root(args.html, root)
+        artifact_dir = html.parent
+    else:
+        artifact_dir = resolve_from_root(args.artifact_dir or QUALITY_DIRECTORY, root)
+        html = artifact_dir / REPORT_NAME
+    if args.thresholds is None and not thresholds.exists():
+        return RunFiles(config, None, artifact_dir, html, artifact_dir / STATE_NAME)
+    return RunFiles(config, thresholds, artifact_dir, html, artifact_dir / STATE_NAME)
+
+
+# --- Rerun commands -----------------------------------------------------------
+
+
+def display_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def rerun_command(
+    args: argparse.Namespace, root: Path, files: RunFiles, *, full: bool = False
+) -> str:
+    """The command that repeats this run; ``full`` drops the scope, --fast, and
+    the check flags (the run that certifies after a commit)."""
+    command = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
+    command += _location_arguments(args, root, files)
+    if not full:
+        command += _scope_arguments(args)
+    if args.no_install:
+        command.append("--no-install")
+    if args.allow_policy_change:
+        command.append("--allow-policy-change")
+    if args.allow_test_removal:
+        command.append("--allow-test-removal")
+    if not full:
+        command += ["--fast"] if args.fast else []
+        command += [f"--{flag}" for flag in selection_names(args)]
+    return shlex.join(command)
+
+
+def _location_arguments(
+    args: argparse.Namespace, root: Path, files: RunFiles
+) -> list[str]:
+    arguments: list[str] = []
+    if args.config:
+        arguments += ["--config", display_path(files.config, root)]
+    if args.thresholds and files.thresholds is not None:
+        arguments += ["--thresholds", display_path(files.thresholds, root)]
+    if args.html:
+        arguments += ["--html", display_path(files.html, root)]
+    elif args.artifact_dir:
+        arguments += ["--artifact-dir", display_path(files.artifact_dir, root)]
+    if args.gate_script:
+        arguments += ["--gate-script", str(Path(args.gate_script).resolve())]
+    return arguments
+
+
+def _scope_arguments(args: argparse.Namespace) -> list[str]:
+    if args.commit:
+        return ["--commit", args.commit]
+    if args.local_changes:
+        return ["--local-changes"]
+    return []
+
+
+# --- One run ------------------------------------------------------------------
+
+
+def change_set(args: argparse.Namespace, root: Path) -> ChangeSet:
+    if args.commit:
+        return diff_scope.commit_changes(root, args.commit)
+    if args.local_changes:
+        return diff_scope.local_changes(root)
+    return diff_scope.repository_changes()
+
+
+def scope_kind(args: argparse.Namespace) -> str:
+    if args.commit:
+        return diff_scope.COMMIT
+    if args.local_changes:
+        return diff_scope.LOCAL_CHANGES
+    return diff_scope.REPOSITORY
+
+
+def run_mode(args: argparse.Namespace) -> str:
+    if selection_names(args):
+        return PARTIAL
+    return FAST if args.fast else FULL
+
+
+def load_engine(gate_script: str | None) -> RunAnalysis:
+    """``run_analysis`` from ``gate_script``, or the bundled engine."""
+    if not gate_script:
+        return quality_run.run_analysis
+    path = Path(gate_script).resolve()
+    spec = importlib.util.spec_from_file_location("quality_engine_override", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot load quality engine: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    engine: Any = getattr(module, "run_analysis", None)
+    if not callable(engine):
+        raise ValueError(f"quality engine has no run_analysis: {path}")
+    checked: RunAnalysis = engine
+    return checked
+
+
+def tool_cache_dir(config: dict[str, Any], root: Path) -> Path | None:
+    value = (config.get("tools") or {}).get("cache_dir")
+    return resolve_from_root(str(value), root) if value else None
+
+
+def analyze(
+    args: argparse.Namespace,
+    root: Path,
+    files: RunFiles,
+    previous_state: dict[str, Any] | None,
+) -> Analysis:
+    """Run the gates. Raises OSError/ValueError/KeyError/TypeError for
+    configuration and runner errors."""
+    if args.config and not files.config.is_file():
+        raise ValueError(f"configuration not found: {files.config}")
+    changes = change_set(args, root)
+    thresholds = load_thresholds(files.thresholds)
+    config = load_config(files.config if files.config.is_file() else None)
+    auto_install = bool(config["tools"].get("auto_install")) and not args.no_install
+    engine = load_engine(args.gate_script)
+    tools = bootstrap_tools(
+        root, auto_install=auto_install, cache_dir=tool_cache_dir(config, root)
+    )
+    names = selection_names(args)
+    analysis = engine(
+        root,
+        config,
+        thresholds,
+        changes=changes,
+        selection=quality_run.selected_gates(names),
+        fast=args.fast,
+        allow_policy_change=args.allow_policy_change,
+        allow_test_removal=args.allow_test_removal,
+        previous_state=previous_state,
+        tools=tools,
+        runner=runner_for(root),
+    )
+    analysis.reference = args.commit or None
+    if args.commit:
+        analysis.scope = quality_run.scope_description(changes.kind, args.commit)
+    return analysis
+
+
+def error_analysis(args: argparse.Namespace, root: Path, message: str) -> Analysis:
+    runner = GateRun(
+        "runner",
+        "Gate runner",
+        BLOCKED,
+        f"The quality-gate runner stopped: {message}",
+        seconds=None,
+    )
+    return Analysis(
+        root=str(root),
+        generated_at=time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        scope=quality_run.scope_description(scope_kind(args), args.commit),
+        mode=run_mode(args),
+        gates=[runner],
+        version=VERSION,
+        reference=args.commit or None,
+        notes=["The run stopped before the gates could be evaluated."],
+    )
+
+
+def exit_code(analysis: Analysis) -> int:
+    return 0 if analysis.status in ("pass", "selected_pass") else 1
+
+
+def write_artifacts(
+    analysis: Analysis, files: RunFiles, error: str | None
+) -> dict[str, Any]:
+    """Write the HTML report and the state file; return the state."""
+    files.artifact_dir.mkdir(parents=True, exist_ok=True)
+    state = analysis_state(analysis, str(files.html))
+    state["state_path"] = str(files.state)
+    if error:
+        state["status"] = "error"
+        state["error"] = error
+    files.html.write_text(quality_report.render_html(state), encoding="utf-8")
+    write_json_atomic(files.state, state)
+    return state
+
+
+def previous_state_for(path: Path) -> dict[str, Any] | None:
+    state = read_state(path)
+    return state if state and state.get("schema_version") == 2 else None
+
+
+def run_locked(args: argparse.Namespace, root: Path) -> int:
+    files = resolve_run_files(args, root)
+    previous = previous_state_for(files.state)
+    error: str | None = None
+    try:
+        analysis = analyze(args, root, files, previous)
+        code = exit_code(analysis)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as raised:
+        error = str(raised) or type(raised).__name__
+        analysis = error_analysis(args, root, error)
+        code = 2
+    analysis.rerun_command = rerun_command(args, root, files)
+    analysis.full_rerun_command = rerun_command(args, root, files, full=True)
+    state = write_artifacts(analysis, files, error)
+    quality_report.print_report(state, previous_state=previous, stream=sys.stdout)
+    return code
+
+
+# --- Run lock and interrupts ----------------------------------------------------
 
 
 def raise_keyboard_interrupt(_signum: int, _frame: Any) -> None:
@@ -94,24 +383,6 @@ def install_interrupt_handlers() -> None:
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
 
-def load_gate(path: Path) -> ModuleType:
-    """Load the bundled gate without requiring package installation."""
-    spec = importlib.util.spec_from_file_location("repo_quality_gate_core", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load quality-gate engine: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def resolve_from_root(value: str | None, root: Path, default: Path) -> Path:
-    if value is None:
-        return default
-    path = Path(value)
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
-
-
 def default_artifact_dir(root: Path) -> Path:
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     digest = hashlib.sha256(str(root).encode()).hexdigest()[:12]
@@ -119,31 +390,13 @@ def default_artifact_dir(root: Path) -> Path:
 
 
 def repository_lock_path(root: Path) -> Path:
-    """Return one stable lock path regardless of report destination."""
+    """One stable lock path per repository, whatever the report destination."""
     return default_artifact_dir(root.resolve()) / ".run.lock"
 
 
 def try_lock(handle: TextIO) -> bool:
     if os.name == "nt":
-        import msvcrt
-
-        windows_msvcrt: Any = msvcrt
-        locking = windows_msvcrt.locking
-        nonblocking_lock = windows_msvcrt.LK_NBLCK
-
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write("\0")
-            handle.flush()
-        handle.seek(0)
-        try:
-            locking(handle.fileno(), nonblocking_lock, 1)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.EDEADLK}:
-                return False
-            raise
-        return True
-
+        return _try_windows_lock(handle)
     import fcntl
 
     try:
@@ -153,15 +406,32 @@ def try_lock(handle: TextIO) -> bool:
     return True
 
 
+def _try_windows_lock(handle: TextIO) -> bool:
+    import msvcrt
+
+    windows: Any = msvcrt
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write("\0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        windows.locking(handle.fileno(), windows.LK_NBLCK, 1)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EDEADLK}:
+            return False
+        raise
+    return True
+
+
 def unlock(handle: TextIO) -> None:
     if os.name == "nt":
         import msvcrt
 
-        windows_msvcrt: Any = msvcrt
+        windows: Any = msvcrt
         handle.seek(0)
-        windows_msvcrt.locking(handle.fileno(), windows_msvcrt.LK_UNLCK, 1)
+        windows.locking(handle.fileno(), windows.LK_UNLCK, 1)
         return
-
     import fcntl
 
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -176,9 +446,9 @@ def lock_owner(handle: TextIO) -> str:
         owner = json.loads(raw)
     except json.JSONDecodeError:
         return raw
-    pid = owner.get("pid", "unknown")
-    started_at = owner.get("started_at", "unknown time")
-    return f"PID {pid}, started {started_at}"
+    if not isinstance(owner, dict):
+        return raw
+    return f"PID {owner.get('pid', 'unknown')}, started {owner.get('started_at', 'unknown time')}"
 
 
 @contextmanager
@@ -194,388 +464,15 @@ def repository_run_lock(root: Path) -> Iterator[None]:
         try:
             handle.seek(0)
             handle.truncate()
-            json.dump(
-                {
-                    "pid": os.getpid(),
-                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
-                },
-                handle,
-            )
+            owner = {
+                "pid": os.getpid(),
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+            }
+            json.dump(owner, handle)
             handle.flush()
             yield
         finally:
             unlock(handle)
-
-
-def display_path(path: Path, root: Path) -> str:
-    try:
-        return str(path.relative_to(root))
-    except ValueError:
-        return str(path)
-
-
-def append_rerun_configuration(
-    command: list[str],
-    root: Path,
-    config_path: Path,
-    explicit_config: bool,
-    thresholds_path: Path,
-    explicit_thresholds: bool,
-    artifact_dir: Path,
-    explicit_artifacts: bool,
-    html_path: Path,
-    explicit_html: bool,
-    gate_script: Path,
-    explicit_gate_script: bool,
-) -> None:
-    if explicit_config:
-        command.extend(["--config", display_path(config_path, root)])
-    if explicit_thresholds:
-        command.extend(["--thresholds", display_path(thresholds_path, root)])
-    if explicit_html:
-        command.extend(["--html", display_path(html_path, root)])
-    elif explicit_artifacts:
-        command.extend(["--artifact-dir", display_path(artifact_dir, root)])
-    if explicit_gate_script:
-        command.extend(["--gate-script", str(gate_script)])
-
-
-def append_rerun_execution(
-    command: list[str],
-    scope_arguments: Sequence[str],
-    no_install: bool,
-    fast: bool,
-    mutation_workers: str | None,
-    selection: Sequence[str] = (),
-) -> None:
-    command.extend(scope_arguments)
-    if no_install:
-        command.append("--no-install")
-    if mutation_workers:
-        command.extend(["--mutation-workers", mutation_workers])
-    if fast:
-        command.append("--fast")
-    command.extend(f"--{name}" for name in selection)
-
-
-def build_rerun_command(
-    root: Path,
-    config_path: Path,
-    explicit_config: bool,
-    thresholds_path: Path,
-    explicit_thresholds: bool,
-    artifact_dir: Path,
-    explicit_artifacts: bool,
-    html_path: Path,
-    explicit_html: bool,
-    gate_script: Path,
-    explicit_gate_script: bool,
-    scope_arguments: Sequence[str],
-    no_install: bool,
-    fast: bool,
-    mutation_workers: str | None,
-    selection: Sequence[str] = (),
-) -> str:
-    command = [sys.executable, str(Path(__file__).resolve()), "--root", "."]
-    append_rerun_configuration(
-        command,
-        root,
-        config_path,
-        explicit_config,
-        thresholds_path,
-        explicit_thresholds,
-        artifact_dir,
-        explicit_artifacts,
-        html_path,
-        explicit_html,
-        gate_script,
-        explicit_gate_script,
-    )
-    append_rerun_execution(
-        command, scope_arguments, no_install, fast, mutation_workers, selection
-    )
-    return shlex.join(command)
-
-
-def error_report(
-    gate: ModuleType,
-    root: Path,
-    message: str,
-    command: str,
-    fast: bool,
-    scope: Any,
-) -> Any:
-    return gate.AnalysisReport(
-        root=str(root),
-        generated_at=time.strftime("%Y-%m-%d %H:%M:%S %z"),
-        languages=gate.detect_languages(root),
-        gates=[
-            gate.GateResult(
-                "runner",
-                "Gate runner",
-                False,
-                f"The quality-gate runner stopped: {message}",
-                prompts=[
-                    (
-                        "Repair gate configuration",
-                        "Repair this configuration or adapter error without disabling "
-                        f"a required gate:\n\n{message}",
-                    )
-                ],
-            )
-        ],
-        functions=[],
-        mutations=[],
-        dependency_violations=[],
-        tool_setup=[],
-        notes=["The run stopped before all gates could be evaluated."],
-        rerun_command=command,
-        mode="fast" if fast else "full",
-        scope=scope,
-    )
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=".", help="repository root")
-    parser.add_argument("--config", help="quality-gate JSON configuration")
-    parser.add_argument("--thresholds", help="quality-threshold JSON configuration")
-    add_setup_arguments(parser)
-    output = parser.add_mutually_exclusive_group()
-    output.add_argument(
-        "--artifact-dir",
-        help=f"report directory (default: repository {QUALITY_DIRECTORY}/ folder)",
-    )
-    output.add_argument(
-        "--html",
-        help="override the automatic HTML report path; JSON state is written beside it",
-    )
-    parser.add_argument(
-        "--gate-script",
-        help="alternate repo_quality_gate.py engine (for development)",
-    )
-    scope = parser.add_mutually_exclusive_group()
-    scope.add_argument(
-        "--commit",
-        nargs="?",
-        const="HEAD",
-        metavar="REF",
-        help="gate production files changed by one commit (default REF: HEAD)",
-    )
-    scope.add_argument(
-        "--local-changes",
-        action="store_true",
-        help="gate production files in staged, unstaged, and untracked changes",
-    )
-    parser.add_argument(
-        "--max-mutants",
-        type=int,
-        help="diagnostic cap; capped runs can never pass",
-    )
-    parser.add_argument(
-        "--mutation-workers",
-        metavar="N|auto",
-        help="run native mutation workers inside one isolated snapshot; native auto follows Stryker's CPU default, while the portable fallback uses up to 4 isolated workers",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="run one diagnostic pass and defer flaky-test repetitions and mutation testing; never certifies",
-    )
-    parser.add_argument(
-        "--no-install",
-        action="store_true",
-        help="forbid automatic installation of missing analysis tools",
-    )
-    parser.add_argument(
-        "--print-prompt",
-        action="store_true",
-        help="print the complete repair prompt after a failing run",
-    )
-    checks = parser.add_argument_group(
-        "select checks", "combinable; omit all of them for the full ship report"
-    )
-    for name, description in CHECK_FLAGS:
-        checks.add_argument(f"--{name}", action="store_true", help=f"run {description}")
-    checks.add_argument(
-        "--craap", dest="crap", action="store_true", help=argparse.SUPPRESS
-    )
-    parser.add_argument("--version", action="version", version=VERSION)
-    return parser.parse_args(argv)
-
-
-def selection_names(args: argparse.Namespace) -> tuple[str, ...]:
-    return tuple(
-        name for name, _ in CHECK_FLAGS if getattr(args, name.replace("-", "_"), False)
-    )
-
-
-def resolve_artifacts(args: argparse.Namespace, root: Path) -> tuple[Path, Path, Path]:
-    default_directory = root / QUALITY_DIRECTORY
-    if args.html is not None:
-        html_path = resolve_from_root(
-            args.html, root, default_directory / "quality-gate-report.html"
-        )
-        artifact_dir = html_path.parent
-    else:
-        artifact_dir = resolve_from_root(args.artifact_dir, root, default_directory)
-        html_path = artifact_dir / "quality-gate-report.html"
-    return artifact_dir, html_path, artifact_dir / "quality-gate-state.json"
-
-
-def scope_cli_arguments(args: argparse.Namespace) -> list[str]:
-    if args.commit:
-        return ["--commit", args.commit]
-    if args.local_changes:
-        return ["--local-changes"]
-    return []
-
-
-def load_gate_safely(gate_script: Path) -> ModuleType | None:
-    try:
-        return load_gate(gate_script)
-    except Exception as error:
-        print(f"error: {error}", file=sys.stderr)
-        return None
-
-
-def requested_scope(args: argparse.Namespace, gate: ModuleType) -> Any:
-    if args.commit:
-        return gate.GateScope("commit", reference=args.commit)
-    if args.local_changes:
-        return gate.GateScope("local_changes")
-    return gate.repository_scope()
-
-
-def selected_scope(args: argparse.Namespace, gate: ModuleType, root: Path) -> Any:
-    if args.commit:
-        return gate.commit_scope(root, args.commit)
-    if args.local_changes:
-        return gate.local_changes_scope(root)
-    return gate.repository_scope()
-
-
-def execute_analysis(
-    args: argparse.Namespace,
-    gate: ModuleType,
-    root: Path,
-    config_path: Path,
-    thresholds_path: Path,
-    html_path: Path,
-    command: str,
-) -> tuple[Any, int, str | None]:
-    scope = requested_scope(args, gate)
-    try:
-        scope = selected_scope(args, gate, root)
-        sync_notes = gate.sync_thresholds_file(thresholds_path)
-        thresholds, threshold_notes = gate.load_thresholds(thresholds_path)
-        config, notes = gate.load_config(
-            config_path if config_path.exists() else None, thresholds
-        )
-        notes = [*sync_notes, *threshold_notes, *notes]
-        if args.no_install:
-            config["tools"]["auto_install"] = False
-        analysis = gate.run(
-            root,
-            config,
-            html_path,
-            args.max_mutants,
-            notes,
-            fast=args.fast,
-            cli_mutation_workers=args.mutation_workers,
-            scope=scope,
-            thresholds=thresholds,
-            selection=gate.gate_selection(selection_names(args)),
-        )
-        analysis.rerun_command = command
-        return analysis, 0 if run_passed(analysis) else 1, None
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        message = str(error)
-        analysis = error_report(gate, root, message, command, args.fast, scope)
-        return analysis, 2, message
-
-
-def run_passed(analysis: Any) -> bool:
-    return bool(
-        analysis.passed or (analysis.mode == "partial" and analysis.selected_passed)
-    )
-
-
-def write_analysis_artifacts(
-    gate: ModuleType,
-    analysis: Any,
-    html_path: Path,
-    state_path: Path,
-    exit_code: int,
-    run_error: str | None,
-) -> dict[str, Any]:
-    html_path.write_text(gate.html_report(analysis), encoding="utf-8")
-    state = analysis_state(gate, analysis, html_path, state_path, exit_code, run_error)
-    state["report"] = dataclasses.asdict(analysis)
-    write_json_atomic(state_path, state)
-    return state
-
-
-def run_locked(args: argparse.Namespace, root: Path) -> int:
-    files = resolve_run_files(
-        args,
-        root,
-        QUALITY_DIRECTORY,
-        PROFILE_NAME,
-        DEFAULT_GATE_SCRIPT,
-        resolve_from_root,
-        resolve_artifacts,
-    )
-    if args.show_profile:
-        return show_profile(root, files.profile)
-    gate = load_gate_safely(files.gate_script)
-    if gate is None:
-        return 2
-    profile, setup_ok = safe_setup_before_baseline(args, gate, root, files)
-    if not setup_ok:
-        return 2
-    thresholds_path = active_thresholds_path(gate, files)
-    command = rerun_for(
-        args,
-        root,
-        files,
-        thresholds_path,
-        build_rerun_command,
-        scope_cli_arguments,
-        selection_names,
-    )
-    analysis, exit_code, run_error = execute_analysis(
-        args,
-        gate,
-        root,
-        files.config,
-        thresholds_path,
-        files.html,
-        command,
-    )
-    files.artifact_dir.mkdir(parents=True, exist_ok=True)
-    previous = previous_measurement(files.state)
-    previous_items = previous_item_keys(files.state)
-    state = write_analysis_artifacts(
-        gate, analysis, files.html, files.state, exit_code, run_error
-    )
-    print_analysis(
-        args, gate, analysis, state, files, previous, previous_items, print_report
-    )
-    if profile is not None:
-        setup_after_baseline(
-            args,
-            gate,
-            analysis,
-            root,
-            files,
-            thresholds_path,
-            profile,
-            exit_code,
-            run_error,
-            write_analysis_artifacts,
-        )
-    return exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -584,6 +481,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not root.is_dir():
         print(f"error: repository root does not exist: {root}", file=sys.stderr)
         return 2
+    if args.init:
+        return project_setup.run_init(root, args)
     install_interrupt_handlers()
     try:
         with repository_run_lock(root):

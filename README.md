@@ -1,66 +1,78 @@
 # code-discipline
 
-A self-contained Codex and Claude Code skill for engineering discipline.
-First-time [guided setup](skills/code-discipline/references/project-setup-chat.md)
-explains gates and thresholds in chat. Users enable or disable checks for each
-project; saved choices are reused, and disabled gates stay OFF. The launcher
-uses Python 3.10+ or downloads a pinned runtime; it never installs project dependencies.
+A self-contained Codex and Claude Code skill for engineering discipline. When
+an agent finishes a change, ten generic quality gates judge that change and
+send every failure back into its loop, with no project setup for common
+languages. First-time [guided setup](skills/code-discipline/references/project-setup-chat.md)
+explains gates and limits in chat; saved choices are reused, and disabled gates
+stay OFF. The launcher uses Python 3.10+ or downloads a pinned runtime; it
+never installs project dependencies.
 
 ## The workflow the skill enforces
 
 ```mermaid
 flowchart LR
-    S["skeleton:<br/>manifest · test runner<br/>one test · start cmd"] --> I["guided setup<br/>project gates + limits"]
+    S["skeleton:<br/>manifest · test runner<br/>one real test"] --> I["guided setup<br/>project gates + limits"]
     I --> F["fast run<br/>--local-changes --fast"]
     F -->|"items"| N["quality_items.py --next<br/>fix one file"] --> F
     F -->|"0 items"| K["git commit"]
     K -->|"next feature:<br/>test + code"| F
-    K -->|"all features done"| R["ship report<br/>quality_loop.py --root .<br/>+ smoke + scope"]
+    K -->|"all features done"| R["ship report<br/>quality_loop.py --root .<br/>all ten gates"]
     R -->|"green"| H["HAND OFF NOW"]
     R -->|"red"| N
 ```
 
-Bootstrap the gate before the first source file, keep every step green, commit
-each green step, and hand off only after the whole-repository ship report —
-which also proves the configured core user story from outside the process
-(`smoke.story`; `smoke.commands` remains available for a CLI or library),
-checks composed-root tests for narrow anti-vacuous mocks, and rejects
-`source.exclude` entries that hide production files (the `Gate scope` row).
+## The ten gates
+
+| Gate | What it checks in the agent's change | Tools |
+|---|---|---|
+| No shortcuts | New suppression, skip, or focus markers; silent error handlers; hidden production files; edits to `.quality/` policy | none |
+| Secrets | Private keys and known token formats in every touched text file | none |
+| File size | A production file that crosses 600 lines, or grows while over | none |
+| Project checks | The repository's own lint, type, format, and build commands pass, and none can silently succeed | the repo's own |
+| Tests | The suite runs once; no failed, skipped, or filtered tests; the count never drops | the repo's own |
+| Coverage | Changed executable lines and branches are covered by that same test run | pinned (coverage.py, c8, cargo-llvm-cov, JaCoCo) or the runtime's own |
+| Complexity | Cyclomatic, cognitive, nesting, and CRAP limits for touched functions | pinned lizard |
+| Duplication | Copied code touching the change, even with renamed variables | pinned Pygments |
+| Dead code | New functions nothing calls, and functions orphaned by removed callers | pinned lizard |
+| Vulnerable dependencies | Known OSV advisories for added or upgraded locked packages; manifests without a lockfile | network (OSV) |
+
+Each gate closes a way an agent can hand back a green-looking but risky
+result: silencing a check, skipping or deleting tests, leaking a key, leaving
+new code unexercised, or copying instead of reusing. Shortcuts and Secrets
+match known text patterns; Dead code reports exported, decorated, and method
+names for review. C and C++ projects built with CMake or Meson get tests and
+gcov coverage with no setup. Coverage needs setup for PHP (pcov or Xdebug)
+and .NET (`coverlet.collector`); until then, like any
+gate that cannot measure, it reports BLOCKED, never PASS. Policy edits and test
+removal need the user's approval: `--allow-policy-change`, `--allow-test-removal`.
 
 The nine rules of [SKILL.md](skills/code-discipline/SKILL.md), one line each:
 
-1. Deliverables first — guided project setup before the first feature.
-2. Read the report, not the state file; fix one file per cycle.
-3. Run the loop in the foreground only; never background it.
-4. The core user story must run: structured smoke probes are part of the report.
-5. Not finished until the ship report is green; never narrow the gate.
-6. Mutation and flaky testing run only when asked.
-7. Green means hand off now — nothing is added after green.
+1. Bootstrap first — guided setup and one real passing test before features.
+2. Take no shortcuts; fix the cause and ask the user before policy changes.
+3. Build complete connections; prove real writes and read-back.
+4. Repair until green from the report; never lower limits to get there.
+5. Certify with the full ship report, run in the foreground.
+6. Stop only on evidence; report BLOCKED with the exact missing dependency.
+7. Disabled gates stay OFF; missing evidence is never a pass.
 8. Commit each green step locally; push or rewrite history only when asked.
 9. Fan out sub-agents by file, at most four, and measure once (below).
 
 ## Fanning out repair work
 
-When a report lists items in many files — adopting the gate in an existing
-repository, or any large first report — the parent delegates disjoint files
+When a report lists items in many files, the parent delegates disjoint files
 and keeps the only measurement:
 
 ```mermaid
 flowchart TB
-    P["parent: items grouped by file<br/>quality_items.py --briefs 4"] --> A1["sub-agent<br/>file 1 + its test"]
-    P --> A2["sub-agent<br/>file 2 + its test"]
-    P --> A3["sub-agent<br/>file 3 + its test"]
-    P --> A4["sub-agent<br/>file 4 + its test"]
-    A1 --> M["parent: rerun --local-changes --fast once<br/>the report is the evidence"]
-    A2 --> M
-    A3 --> M
-    A4 --> M
+    P["parent: items grouped by file<br/>quality_items.py --briefs 4"] --> A["up to four sub-agents<br/>each owns one file + its test"]
+    A --> M["parent: rerun --local-changes --fast once<br/>the report is the evidence"]
     M --> K["git commit"]
 ```
 
-Sub-agents never run `--init`, never edit `.quality/`, never commit; shared
-modules (types, schemas, contracts) are edited by the parent first; a
-sub-agent's "green" is a claim, the parent's single rerun is the evidence.
+Sub-agents never run `--init`, edit `.quality/`, or commit; a sub-agent's
+"green" is a claim, the parent's single rerun is the evidence.
 
 ## Install and set up
 
@@ -77,8 +89,8 @@ curl -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github.com/
 ```
 
 Read the installed guide and finish setup now; restart later for automatic discovery. Codex reads
-`.agents/skills/code-discipline`; Claude Code reads its `.claude/skills` link.
-Global installation creates the same paths under `$HOME` without cloning.
+`.agents/skills/code-discipline`; Claude Code reads its `.claude/skills` link;
+global installation creates the same paths under `$HOME`.
 
 ## Update
 
@@ -97,34 +109,23 @@ and restore each `.claude/skills` link. Every skill change is also published as
 ## Run the quality gate
 
 ```bash
-.agents/skills/code-discipline/scripts/quality --root . --init --non-interactive
+.agents/skills/code-discipline/scripts/quality --root . --init
 .agents/skills/code-discipline/scripts/quality --root . --local-changes --fast
 python3 .agents/skills/code-discipline/scripts/quality_items.py --root . --next
 .agents/skills/code-discipline/scripts/quality --root .   # ship report
 ```
 
-Targeted checks never certify: `--lint`, `--types`, `--contracts`,
-`--tests`, `--coverage`, `--branches`, `--slow-tests`,
-`--extension-contracts`, `--extension-deps`, `--failure-paths`,
-`--silent-errors`, `--test-integrity`, `--complexity`, `--crap`, `--loc`,
-`--dead-code`, `--deps`, `--test-count`, `--cognitive`, `--duplication`,
-`--cycles`, `--secrets`, `--vulnerabilities`, `--hotspots`, `--smoke`, `--gherkin`, plus
-`--flaky` and `--mutation` on request. Every run
-prints each gate and the separate product/security/deployment/operations
-coverage profile, `Coverage today`, `Since last run: fixed · remaining · new`, a `To fix` list grouped by file when it is long, the exact next command, and
+Targeted checks never certify: `--shortcuts`, `--secrets`, `--loc`, `--checks`,
+`--tests`, `--coverage`, `--complexity`, `--duplication`, `--dead-code`,
+`--vulnerabilities`; `--fast` defers only the network-bound vulnerability check.
+Every run prints each gate, a `To fix` list, the exact next command, and
 `QUALITY_LOOP=` / `ITEMS_TO_FIX=`. Every run writes `.quality/quality-gate-report.html`
 and `.quality/quality-gate-state.json`; `--html PATH` moves the HTML. Defaults:
-600 lines per file, 100% per-function line and branch coverage, 5 seconds per
-test, 300 seconds per suite, 100% extension contracts, no core-to-extension
-imports, 100% failure-path coverage, no silent handlers, at least one executed
-test with none skipped, cognitive complexity 15, nesting depth 4, duplicated
-code 5%, zero dependency cycles, secrets, or known vulnerabilities, and
-cyclomatic complexity and CRAP at 6. Write Gherkin scenarios in `.feature.yaml`; all
-scenarios, Examples rows, steps and hooks must pass. Only a full run prints
-`QUALITY_LOOP=PASS`; selected checks print `QUALITY_LOOP=SELECTED_PASS`.
-The launcher caches pinned tools/Python; it never restores project dependencies. The
-[setup guide](skills/code-discipline/references/repository-setup.md) covers adapters and formulas;
-the [loop reference](skills/code-discipline/references/quality-loop.md) covers reports, repairs, and delegation.
+600 lines per file; 90% line and branch coverage of changed lines; cyclomatic 10,
+cognitive 15, nesting 4, CRAP 30; clones from 50 tokens and 5 lines; at least one
+executed test; zero for every other count. Only a full run prints
+`QUALITY_LOOP=PASS`. The [setup guide](skills/code-discipline/references/repository-setup.md)
+covers adapters; the [loop reference](skills/code-discipline/references/quality-loop.md) covers reports and repairs.
 
 ## Prompt for an agent: install in this repository
 
